@@ -1,0 +1,1992 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © point_master
+
+//@version=5
+
+// =====================================================================================
+// POINT MASTER SOURCE B 5M15M  ―  POINT MASTER B 5分・15分専用版 Source B（Logic13〜18 : TL / 三尊 / DTB / ウェッジ / 三角形）
+// =====================================================================================
+// 1 分足あり版 Source（PM-SRC-B-V2）から 1 分足の取得・状態・準備確認・保持設定・BUS を取り除き、
+// 5 分足と 15 分足だけで、担当ロジックの検知・抑止前 PRE・V2 有効根拠（否定ライン / 価格否定 / 期限 / Fib 解除）・
+// 系統点・データ準備確認を行う版。5M / 15M の処理内容と取得方式（[1] + lookahead_on）は 1 分足あり版と同じ。
+// 検知モジュール（入力・PRM 束・ロジック関数・Engine 関数）は V2 版からそのまま移している（条件の変更なし）。
+// 取り除いたもの : 他 Source のロジック / 1H・4H・1D の取得 / ロジック名・Weight / 元版の ST_STATE・スコア・PRE スコア・
+//                  PHASE・VALID TP / 旧テーブル・旧アラート・LOT ADJUST / モード A / 判定（Decision が担当）
+// 使い方 : 5 分足チャートに追加し、PointMasterDecision5M15M（PM-DEC-515）の入力
+//          「B 5M BUS / B 15M BUS」へ、この Source の同名出力を接続する。TF は 5M / 15M 固定。
+// 【BUS 仕様（Decision への受け渡し）】plot の値 1 本 = 1 TF ぶんの集約結果（非負整数 < 2^49）
+//   bus = 1(format) + 4 × SourceID + 16 × TFID + 64 × slot + 2^28 × payload
+//     bit 0-1   : format = 2（5分・15分専用版。1 分足あり版の BUS は format 1 なので Decision 5M15M は受け付けない）
+//     bit 2-3   : SourceID（1 = A / 2 = B / 3 = C）
+//     bit 4-5   : TFID（1 = 5M / 2 = 15M。この版は 1M を出さない）
+//     bit 6-27  : slot = (集約結果を確定した 5 分足の確定時刻 time_close − 2020-01-01 00:00 UTC) / 5 分
+//                 0〜4,194,303（2020-01-01 00:05 〜 2059-11-23 頃の 5 分足）。範囲外は折り返さず na
+//     bit 28-48 : payload（21 bit）
+//       bit 0 : LONG 方向の根拠がこの 5 分足の処理中に価格否定された / bit 1 : SHORT 方向
+//       bit 2 : 価格基準なし（未対応）の有効根拠がある
+//       bit 3- : 系統ごとに [LONG 確認済み 1bit, LONG 統合, SHORT 確認済み 1bit, SHORT 統合]
+//                統合は SAT だけ 2bit（0〜3 = 強度 0 / 1/3 / 2/3 / 1）、他の系統は 1bit（強度 0 / 1 しか取らない）
+//   最大値 < 2^49 = 562,949,953,421,312 ≤ 2^53 − 1。各フィールドは重ならず、境界値まで可逆。
+//   未準備・不整合の 5 分足では na（根拠ゼロを有効値として送らない）。
+//   値は 5 分足の確定時点で確定し、足の途中では最後に確定した値を出し続ける。
+//   payload の系統配置（この Source）: 形状（Logic13〜18）= bit 3-6
+// =====================================================================================
+indicator(
+     title         = "POINT MASTER SOURCE B 5M15M",
+     shorttitle    = "PM-B-515",
+     overlay       = true,
+     max_bars_back = 500
+ )
+
+// =====================================================================================
+// §0. 定数（この Source 内のロジック番号は 0 始まりのローカル番号。0〜5 = Logic13〜18）
+// =====================================================================================
+int N_LOGIC = 6
+int N_TF    = 2            // 内部 index 0 = 5M / 1 = 15M（1M は持たない）
+int CONF_IGNORE = 0
+int CONF_LONG   = 1
+int CONF_SHORT  = 2
+f_idx(li, ti) => li * N_TF + ti
+// 時間足（5M / 15M 固定）。tfStr1 は Engine A の EMA 対象 TF 判定（元版は 1M / 5M のみ対象）で参照されるだけで、
+// 1M のデータ取得には使わない（この版は 1M を取得しない。15M へ EMA ロジックを新たに適用しない）
+tfStr1 = "1"
+tfStr2 = "5"
+tfStr3 = "15"
+
+// =====================================================================================
+// §3. 保持本数（元版と同じ input・初期値。5M / 15M のみ）＝ V2 有効根拠の期限
+// =====================================================================================
+grpH13 = "③ Logic13 (TL Rebound) 保持本数"
+h13b = input.int(6, "5M",  group = grpH13, minval = 1, inline = "h13a")
+h13c = input.int(4, "15M", group = grpH13, minval = 1, inline = "h13a")
+grpH14 = "③ Logic14 (TL Break) 保持本数"
+h14b = input.int(6, "5M",  group = grpH14, minval = 1, inline = "h14a")
+h14c = input.int(4, "15M", group = grpH14, minval = 1, inline = "h14a")
+grpH15 = "③ Logic15 (H&S) 保持本数"
+h15b = input.int(6, "5M",  group = grpH15, minval = 1, inline = "h15a")
+h15c = input.int(4, "15M", group = grpH15, minval = 1, inline = "h15a")
+grpH16 = "③ Logic16 (DT/DB) 保持本数"
+h16b = input.int(6, "5M",  group = grpH16, minval = 1, inline = "h16a")
+h16c = input.int(4, "15M", group = grpH16, minval = 1, inline = "h16a")
+grpH17 = "③ Logic17 (Wedge) 保持本数"
+h17b = input.int(6, "5M",  group = grpH17, minval = 1, inline = "h17a")
+h17c = input.int(4, "15M", group = grpH17, minval = 1, inline = "h17a")
+grpH18 = "③ Logic18 (Triangle) 保持本数"
+h18b = input.int(6, "5M",  group = grpH18, minval = 1, inline = "h18a")
+h18c = input.int(4, "15M", group = grpH18, minval = 1, inline = "h18a")
+HOLD13 = array.from(h13b, h13c)
+HOLD14 = array.from(h14b, h14c)
+HOLD15 = array.from(h15b, h15c)
+HOLD16 = array.from(h16b, h16c)
+HOLD17 = array.from(h17b, h17c)
+HOLD18 = array.from(h18b, h18c)
+var HOLD_ALL = array.new_int(0)
+if array.size(HOLD_ALL) == 0
+    array.concat(HOLD_ALL, HOLD13)
+    array.concat(HOLD_ALL, HOLD14)
+    array.concat(HOLD_ALL, HOLD15)
+    array.concat(HOLD_ALL, HOLD16)
+    array.concat(HOLD_ALL, HOLD17)
+    array.concat(HOLD_ALL, HOLD18)
+
+grpRule = "⑤ 状態管理ルール"
+conflictStr = input.string("無視 (現状維持)", "同一ロジック・同一TFで両方向が同時発生した時",
+     options = ["無視 (現状維持)", "LONG優先", "SHORT優先"], group = grpRule)
+conflictMode = conflictStr == "LONG優先" ? CONF_LONG : conflictStr == "SHORT優先" ? CONF_SHORT : CONF_IGNORE
+
+// =====================================================================================
+// §4. 検知モジュール（V2 版からそのまま移したもの）
+// =====================================================================================
+
+// -------------------------------------------------------------------------------------
+// SIGNAL MODULE : Logic13 = Trendline Rebound / Logic14 = Trendline Break
+// -------------------------------------------------------------------------------------
+// Trendline の生成・選択・Line Quality は元 Trendline/Channel ストラテジー
+// （f_tlEnvState）と同一です。簡略化していません。
+//   ・確定Pivot（ATR Swing Filter付き）を高値側・安値側それぞれ4点保持
+//   ・上昇TL = Pivot Low 側から3本、下降TL = Pivot High 側から3本の候補を生成
+//   ・ライン有効期限 / Touch数 / Broken数 / Slope から Line Quality を算出
+//   ・Quality最高（同点は価格に近い方）を採用
+//   ・Quality は方向別に分離（上昇TLのイベントは上昇TLのQuality、下降TLは下降TLのQuality）
+//
+//   Logic13 : 上昇TL接近 + bullishReversal + close > 上昇TL値 → LONG
+//             下降TL接近 + bearishReversal + close < 下降TL値 → SHORT
+//   Logic14 : close[1] <= 下降TL[1] かつ close > 下降TL → LONG（下降TLを終値で上抜け）
+//             close[1] >= 上昇TL[1] かつ close < 上昇TL → SHORT（上昇TLを終値で下抜け）
+//             ブレイク後、その「同じTrendline」の現在バー延長値を終値で逆側へ跨いだら
+//             逆方向イベント（上抜け後に下へ戻る → SHORT / 下抜け後に上へ戻る → LONG）
+//
+// ブレイクしたラインは x1/y1/x2/y2 と方向を保存して追跡するので、別のTrendlineを
+// 跨いだだけでは反転しません。ラインが有効期限切れになれば追跡を終了します。
+// イベントは跨いだ確定足だけ。同じ側に滞在している間は再発生しません。
+// Channel / Retest / Fake Break は移植していません。
+// Rebound と Break は別ロジックなので互いに解除しません。全6TF対象で、
+// 共通MTF基盤の各TFコンテキストで評価するため request.security は追加していません。
+grpTL = "④ Logic13/14 : Trendline パラメータ"
+tlPivotLen         = input.int(5,     "Pivot Length",           group = grpTL, minval = 1)
+tlUseATRSwing      = input.bool(true, "ATR Swing Filterを使う",  group = grpTL)
+tlMinSwingATR      = input.float(0.5, "最低Swing幅 ATR倍率",     group = grpTL, step = 0.1)
+tlTouchMode        = input.string("ATR", "接近判定", options = ["Dollar", "ATR"], group = grpTL)
+tlTouchDollar      = input.float(3.0, "接近幅($)",              group = grpTL, step = 0.1)
+tlTouchATR         = input.float(0.3, "接近幅 ATR倍率",          group = grpTL, step = 0.05)
+tlMaxLineAgeBars   = input.int(300,   "ライン有効期限 Bars",     group = grpTL, minval = 20)
+tlMinLineTouches   = input.int(2,     "最低Touch数",            group = grpTL, minval = 2)
+tlBreakConfirmBars = input.int(2,     "Break Confirm Bars",     group = grpTL, minval = 1)
+tlMinSlopeATR      = input.float(0.03, "最低Slope ATR倍率",      group = grpTL, step = 0.01)
+tlMaxSlopeATR      = input.float(1.5,  "最大Slope ATR倍率",      group = grpTL, step = 0.1)
+useTlQualityFilter = input.bool(true, "Line Quality Filterを使う", group = grpTL)
+minTlQuality       = input.int(70,    "最低Line Quality",        group = grpTL, minval = 0, maxval = 100)
+
+// --- Logic13/14 Trendline のパラメータ束（input の値をそのまま格納。index = 下のコメント順）---
+//     ロジック関数はここから array.get() で読むため、外部要素は この配列1個だけになります。
+var array<float> PRM_TL = array.from(
+     tlUseATRSwing ? 1.0 : 0.0,            // 00 : tlUseATRSwing
+     tlMinSwingATR,                        // 01 : tlMinSwingATR
+     tlTouchMode == "Dollar" ? 0.0 : 1.0,  // 02 : tlTouchMode
+     tlTouchDollar,                        // 03 : tlTouchDollar
+     tlTouchATR,                           // 04 : tlTouchATR
+     tlMaxLineAgeBars * 1.0,               // 05 : tlMaxLineAgeBars
+     tlMinLineTouches * 1.0,               // 06 : tlMinLineTouches
+     tlBreakConfirmBars * 1.0,             // 07 : tlBreakConfirmBars
+     tlMinSlopeATR,                        // 08 : tlMinSlopeATR
+     tlMaxSlopeATR,                        // 09 : tlMaxSlopeATR
+     useTlQualityFilter ? 1.0 : 0.0,       // 10 : useTlQualityFilter
+     minTlQuality * 1.0                    // 11 : minTlQuality
+ )
+
+// --- 元コードと同一の補助関数 ---
+f_tlNear(_price, _level, _rng) =>
+    not na(_level) and math.abs(_price - _level) <= _rng
+
+f_tlLineValue(_x1, _y1, _x2, _y2, _xNow) =>
+    float _slope = (_y2 - _y1) / math.max(_x2 - _x1, 1)
+    _y1 + _slope * (_xNow - _x1)
+
+f_tlQualityScore(_touch, _ageBars, _slopeAbsATR, _broken) =>
+    // --- パラメータ読み出し（PRM束。値は input と同一）---
+    float _pTlMinSlopeATR          = array.get(PRM_TL, 8)
+    float _pTlMaxSlopeATR          = array.get(PRM_TL, 9)
+    int _tS = _touch >= 4 ? 40 : _touch == 3 ? 30 : _touch >= 2 ? 20 : 0
+    int _aS = (_ageBars >= 20 and _ageBars <= 150) ? 20 : (_ageBars >= 151 and _ageBars <= 300) ? 10 : 0
+    int _sS = na(_slopeAbsATR) ? 0 : (_slopeAbsATR < _pTlMinSlopeATR ? 5 : _slopeAbsATR > _pTlMaxSlopeATR ? 5 : 20)
+    int _bS = _broken == 0 ? 20 : _broken == 1 ? 10 : 0
+    math.min(100, _tS + _aS + _sS + _bS)
+
+f_tlSlopeATR(_p1, _b1, _p2, _b2, _atrv) =>
+    _atrv != 0 ? math.abs((_p2 - _p1) / math.max(_b2 - _b1, 1)) / _atrv : na
+
+f_trendlineEvents() =>
+    // --- パラメータ読み出し（PRM束。値は input と同一）---
+    bool  _pTlUseATRSwing          = array.get(PRM_TL, 0) > 0.5
+    float _pTlMinSwingATR          = array.get(PRM_TL, 1)
+    int   _pTlTouchMode            = int(array.get(PRM_TL, 2))
+    float _pTlTouchDollar          = array.get(PRM_TL, 3)
+    float _pTlTouchATR             = array.get(PRM_TL, 4)
+    int   _pTlMaxLineAgeBars       = int(array.get(PRM_TL, 5))
+    int   _pTlMinLineTouches       = int(array.get(PRM_TL, 6))
+    int   _pTlBreakConfirmBars     = int(array.get(PRM_TL, 7))
+    bool  _pUseTlQualityFilter     = array.get(PRM_TL, 10) > 0.5
+    int   _pMinTlQuality           = int(array.get(PRM_TL, 11))
+    float _atr = ta.atr(14)
+    float _touchRange = _pTlTouchMode == 1 ? _atr * _pTlTouchATR : _pTlTouchDollar
+
+    // --- 反転ローソク（元コードと同一）---
+    bool _bullEng = close > open and close[1] < open[1] and close >= open[1] and open <= close[1]
+    bool _bearEng = close < open and close[1] > open[1] and close <= open[1] and open >= close[1]
+    float _body   = math.abs(close - open)
+    float _upWick = high - math.max(open, close)
+    float _dnWick = math.min(open, close) - low
+    bool _pinLower = _dnWick >= _body and _dnWick >= _upWick
+    bool _pinUpper = _upWick >= _body and _upWick >= _dnWick
+    bool _bullishReversal = _bullEng or _pinLower or close > open
+    bool _bearishReversal = _bearEng or _pinUpper or close < open
+
+    // --- 確定Pivot（ATR Swing Filter）を高値側・安値側それぞれ4点保持 ---
+    float _ph = ta.pivothigh(high, tlPivotLen, tlPivotLen)
+    float _pl = ta.pivotlow(low, tlPivotLen, tlPivotLen)
+    var float _hp1P = na
+    var float _hp2P = na
+    var float _hp3P = na
+    var float _hp4P = na
+    var int   _hp1B = na
+    var int   _hp2B = na
+    var int   _hp3B = na
+    var int   _hp4B = na
+    var float _lp1P = na
+    var float _lp2P = na
+    var float _lp3P = na
+    var float _lp4P = na
+    var int   _lp1B = na
+    var int   _lp2B = na
+    var int   _lp3B = na
+    var int   _lp4B = na
+    bool _newHighPivot = false
+    bool _newLowPivot  = false
+    if not na(_ph)
+        if na(_hp1P) or not _pTlUseATRSwing or math.abs(_ph - _hp1P) >= _atr * _pTlMinSwingATR
+            _hp4P := _hp3P
+            _hp4B := _hp3B
+            _hp3P := _hp2P
+            _hp3B := _hp2B
+            _hp2P := _hp1P
+            _hp2B := _hp1B
+            _hp1P := _ph
+            _hp1B := bar_index - tlPivotLen
+            _newHighPivot := true
+    if not na(_pl)
+        if na(_lp1P) or not _pTlUseATRSwing or math.abs(_pl - _lp1P) >= _atr * _pTlMinSwingATR
+            _lp4P := _lp3P
+            _lp4B := _lp3B
+            _lp3P := _lp2P
+            _lp3B := _lp2B
+            _lp2P := _lp1P
+            _lp2B := _lp1B
+            _lp1P := _pl
+            _lp1B := bar_index - tlPivotLen
+            _newLowPivot := true
+
+    // --- Touch / Broken カウンタ（新Pivotでリセット）---
+    var int _upTouchA = 0
+    var int _upTouchB = 0
+    var int _upTouchC = 0
+    var int _upBrokA  = 0
+    var int _upBrokB  = 0
+    var int _upBrokC  = 0
+    var int _upBelowA = 0
+    var int _upBelowB = 0
+    var int _upBelowC = 0
+    var int _dnTouchA = 0
+    var int _dnTouchB = 0
+    var int _dnTouchC = 0
+    var int _dnBrokA  = 0
+    var int _dnBrokB  = 0
+    var int _dnBrokC  = 0
+    var int _dnAboveA = 0
+    var int _dnAboveB = 0
+    var int _dnAboveC = 0
+    if _newLowPivot
+        _upTouchA := 0
+        _upTouchB := 0
+        _upTouchC := 0
+        _upBrokA := 0
+        _upBrokB := 0
+        _upBrokC := 0
+        _upBelowA := 0
+        _upBelowB := 0
+        _upBelowC := 0
+    if _newHighPivot
+        _dnTouchA := 0
+        _dnTouchB := 0
+        _dnTouchC := 0
+        _dnBrokA := 0
+        _dnBrokB := 0
+        _dnBrokC := 0
+        _dnAboveA := 0
+        _dnAboveB := 0
+        _dnAboveC := 0
+
+    // --- 上昇Trendline候補（Pivot Low 側）---
+    bool _upValidA = not na(_lp1P) and not na(_lp2P) and _lp1B != _lp2B and (bar_index - _lp2B) <= _pTlMaxLineAgeBars
+    bool _upValidB = not na(_lp1P) and not na(_lp3P) and _lp1B != _lp3B and (bar_index - _lp3B) <= _pTlMaxLineAgeBars
+    bool _upValidC = not na(_lp1P) and not na(_lp4P) and _lp1B != _lp4B and (bar_index - _lp4B) <= _pTlMaxLineAgeBars
+    float _upValA = _upValidA ? f_tlLineValue(_lp2B, _lp2P, _lp1B, _lp1P, bar_index) : na
+    float _upValB = _upValidB ? f_tlLineValue(_lp3B, _lp3P, _lp1B, _lp1P, bar_index) : na
+    float _upValC = _upValidC ? f_tlLineValue(_lp4B, _lp4P, _lp1B, _lp1P, bar_index) : na
+    if not na(_upValA)
+        if f_tlNear(low, _upValA, _touchRange) and _bullishReversal and close > _upValA
+            _upTouchA := _upTouchA + 1
+        _upBelowA := close < _upValA ? _upBelowA + 1 : 0
+        if _upBelowA == _pTlBreakConfirmBars
+            _upBrokA := _upBrokA + 1
+    if not na(_upValB)
+        if f_tlNear(low, _upValB, _touchRange) and _bullishReversal and close > _upValB
+            _upTouchB := _upTouchB + 1
+        _upBelowB := close < _upValB ? _upBelowB + 1 : 0
+        if _upBelowB == _pTlBreakConfirmBars
+            _upBrokB := _upBrokB + 1
+    if not na(_upValC)
+        if f_tlNear(low, _upValC, _touchRange) and _bullishReversal and close > _upValC
+            _upTouchC := _upTouchC + 1
+        _upBelowC := close < _upValC ? _upBelowC + 1 : 0
+        if _upBelowC == _pTlBreakConfirmBars
+            _upBrokC := _upBrokC + 1
+
+    // --- 下降Trendline候補（Pivot High 側）---
+    bool _dnValidA = not na(_hp1P) and not na(_hp2P) and _hp1B != _hp2B and (bar_index - _hp2B) <= _pTlMaxLineAgeBars
+    bool _dnValidB = not na(_hp1P) and not na(_hp3P) and _hp1B != _hp3B and (bar_index - _hp3B) <= _pTlMaxLineAgeBars
+    bool _dnValidC = not na(_hp1P) and not na(_hp4P) and _hp1B != _hp4B and (bar_index - _hp4B) <= _pTlMaxLineAgeBars
+    float _dnValA = _dnValidA ? f_tlLineValue(_hp2B, _hp2P, _hp1B, _hp1P, bar_index) : na
+    float _dnValB = _dnValidB ? f_tlLineValue(_hp3B, _hp3P, _hp1B, _hp1P, bar_index) : na
+    float _dnValC = _dnValidC ? f_tlLineValue(_hp4B, _hp4P, _hp1B, _hp1P, bar_index) : na
+    if not na(_dnValA)
+        if f_tlNear(high, _dnValA, _touchRange) and _bearishReversal and close < _dnValA
+            _dnTouchA := _dnTouchA + 1
+        _dnAboveA := close > _dnValA ? _dnAboveA + 1 : 0
+        if _dnAboveA == _pTlBreakConfirmBars
+            _dnBrokA := _dnBrokA + 1
+    if not na(_dnValB)
+        if f_tlNear(high, _dnValB, _touchRange) and _bearishReversal and close < _dnValB
+            _dnTouchB := _dnTouchB + 1
+        _dnAboveB := close > _dnValB ? _dnAboveB + 1 : 0
+        if _dnAboveB == _pTlBreakConfirmBars
+            _dnBrokB := _dnBrokB + 1
+    if not na(_dnValC)
+        if f_tlNear(high, _dnValC, _touchRange) and _bearishReversal and close < _dnValC
+            _dnTouchC := _dnTouchC + 1
+        _dnAboveC := close > _dnValC ? _dnAboveC + 1 : 0
+        if _dnAboveC == _pTlBreakConfirmBars
+            _dnBrokC := _dnBrokC + 1
+
+    // --- 各ライン Quality ---
+    int _upQA = _upValidA ? f_tlQualityScore(_upTouchA, bar_index - _lp2B, f_tlSlopeATR(_lp2P, _lp2B, _lp1P, _lp1B, _atr), _upBrokA) : -1
+    int _upQB = _upValidB ? f_tlQualityScore(_upTouchB, bar_index - _lp3B, f_tlSlopeATR(_lp3P, _lp3B, _lp1P, _lp1B, _atr), _upBrokB) : -1
+    int _upQC = _upValidC ? f_tlQualityScore(_upTouchC, bar_index - _lp4B, f_tlSlopeATR(_lp4P, _lp4B, _lp1P, _lp1B, _atr), _upBrokC) : -1
+    int _dnQA = _dnValidA ? f_tlQualityScore(_dnTouchA, bar_index - _hp2B, f_tlSlopeATR(_hp2P, _hp2B, _hp1P, _hp1B, _atr), _dnBrokA) : -1
+    int _dnQB = _dnValidB ? f_tlQualityScore(_dnTouchB, bar_index - _hp3B, f_tlSlopeATR(_hp3P, _hp3B, _hp1P, _hp1B, _atr), _dnBrokB) : -1
+    int _dnQC = _dnValidC ? f_tlQualityScore(_dnTouchC, bar_index - _hp4B, f_tlSlopeATR(_hp4P, _hp4B, _hp1P, _hp1B, _atr), _dnBrokC) : -1
+
+    // --- 上昇TL採用（Quality最高・同点は価格に近い方）---
+    int   _selUpIdx = na
+    float _upVal    = na
+    int   _upQual   = 0
+    int   _upTouch  = 0
+    float _upAncP   = na
+    int   _upAncB   = na
+    if _upValidA
+        _selUpIdx := 0
+        _upVal := _upValA
+        _upQual := _upQA
+        _upTouch := _upTouchA
+        _upAncP := _lp2P
+        _upAncB := _lp2B
+    if _upValidB and (na(_selUpIdx) or _upQB > _upQual or (_upQB == _upQual and math.abs(close - _upValB) < math.abs(close - _upVal)))
+        _selUpIdx := 1
+        _upVal := _upValB
+        _upQual := _upQB
+        _upTouch := _upTouchB
+        _upAncP := _lp3P
+        _upAncB := _lp3B
+    if _upValidC and (na(_selUpIdx) or _upQC > _upQual or (_upQC == _upQual and math.abs(close - _upValC) < math.abs(close - _upVal)))
+        _selUpIdx := 2
+        _upVal := _upValC
+        _upQual := _upQC
+        _upTouch := _upTouchC
+        _upAncP := _lp4P
+        _upAncB := _lp4B
+    bool _upValid = not na(_upVal)
+
+    // --- 下降TL採用 ---
+    int   _selDnIdx = na
+    float _dnVal    = na
+    int   _dnQual   = 0
+    int   _dnTouch  = 0
+    float _dnAncP   = na
+    int   _dnAncB   = na
+    if _dnValidA
+        _selDnIdx := 0
+        _dnVal := _dnValA
+        _dnQual := _dnQA
+        _dnTouch := _dnTouchA
+        _dnAncP := _hp2P
+        _dnAncB := _hp2B
+    if _dnValidB and (na(_selDnIdx) or _dnQB > _dnQual or (_dnQB == _dnQual and math.abs(close - _dnValB) < math.abs(close - _dnVal)))
+        _selDnIdx := 1
+        _dnVal := _dnValB
+        _dnQual := _dnQB
+        _dnTouch := _dnTouchB
+        _dnAncP := _hp3P
+        _dnAncB := _hp3B
+    if _dnValidC and (na(_selDnIdx) or _dnQC > _dnQual or (_dnQC == _dnQual and math.abs(close - _dnValC) < math.abs(close - _dnVal)))
+        _selDnIdx := 2
+        _dnVal := _dnValC
+        _dnQual := _dnQC
+        _dnTouch := _dnTouchC
+        _dnAncP := _hp4P
+        _dnAncB := _hp4B
+    bool _dnValid = not na(_dnVal)
+
+    // --- Quality Filter（方向別に分離。反対側のQualityでは許可しない）---
+    bool _upStrong = _upValid and _upQual >= _pMinTlQuality and _upTouch >= _pTlMinLineTouches
+    bool _dnStrong = _dnValid and _dnQual >= _pMinTlQuality and _dnTouch >= _pTlMinLineTouches
+    bool _upQualOk = not _pUseTlQualityFilter or _upStrong
+    bool _dnQualOk = not _pUseTlQualityFilter or _dnStrong
+
+    // ================= Logic13 : Trendline Rebound =================
+    bool _nearUp = f_tlNear(low,  _upVal, _touchRange)
+    bool _nearDn = f_tlNear(high, _dnVal, _touchRange)
+    bool _rebLong  = _upQualOk and _nearUp and _bullishReversal and close > _upVal
+    bool _rebShort = _dnQualOk and _nearDn and _bearishReversal and close < _dnVal
+
+    // ================= Logic14 : Trendline Break =================
+    // 元コードの rawTlBuyBreak / rawTlSellBreak と同一（確定終値で跨いだ瞬間のみ）
+    bool _rawBuyBreak  = not na(_dnVal) and not na(_dnVal[1]) and close > _dnVal and close[1] <= _dnVal[1]
+    bool _rawSellBreak = not na(_upVal) and not na(_upVal[1]) and close < _upVal and close[1] >= _upVal[1]
+    bool _brkLong  = _dnQualOk and _rawBuyBreak
+    bool _brkShort = _upQualOk and _rawSellBreak
+    bool _v2RawBrkL = _brkLong       // ★V2: 新規ブレイク（追跡ラインへの戻りと区別するため）
+    bool _v2RawBrkS = _brkShort
+    float _v2TrkLvl = na             // ★V2: 追跡ラインへの戻りイベントの否定ライン（現在値 / 傾き）
+    float _v2TrkSlp = na
+
+    // --- ブレイクしたラインを x1/y1/x2/y2 で保存して追跡（同じラインへの戻り判定用）---
+    //     _trkSide : 1 = 現在そのラインより上 / -1 = 下 / 0 = 追跡なし
+    var int   _trkX1 = na
+    var float _trkY1 = na
+    var int   _trkX2 = na
+    var float _trkY2 = na
+    var int   _trkOldB = na   // 古い方のPivotバー（有効期限判定用）
+    var int   _trkSide = 0
+
+    if _brkLong
+        // 下降TLを上抜け → その下降TLを追跡（価格はライン上側）
+        _trkX1 := _dnAncB
+        _trkY1 := _dnAncP
+        _trkX2 := _hp1B
+        _trkY2 := _hp1P
+        _trkOldB := _dnAncB
+        _trkSide := 1
+    else if _brkShort
+        // 上昇TLを下抜け → その上昇TLを追跡（価格はライン下側）
+        _trkX1 := _upAncB
+        _trkY1 := _upAncP
+        _trkX2 := _lp1B
+        _trkY2 := _lp1P
+        _trkOldB := _upAncB
+        _trkSide := -1
+    else if _trkSide != 0
+        // 追跡中：ラインが有効期限切れ / データ欠損なら追跡終了
+        if na(_trkX1) or na(_trkX2) or na(_trkOldB) or (bar_index - _trkOldB) > _pTlMaxLineAgeBars
+            _trkSide := 0
+        else
+            // 同じラインの現在バー延長値を終値で逆側へ跨いだら逆方向イベント（1回だけ）
+            float _trkNow = f_tlLineValue(_trkX1, _trkY1, _trkX2, _trkY2, bar_index)
+            _v2TrkLvl := _trkNow
+            _v2TrkSlp := (_trkY2 - _trkY1) / math.max(_trkX2 - _trkX1, 1)
+            if _trkSide == 1 and close < _trkNow
+                _brkShort := true         // 上抜け失敗：同じ下降TLの下へ終値で復帰
+                _trkSide  := -1
+            else if _trkSide == -1 and close > _trkNow
+                _brkLong := true          // 下抜け失敗：同じ上昇TLの上へ終値で復帰
+                _trkSide := 1
+    // ★V2: 判定条件は変更せず、V2 の価格否定用に「成立時の否定ライン」を追加で返す（成立しない足は na）
+    //     ライン値（この足）と傾き（この TF 1本あたり。f_tlLineValue と同じ式）。
+    //     Logic13 : LONG = 採用上昇TL / SHORT = 採用下降TL（ラインの反発）
+    //     Logic14 : 新規ブレイク = 跨いだライン（LONG 下降TL / SHORT 上昇TL）、戻りイベント = 追跡中の同じライン
+    float _v2UpSlp = (not na(_upAncB) and not na(_lp1B)) ? (_lp1P - _upAncP) / math.max(_lp1B - _upAncB, 1) : na
+    float _v2DnSlp = (not na(_dnAncB) and not na(_hp1B)) ? (_hp1P - _dnAncP) / math.max(_hp1B - _dnAncB, 1) : na
+    float _v2BrkLL = _v2RawBrkL ? _dnVal   : _brkLong  ? _v2TrkLvl : na
+    float _v2BrkSL = _v2RawBrkL ? _v2DnSlp : _brkLong  ? _v2TrkSlp : na
+    float _v2BrkLS = _v2RawBrkS ? _upVal   : _brkShort ? _v2TrkLvl : na
+    float _v2BrkSS = _v2RawBrkS ? _v2UpSlp : _brkShort ? _v2TrkSlp : na
+    [_rebLong, _rebShort, _brkLong, _brkShort, _rebLong ? _upVal : na, _rebShort ? _dnVal : na, _rebLong ? _v2UpSlp : na, _rebShort ? _v2DnSlp : na, _v2BrkLL, _v2BrkLS, _v2BrkSL, _v2BrkSS]
+
+// -------------------------------------------------------------------------------------
+// SIGNAL MODULE : Logic15 = H&S Pattern（三尊 / 逆三尊）
+// -------------------------------------------------------------------------------------
+// 検出は元「トレンド + 三尊 環境認識ストラテジー」（f_hsEnvPush / f_hsFindHS）と同一です。
+// 簡略化していません。
+//   ・確定Pivotを配列保持（同方向連続は極値のみ / 前Pivotから ATR×ノイズ倍率 未満は除外 / 上限で最古を破棄）
+//   ・H-L-H-L-H（三尊）/ L-H-L-H-L（逆三尊）の全候補を探索
+//   ・頭の位置 / 頭の突出 / 頭と各肩の最低距離 / 左右肩の価格差 / 肩の時間比 /
+//     ネックライン高低差 / ネックライン傾斜 / パターン横幅 をすべて必須条件として判定
+//   ・スコアリングして最良候補（直近Head優先 → 同一Head内でスコア最高）を採用
+//
+//   形が完成しただけではイベントを出しません。ネックライン（2つのネックPivotを結ぶ斜め線）を
+//   現在バーへ延長し、ATRバッファ込みで確定終値が抜けた足だけがイベントになります。
+//     逆三尊 : close > ネックライン + ATR×バッファ → LONG
+//     三尊   : close < ネックライン - ATR×バッファ → SHORT
+//   右肩完成からブレイク期限内であること、実体率フィルター、方向ローソクも元コードどおり。
+//
+// 同じパターンからは1回だけ（Consumed管理）。新Pivotで再探索しますが、確定済みパターンは
+// 再採用しません。ブレイク前に頭を更新する極値が出た候補はそのHeadごと恒久無効化します。
+// 出力はイベント2値のみで、保持・期限・LONG⇔SHORT切替は POINT MASTER 側が行います。
+// 全6TF対象。共通MTF基盤の各TFコンテキストで評価するため request.security は追加していません。
+grpHS = "④ Logic15 : 三尊 / 逆三尊 パラメータ"
+hsPivotLen        = input.int(4,     "Pivot Length",                    group = grpHS, minval = 1)
+hsMaxPivots       = input.int(16,    "保持Pivot数 (探索対象)",           group = grpHS, minval = 5, maxval = 24)
+hsNoiseATR        = input.float(0.5, "ノイズ除外 前Pivot値幅 ATR倍率",   group = grpHS, step = 0.05)
+hsHeadPromMult    = input.float(1.0, "頭と肩の最低差 ATR倍率",           group = grpHS, step = 0.1)
+hsMinHeadShATR    = input.float(1.0, "頭と各肩の最低距離 ATR倍率",       group = grpHS, step = 0.1)
+hsShoulderATR     = input.float(1.0, "左右肩の価格差 ATR上限",           group = grpHS, step = 0.1)
+hsTimeRatioMin    = input.float(0.5, "肩の時間比 下限",                 group = grpHS, step = 0.05)
+hsTimeRatioMax    = input.float(2.0, "肩の時間比 上限",                 group = grpHS, step = 0.1)
+hsNeckDiffATR     = input.float(1.0, "ネックライン高低差 ATR上限",       group = grpHS, step = 0.1)
+hsMaxNeckSlopeATR = input.float(0.07, "ネックライン最大傾斜 ATR/Bar",    group = grpHS, step = 0.01)
+hsMinPatternBars  = input.int(20,    "パターン最小横幅",                group = grpHS, minval = 1)
+hsMaxPatternBars  = input.int(80,    "パターン最大横幅",                group = grpHS, minval = 2)
+hsBreakBufferATR  = input.float(0.1, "ネックラインブレイクのATRバッファ", group = grpHS, step = 0.05)
+hsBreakMaxBars    = input.int(20,    "右肩完成後のブレイク期限",         group = grpHS, minval = 1)
+useHsBodyFilter   = input.bool(true, "ブレイク実体率フィルターを使う",    group = grpHS)
+hsMinBodyRatio    = input.float(0.45, "最低ブレイク実体率",              group = grpHS, minval = 0.0, maxval = 1.0, step = 0.05)
+
+// --- Logic15 H&S のパラメータ束（input の値をそのまま格納。index = 下のコメント順）---
+//     ロジック関数はここから array.get() で読むため、外部要素は この配列1個だけになります。
+var array<float> PRM_HS = array.from(
+     hsMaxPivots * 1.0,            // 00 : hsMaxPivots
+     hsNoiseATR,                   // 01 : hsNoiseATR
+     hsHeadPromMult,               // 02 : hsHeadPromMult
+     hsMinHeadShATR,               // 03 : hsMinHeadShATR
+     hsShoulderATR,                // 04 : hsShoulderATR
+     hsTimeRatioMin,               // 05 : hsTimeRatioMin
+     hsTimeRatioMax,               // 06 : hsTimeRatioMax
+     hsNeckDiffATR,                // 07 : hsNeckDiffATR
+     hsMaxNeckSlopeATR,            // 08 : hsMaxNeckSlopeATR
+     hsMinPatternBars * 1.0,       // 09 : hsMinPatternBars
+     hsMaxPatternBars * 1.0,       // 10 : hsMaxPatternBars
+     hsBreakBufferATR,             // 11 : hsBreakBufferATR
+     hsBreakMaxBars * 1.0,         // 12 : hsBreakMaxBars
+     useHsBodyFilter ? 1.0 : 0.0,  // 13 : useHsBodyFilter
+     hsMinBodyRatio                // 14 : hsMinBodyRatio
+ )
+
+// Pivot を配列へ追加（元コード f_hsEnvPush と同一。ラベル用の時刻配列だけ省略）
+f_hsPush(_pr, _bar, _hi, _price, _b, _isHigh, _atr) =>
+    // --- パラメータ読み出し（PRM束。値は input と同一）---
+    int   _pHsMaxPivots            = int(array.get(PRM_HS, 0))
+    float _pHsNoiseATR             = array.get(PRM_HS, 1)
+    int _n = array.size(_pr)
+    if _n == 0
+        array.push(_pr, _price)
+        array.push(_bar, _b)
+        array.push(_hi, _isHigh)
+    else
+        bool _lastHigh = array.get(_hi, _n - 1)
+        if _isHigh == _lastHigh
+            float _lastP = array.get(_pr, _n - 1)
+            if (_isHigh and _price > _lastP) or (not _isHigh and _price < _lastP)
+                array.set(_pr, _n - 1, _price)
+                array.set(_bar, _n - 1, _b)
+        else
+            float _lastP = array.get(_pr, _n - 1)
+            if math.abs(_price - _lastP) >= _atr * _pHsNoiseATR
+                array.push(_pr, _price)
+                array.push(_bar, _b)
+                array.push(_hi, _isHigh)
+    while array.size(_pr) > _pHsMaxPivots
+        array.shift(_pr)
+        array.shift(_bar)
+        array.shift(_hi)
+
+// 最良候補の探索（元コード f_hsFindHS と同一。_inv=true で逆三尊）
+// 戻り値 [lsIdx, hdIdx, rsIdx, n1Idx, n2Idx]（未検出は全て -1）
+f_hsFind(_pr, _bar, _hi, _atr, _inv) =>
+    // --- パラメータ読み出し（PRM束。値は input と同一）---
+    float _pHsHeadPromMult         = array.get(PRM_HS, 2)
+    float _pHsMinHeadShATR         = array.get(PRM_HS, 3)
+    float _pHsShoulderATR          = array.get(PRM_HS, 4)
+    float _pHsTimeRatioMin         = array.get(PRM_HS, 5)
+    float _pHsTimeRatioMax         = array.get(PRM_HS, 6)
+    float _pHsNeckDiffATR          = array.get(PRM_HS, 7)
+    float _pHsMaxNeckSlopeATR      = array.get(PRM_HS, 8)
+    int   _pHsMinPatternBars       = int(array.get(PRM_HS, 9))
+    int   _pHsMaxPatternBars       = int(array.get(PRM_HS, 10))
+    int _n = array.size(_pr)
+    float _best = -1e18
+    int _bestHeadBar = -1
+    int _rLs = -1
+    int _rHd = -1
+    int _rRs = -1
+    int _rN1 = -1
+    int _rN2 = -1
+    if _n >= 5 and _atr > 0
+        for _h = 2 to _n - 3
+            if array.get(_hi, _h) != _inv
+                float _hdP = array.get(_pr, _h)
+                int   _hdB = array.get(_bar, _h)
+                for _i = 0 to _h - 2
+                    if array.get(_hi, _i) != _inv
+                        for _j = _h + 2 to _n - 1
+                            if array.get(_hi, _j) != _inv
+                                float _lsP = array.get(_pr, _i)
+                                float _rsP = array.get(_pr, _j)
+                                int   _lsB = array.get(_bar, _i)
+                                int   _rsB = array.get(_bar, _j)
+                                int   _n1 = -1
+                                float _n1P = na
+                                if _i + 1 <= _h - 1
+                                    for _a = _i + 1 to _h - 1
+                                        if array.get(_hi, _a) == _inv
+                                            float _v = array.get(_pr, _a)
+                                            if _n1 == -1 or (_inv ? _v > _n1P : _v < _n1P)
+                                                _n1 := _a
+                                                _n1P := _v
+                                int   _n2 = -1
+                                float _n2P = na
+                                if _h + 1 <= _j - 1
+                                    for _a = _h + 1 to _j - 1
+                                        if array.get(_hi, _a) == _inv
+                                            float _v = array.get(_pr, _a)
+                                            if _n2 == -1 or (_inv ? _v > _n2P : _v < _n2P)
+                                                _n2 := _a
+                                                _n2P := _v
+                                if _n1 != -1 and _n2 != -1
+                                    float _avgSh = (_lsP + _rsP) / 2.0
+                                    float _prom  = _inv ? (_avgSh - _hdP) : (_hdP - _avgSh)
+                                    bool  _headPosOk = _inv ? (_hdP < _lsP and _hdP < _rsP) : (_hdP > _lsP and _hdP > _rsP)
+                                    bool  _promOk = _prom >= _atr * _pHsHeadPromMult
+                                    float _hlDist = _inv ? (_lsP - _hdP) : (_hdP - _lsP)
+                                    float _hrDist = _inv ? (_rsP - _hdP) : (_hdP - _rsP)
+                                    bool  _headDistOk = _hlDist >= _atr * _pHsMinHeadShATR and _hrDist >= _atr * _pHsMinHeadShATR
+                                    bool  _symOk  = math.abs(_lsP - _rsP) <= _atr * _pHsShoulderATR
+                                    float _t1 = _hdB - _lsB
+                                    float _t2 = _rsB - _hdB
+                                    bool  _timeOk = _t1 > 0 and _t2 > 0 and (_t1 / _t2) >= _pHsTimeRatioMin and (_t1 / _t2) <= _pHsTimeRatioMax
+                                    bool  _neckOk = math.abs(_n1P - _n2P) <= _atr * _pHsNeckDiffATR
+                                    int   _n1B = array.get(_bar, _n1)
+                                    int   _n2B = array.get(_bar, _n2)
+                                    float _neckSlope = math.abs(_n2P - _n1P) / math.max(math.abs(_n2B - _n1B), 1) / _atr
+                                    bool  _neckSlopeOk = _neckSlope <= _pHsMaxNeckSlopeATR
+                                    int   _patBars = _rsB - _lsB
+                                    bool  _widthOk = _patBars >= _pHsMinPatternBars and _patBars <= _pHsMaxPatternBars
+                                    if _headPosOk and _promOk and _headDistOk and _symOk and _timeOk and _neckOk and _neckSlopeOk and _widthOk
+                                        float _midW = (_pHsMinPatternBars + _pHsMaxPatternBars) / 2.0
+                                        float _rngW = math.max(_pHsMaxPatternBars - _pHsMinPatternBars, 1)
+                                        float _sc = _prom / _atr - math.abs(_lsP - _rsP) / _atr - math.abs(_t1 - _t2) / math.max(_t1 + _t2, 1.0) * 2.0 - math.abs(_n1P - _n2P) / _atr - math.abs(_patBars - _midW) / _rngW
+                                        if _hdB > _bestHeadBar or (_hdB == _bestHeadBar and _sc > _best)
+                                            _best := _sc
+                                            _bestHeadBar := _hdB
+                                            _rLs := _i
+                                            _rHd := _h
+                                            _rRs := _j
+                                            _rN1 := _n1
+                                            _rN2 := _n2
+    [_rLs, _rHd, _rRs, _rN1, _rN2]
+
+f_hsEvents() =>
+    // --- パラメータ読み出し（PRM束。値は input と同一）---
+    float _pHsBreakBufferATR       = array.get(PRM_HS, 11)
+    int   _pHsBreakMaxBars         = int(array.get(PRM_HS, 12))
+    bool  _pUseHsBodyFilter        = array.get(PRM_HS, 13) > 0.5
+    float _pHsMinBodyRatio         = array.get(PRM_HS, 14)
+    float _atr = ta.atr(14)
+    float _ph = ta.pivothigh(hsPivotLen, hsPivotLen)
+    float _pl = ta.pivotlow(hsPivotLen, hsPivotLen)
+    var array<float> _pPr   = array.new_float()
+    var array<int>   _pBar  = array.new_int()
+    var array<bool>  _pHigh = array.new_bool()
+    // 採用中の 逆三尊(up) / 三尊(dn) パターン（ネックライン計算と期限判定に必要な値だけ保持）
+    var bool  _upReady = false
+    var bool  _upConsumed = false
+    var int   _upHdBar = na
+    var float _upHdP = na
+    var int   _upRsBar = na
+    var float _upN1P = na
+    var int   _upN1B = na
+    var float _upN2P = na
+    var int   _upN2B = na
+    var int   _upDeadHdBar = na
+    var bool  _dnReady = false
+    var bool  _dnConsumed = false
+    var int   _dnHdBar = na
+    var float _dnHdP = na
+    var int   _dnRsBar = na
+    var float _dnN1P = na
+    var int   _dnN1B = na
+    var float _dnN2P = na
+    var int   _dnN2B = na
+    var int   _dnDeadHdBar = na
+
+    bool _newPivot = not na(_ph) or not na(_pl)
+    if not na(_ph)
+        f_hsPush(_pPr, _pBar, _pHigh, _ph, bar_index - hsPivotLen, true, _atr)
+    if not na(_pl)
+        f_hsPush(_pPr, _pBar, _pHigh, _pl, bar_index - hsPivotLen, false, _atr)
+
+    // 新Pivotのたびに両方向を再探索（確定済みHeadは Consumed / Dead で再発火しない）
+    if _newPivot
+        int  _sz   = array.size(_pPr)
+        bool _szOk = array.size(_pBar) == _sz and array.size(_pHigh) == _sz
+        [_uLs, _uHd, _uRs, _uN1, _uN2] = f_hsFind(_pPr, _pBar, _pHigh, _atr, true)
+        _upReady := false
+        bool _upIdxOk = _szOk and _uLs >= 0 and _uLs < _sz and _uHd >= 0 and _uHd < _sz and _uRs >= 0 and _uRs < _sz and _uN1 >= 0 and _uN1 < _sz and _uN2 >= 0 and _uN2 < _sz
+        if _upIdxOk
+            int _hb = array.get(_pBar, _uHd)
+            if _hb != _upHdBar
+                _upConsumed := false
+            _upHdBar := _hb
+            _upHdP  := array.get(_pPr, _uHd)
+            _upRsBar := array.get(_pBar, _uRs)
+            _upN1P := array.get(_pPr, _uN1)
+            _upN1B := array.get(_pBar, _uN1)
+            _upN2P := array.get(_pPr, _uN2)
+            _upN2B := array.get(_pBar, _uN2)
+            if not na(_upDeadHdBar) and _hb == _upDeadHdBar
+                _upReady := false
+            else
+                _upReady := true
+                _upDeadHdBar := na
+        [_dLs, _dHd, _dRs, _dN1, _dN2] = f_hsFind(_pPr, _pBar, _pHigh, _atr, false)
+        _dnReady := false
+        bool _dnIdxOk = _szOk and _dLs >= 0 and _dLs < _sz and _dHd >= 0 and _dHd < _sz and _dRs >= 0 and _dRs < _sz and _dN1 >= 0 and _dN1 < _sz and _dN2 >= 0 and _dN2 < _sz
+        if _dnIdxOk
+            int _hbd = array.get(_pBar, _dHd)
+            if _hbd != _dnHdBar
+                _dnConsumed := false
+            _dnHdBar := _hbd
+            _dnHdP  := array.get(_pPr, _dHd)
+            _dnRsBar := array.get(_pBar, _dRs)
+            _dnN1P := array.get(_pPr, _dN1)
+            _dnN1B := array.get(_pBar, _dN1)
+            _dnN2P := array.get(_pPr, _dN2)
+            _dnN2B := array.get(_pBar, _dN2)
+            if not na(_dnDeadHdBar) and _hbd == _dnDeadHdBar
+                _dnReady := false
+            else
+                _dnReady := true
+                _dnDeadHdBar := na
+
+    // 構造否定（ブレイク前に頭を更新する極値が出たら、そのHeadを恒久無効化）
+    if not na(_pl) and not _upConsumed and not na(_upHdP) and _pl < _upHdP
+        _upReady := false
+        _upDeadHdBar := _upHdBar
+    if not na(_ph) and not _dnConsumed and not na(_dnHdP) and _ph > _dnHdP
+        _dnReady := false
+        _dnDeadHdBar := _dnHdBar
+
+    // ネックラインを斜め線として現在バーへ延長し、ATRバッファ込みの確定終値ブレイクで確定
+    float _bodyRatio = math.abs(close - open) / math.max(high - low, syminfo.mintick)
+    bool  _bodyOk = not _pUseHsBodyFilter or _bodyRatio >= _pHsMinBodyRatio
+    float _neckUp = (_upReady and not na(_upN1B) and not na(_upN2B) and _upN2B != _upN1B) ? _upN1P + (_upN2P - _upN1P) / (_upN2B - _upN1B) * (bar_index - _upN1B) : na
+    float _neckDn = (_dnReady and not na(_dnN1B) and not na(_dnN2B) and _dnN2B != _dnN1B) ? _dnN1P + (_dnN2P - _dnN1P) / (_dnN2B - _dnN1B) * (bar_index - _dnN1B) : na
+    bool _timeUpOk = not na(_upRsBar) and (bar_index - _upRsBar) <= _pHsBreakMaxBars
+    bool _timeDnOk = not na(_dnRsBar) and (bar_index - _dnRsBar) <= _pHsBreakMaxBars
+    bool _buyConfirm  = _upReady and not _upConsumed and _timeUpOk and not na(_neckUp) and close > _neckUp + _atr * _pHsBreakBufferATR and close > open and _bodyOk
+    bool _sellConfirm = _dnReady and not _dnConsumed and _timeDnOk and not na(_neckDn) and close < _neckDn - _atr * _pHsBreakBufferATR and close < open and _bodyOk
+
+    bool _hsLong  = false
+    bool _hsShort = false
+    if _buyConfirm and not _sellConfirm
+        _hsLong := true            // 逆三尊ネックライン上抜け → LONG
+        _upConsumed := true        // 同じパターンからは1回だけ
+    else if _sellConfirm and not _buyConfirm
+        _hsShort := true           // 三尊ネックライン下抜け → SHORT
+        _dnConsumed := true
+
+    // --- PRE（Phase B）: 採用済みパターンがネックラインブレイク待ちの間だけON（候補生成条件は変更なし）---
+    //     CURRENT発火後は Consumed、構造否定は Ready=false、期限切れは _time*Ok=false で即0。
+    bool _hsPreLong  = _upReady and not _upConsumed and _timeUpOk and not na(_neckUp)
+    bool _hsPreShort = _dnReady and not _dnConsumed and _timeDnOk and not na(_neckDn)
+    // ★V2: 判定条件は変更せず、V2 の価格否定用に「成立時の否定ライン」を追加で返す（成立しない足は na）
+    //     LONG = 逆三尊ネックライン / SHORT = 三尊ネックライン（線のブレイク。値と傾き）
+    float _v2HsLvlL = _hsLong  ? _neckUp : na
+    float _v2HsLvlS = _hsShort ? _neckDn : na
+    float _v2HsSlpL = _hsLong  ? (_upN2P - _upN1P) / (_upN2B - _upN1B) : na
+    float _v2HsSlpS = _hsShort ? (_dnN2P - _dnN1P) / (_dnN2B - _dnN1B) : na
+    [_hsLong, _hsShort, _hsPreLong, _hsPreShort, _v2HsLvlL, _v2HsLvlS, _v2HsSlpL, _v2HsSlpS]
+
+// -------------------------------------------------------------------------------------
+// SIGNAL MODULE : Logic16 = Double Top / Double Bottom
+// -------------------------------------------------------------------------------------
+// 検出は元「トレンド + DT/DB 環境認識ストラテジー」（f_dtdbEnvPush / f_dtdbEnvTolOk /
+// f_dtdbEnvScore と候補探索）と同一です。簡略化していません。Triple は実装しません。
+//   ・確定Pivotを時系列1配列で保持（同方向連続はより極端な価格へ置換 / ATRノイズ除外 / 上限で最古を破棄）
+//   ・Double Top = High → Low → High / Double Bottom = Low → High → Low
+//   ・2頂点(2底値)の許容判定（Percent / ATR / PercentOrATR / PercentAndATR）
+//   ・ネック最低深さ / パターン横幅（最小・最大）を必須条件として判定
+//   ・候補スコア（左右差が小 / ネックが深い / 横幅が適正 / 左右の時間バランスが良い）で最良候補を採用
+//
+//   2頂点(2底値)が揃っただけではイベントを出しません。確定終値がネックラインを
+//   ATRバッファ込みで抜けた足だけがイベントになります。
+//     Double Bottom : close > neck + ATR×バッファ → LONG
+//     Double Top    : close < neck - ATR×バッファ → SHORT
+//   2回目の頂点/底値の形成からブレイク期限内であること、実体率フィルター、
+//   ブレイク足の色要求も元コードどおりです。
+//
+// 各パターンのブレイクは1回だけ（Broken管理）。新しい右側Pivotで新候補を採用したときに
+// 再びイベント可能になります。同一足でDTとDBが両方確定した場合は両方のイベントを返し、
+// 方向の裁定は POINT MASTER §6 の同時発生設定に任せます。
+// 出力はイベント2値のみで、保持・期限・LONG⇔SHORT切替は POINT MASTER 側が行います。
+// 全6TF対象。共通MTF基盤の各TFコンテキストで評価するため request.security は追加していません。
+grpDTDB = "④ Logic16 : Double Top / Bottom パラメータ"
+dtdbPivotLen       = input.int(3,     "Pivot Length",                   group = grpDTDB, minval = 1)
+dtdbMaxPivots      = input.int(30,    "保持Pivot数 (探索対象)",          group = grpDTDB, minval = 5, maxval = 50)
+dtdbNoiseATR       = input.float(0.3, "ノイズ除外 前Pivot値幅 ATR倍率",  group = grpDTDB, step = 0.05)
+dtdbTolMode        = input.string("ATR", "頂点/底値の許容判定", options = ["Percent", "ATR", "PercentOrATR", "PercentAndATR"], group = grpDTDB)
+dtdbTolPct         = input.float(0.01, "許容率 (Percent)",              group = grpDTDB, minval = 0.0, step = 0.001)
+dtdbTolATR         = input.float(0.6,  "許容差 (ATR倍率)",              group = grpDTDB, minval = 0.0, step = 0.05)
+dtdbMinNeckDepthATR = input.float(0.6, "ネック最小深さ ATR倍率",         group = grpDTDB, minval = 0.0, step = 0.1)
+dtdbMinPatternBars = input.int(6,     "パターン最小横幅",                group = grpDTDB, minval = 1)
+dtdbMaxPatternBars = input.int(80,    "パターン最大横幅",                group = grpDTDB, minval = 2)
+dtdbBreakBufferATR = input.float(0.0, "ネックラインブレイクのATRバッファ", group = grpDTDB, minval = 0.0, step = 0.05)
+dtdbBreakMaxBars   = input.int(30,    "2回目頂点/底値後のブレイク期限",   group = grpDTDB, minval = 1)
+useDtdbBodyFilter  = input.bool(false, "ブレイク実体率フィルターを使う",   group = grpDTDB)
+dtdbMinBodyRatio   = input.float(0.45, "最低ブレイク実体率",             group = grpDTDB, minval = 0.0, maxval = 1.0, step = 0.05)
+useDtdbBreakColor  = input.bool(false, "ブレイク足の色を要求 (DT=陰線/DB=陽線)", group = grpDTDB)
+
+// --- Logic16 DT/DB のパラメータ束（input の値をそのまま格納。index = 下のコメント順）---
+//     ロジック関数はここから array.get() で読むため、外部要素は この配列1個だけになります。
+var array<float> PRM_DTDB = array.from(
+     dtdbMaxPivots * 1.0,                                                                                      // 00 : dtdbMaxPivots
+     dtdbNoiseATR,                                                                                             // 01 : dtdbNoiseATR
+     dtdbTolMode == "Percent" ? 0.0 : dtdbTolMode == "ATR" ? 1.0 : dtdbTolMode == "PercentOrATR" ? 2.0 : 3.0,  // 02 : dtdbTolMode
+     dtdbTolPct,                                                                                               // 03 : dtdbTolPct
+     dtdbTolATR,                                                                                               // 04 : dtdbTolATR
+     dtdbMinNeckDepthATR,                                                                                      // 05 : dtdbMinNeckDepthATR
+     dtdbMinPatternBars * 1.0,                                                                                 // 06 : dtdbMinPatternBars
+     dtdbMaxPatternBars * 1.0,                                                                                 // 07 : dtdbMaxPatternBars
+     dtdbBreakBufferATR,                                                                                       // 08 : dtdbBreakBufferATR
+     dtdbBreakMaxBars * 1.0,                                                                                   // 09 : dtdbBreakMaxBars
+     useDtdbBodyFilter ? 1.0 : 0.0,                                                                            // 10 : useDtdbBodyFilter
+     dtdbMinBodyRatio,                                                                                         // 11 : dtdbMinBodyRatio
+     useDtdbBreakColor ? 1.0 : 0.0                                                                             // 12 : useDtdbBreakColor
+ )
+
+// Pivot を時系列1配列へ追加（元コード f_dtdbEnvPush と同一。描画用の時刻配列だけ省略）
+f_dtdbPush(_pr, _bar, _hi, _price, _b, _isHigh, _atr) =>
+    // --- パラメータ読み出し（PRM束。値は input と同一）---
+    int   _pDtdbMaxPivots          = int(array.get(PRM_DTDB, 0))
+    float _pDtdbNoiseATR           = array.get(PRM_DTDB, 1)
+    int _n = array.size(_pr)
+    if _n == 0
+        array.push(_pr, _price)
+        array.push(_bar, _b)
+        array.push(_hi, _isHigh)
+    else
+        bool _lastHigh = array.get(_hi, _n - 1)
+        if _isHigh == _lastHigh
+            float _lastP = array.get(_pr, _n - 1)
+            if (_isHigh and _price > _lastP) or (not _isHigh and _price < _lastP)
+                array.set(_pr, _n - 1, _price)
+                array.set(_bar, _n - 1, _b)
+        else
+            float _lastP = array.get(_pr, _n - 1)
+            if math.abs(_price - _lastP) >= _atr * _pDtdbNoiseATR
+                array.push(_pr, _price)
+                array.push(_bar, _b)
+                array.push(_hi, _isHigh)
+    while array.size(_pr) > _pDtdbMaxPivots
+        array.shift(_pr)
+        array.shift(_bar)
+        array.shift(_hi)
+
+// 頂点/底値の許容判定（元コード f_dtdbEnvTolOk と同一）
+f_dtdbTolOk(_a, _b, _atr) =>
+    // --- パラメータ読み出し（PRM束。値は input と同一）---
+    int   _pDtdbTolMode            = int(array.get(PRM_DTDB, 2))
+    float _pDtdbTolPct             = array.get(PRM_DTDB, 3)
+    float _pDtdbTolATR             = array.get(PRM_DTDB, 4)
+    float _diff = math.abs(_a - _b)
+    bool _pctOk = _a != 0 and (_diff / _a) <= _pDtdbTolPct
+    bool _atrOk = _atr > 0 and _diff <= _atr * _pDtdbTolATR
+    _pDtdbTolMode == 0              ? _pctOk :
+     _pDtdbTolMode == 1             ? _atrOk :
+     _pDtdbTolMode == 2             ? (_pctOk or _atrOk) :
+     (_pctOk and _atrOk)
+
+// 候補スコア 0〜100（元コード f_dtdbEnvScore と同一）
+f_dtdbScore(_diff, _atr, _depth, _width, _p1b, _neckb, _p2b) =>
+    // --- パラメータ読み出し（PRM束。値は input と同一）---
+    int   _pDtdbMinPatternBars     = int(array.get(PRM_DTDB, 6))
+    int   _pDtdbMaxPatternBars     = int(array.get(PRM_DTDB, 7))
+    float _sym = _atr > 0 ? math.max(0.0, 1.0 - (_diff / _atr)) : 0.0
+    float _dep = _atr > 0 ? math.min(1.0, _depth / (_atr * 3.0)) : 0.0
+    float _mid = (_pDtdbMinPatternBars + _pDtdbMaxPatternBars) / 2.0
+    float _wid = _mid > 0 ? math.max(0.0, 1.0 - math.abs(_width - _mid) / _mid) : 0.0
+    int _left  = _neckb - _p1b
+    int _right = _p2b - _neckb
+    float _bal = (_left > 0 and _right > 0) ? (math.min(_left, _right) / math.max(_left, _right)) : 0.0
+    (_sym * 40.0) + (_dep * 25.0) + (_wid * 20.0) + (_bal * 15.0)
+
+f_dtdbEvents() =>
+    // --- パラメータ読み出し（PRM束。値は input と同一）---
+    float _pDtdbMinNeckDepthATR    = array.get(PRM_DTDB, 5)
+    int   _pDtdbMinPatternBars     = int(array.get(PRM_DTDB, 6))
+    int   _pDtdbMaxPatternBars     = int(array.get(PRM_DTDB, 7))
+    float _pDtdbBreakBufferATR     = array.get(PRM_DTDB, 8)
+    int   _pDtdbBreakMaxBars       = int(array.get(PRM_DTDB, 9))
+    bool  _pUseDtdbBodyFilter      = array.get(PRM_DTDB, 10) > 0.5
+    float _pDtdbMinBodyRatio       = array.get(PRM_DTDB, 11)
+    bool  _pUseDtdbBreakColor      = array.get(PRM_DTDB, 12) > 0.5
+    float _atr = ta.atr(14)
+    var array<float> _pPr   = array.new_float()
+    var array<int>   _pBar  = array.new_int()
+    var array<bool>  _pHigh = array.new_bool()
+    float _ph = ta.pivothigh(high, dtdbPivotLen, dtdbPivotLen)
+    float _pl = ta.pivotlow(low, dtdbPivotLen, dtdbPivotLen)
+    bool _newHigh = not na(_ph)
+    bool _newLow  = not na(_pl)
+    if _newHigh
+        f_dtdbPush(_pPr, _pBar, _pHigh, _ph, bar_index - dtdbPivotLen, true, _atr)
+    if _newLow
+        f_dtdbPush(_pPr, _pBar, _pHigh, _pl, bar_index - dtdbPivotLen, false, _atr)
+
+    // --- DT候補 状態 ---
+    var bool  _dtActive = false
+    var bool  _dtBroken = false
+    var float _dtNeP = na
+    var int   _dtFormBar = na
+    // --- DB候補 状態 ---
+    var bool  _dbActive = false
+    var bool  _dbBroken = false
+    var float _dbNeP = na
+    var int   _dbFormBar = na
+
+    int _n = array.size(_pPr)
+
+    // --- DT候補探索（新しい High = 2回目の頂点）---
+    if _newHigh and _n >= 3
+        int _k = _n - 1
+        if array.get(_pHigh, _k)
+            float _t2  = array.get(_pPr, _k)
+            int   _t2b = array.get(_pBar, _k)
+            float _best = na
+            for _i = 0 to _k - 2
+                if array.get(_pHigh, _i)
+                    float _t1  = array.get(_pPr, _i)
+                    int   _t1b = array.get(_pBar, _i)
+                    // _i と _k の間で最安の Low をネックラインに
+                    float _neck = na
+                    int   _neckb = na
+                    for _m = _i + 1 to _k - 1
+                        if not array.get(_pHigh, _m)
+                            float _lp = array.get(_pPr, _m)
+                            if na(_neck) or _lp < _neck
+                                _neck  := _lp
+                                _neckb := array.get(_pBar, _m)
+                    if not na(_neck)
+                        float _diff  = math.abs(_t1 - _t2)
+                        float _depth = math.min(_t1, _t2) - _neck
+                        int   _width = _t2b - _t1b
+                        bool  _tolOk   = f_dtdbTolOk(_t1, _t2, _atr)
+                        bool  _depthOk = _depth >= _atr * _pDtdbMinNeckDepthATR
+                        bool  _widthOk = _width >= _pDtdbMinPatternBars and _width <= _pDtdbMaxPatternBars
+                        if _tolOk and _depthOk and _widthOk
+                            float _sc = f_dtdbScore(_diff, _atr, _depth, _width, _t1b, _neckb, _t2b)
+                            if na(_best) or _sc > _best
+                                _best := _sc
+                                _dtActive := true
+                                _dtBroken := false
+                                _dtNeP := _neck
+                                _dtFormBar := bar_index
+
+    // --- DB候補探索（新しい Low = 2回目の底値）---
+    if _newLow and _n >= 3
+        int _k = _n - 1
+        if not array.get(_pHigh, _k)
+            float _b2  = array.get(_pPr, _k)
+            int   _b2b = array.get(_pBar, _k)
+            float _best = na
+            for _i = 0 to _k - 2
+                if not array.get(_pHigh, _i)
+                    float _b1  = array.get(_pPr, _i)
+                    int   _b1b = array.get(_pBar, _i)
+                    // _i と _k の間で最高の High をネックラインに
+                    float _neck = na
+                    int   _neckb = na
+                    for _m = _i + 1 to _k - 1
+                        if array.get(_pHigh, _m)
+                            float _hp = array.get(_pPr, _m)
+                            if na(_neck) or _hp > _neck
+                                _neck  := _hp
+                                _neckb := array.get(_pBar, _m)
+                    if not na(_neck)
+                        float _diff  = math.abs(_b1 - _b2)
+                        float _depth = _neck - math.max(_b1, _b2)
+                        int   _width = _b2b - _b1b
+                        bool  _tolOk   = f_dtdbTolOk(_b1, _b2, _atr)
+                        bool  _depthOk = _depth >= _atr * _pDtdbMinNeckDepthATR
+                        bool  _widthOk = _width >= _pDtdbMinPatternBars and _width <= _pDtdbMaxPatternBars
+                        if _tolOk and _depthOk and _widthOk
+                            float _sc = f_dtdbScore(_diff, _atr, _depth, _width, _b1b, _neckb, _b2b)
+                            if na(_best) or _sc > _best
+                                _best := _sc
+                                _dbActive := true
+                                _dbBroken := false
+                                _dbNeP := _neck
+                                _dbFormBar := bar_index
+
+    // --- ブレイク足フィルター（実体率 / 色）---
+    float _body = math.abs(close - open)
+    float _rng  = high - low
+    bool  _bodyOk    = not _pUseDtdbBodyFilter or (_rng > 0 and (_body / _rng) >= _pDtdbMinBodyRatio)
+    bool  _dtColorOk = not _pUseDtdbBreakColor or close < open
+    bool  _dbColorOk = not _pUseDtdbBreakColor or close > open
+
+    // --- DT ネックライン下抜け（期限切れは失効・同じパターンからは1回だけ）---
+    bool _dtdbShort = false
+    if _dtActive and not _dtBroken and not na(_dtNeP)
+        if not na(_dtFormBar) and (bar_index - _dtFormBar) > _pDtdbBreakMaxBars
+            _dtActive := false
+        else if close < _dtNeP - _atr * _pDtdbBreakBufferATR and _bodyOk and _dtColorOk
+            _dtdbShort := true
+            _dtBroken := true
+
+    // --- DB ネックライン上抜け（期限切れは失効・同じパターンからは1回だけ）---
+    bool _dtdbLong = false
+    if _dbActive and not _dbBroken and not na(_dbNeP)
+        if not na(_dbFormBar) and (bar_index - _dbFormBar) > _pDtdbBreakMaxBars
+            _dbActive := false
+        else if close > _dbNeP + _atr * _pDtdbBreakBufferATR and _bodyOk and _dbColorOk
+            _dtdbLong := true
+            _dbBroken := true
+
+    // --- PRE（Phase B）: 採用済みDB / DT がネックラインブレイク待ちの間だけON（候補生成条件は変更なし）---
+    //     DB → PRE LONG / DT → PRE SHORT。CURRENT発火後は Broken、期限切れは失効で即0。
+    bool _dbInTime   = not (not na(_dbFormBar) and (bar_index - _dbFormBar) > _pDtdbBreakMaxBars)
+    bool _dtInTime   = not (not na(_dtFormBar) and (bar_index - _dtFormBar) > _pDtdbBreakMaxBars)
+    bool _dtdbPreLong  = _dbActive and not _dbBroken and not na(_dbNeP) and _dbInTime
+    bool _dtdbPreShort = _dtActive and not _dtBroken and not na(_dtNeP) and _dtInTime
+
+    // 同一足で両方確定した場合も両方のイベントを返す（方向の裁定は POINT MASTER §6）
+    // ★V2: LONG = DB ネック / SHORT = DT ネック（水平線のブレイク。傾き 0）
+    [_dtdbLong, _dtdbShort, _dtdbPreLong, _dtdbPreShort, _dtdbLong ? _dbNeP : na, _dtdbShort ? _dtNeP : na, _dtdbLong ? 0.0 : na, _dtdbShort ? 0.0 : na]
+
+// -------------------------------------------------------------------------------------
+// SIGNAL MODULE : Logic17 = Wedge Pattern（Bear / Bull）
+// -------------------------------------------------------------------------------------
+// 検出は元「トレンド + ウェッジ 環境認識ストラテジー」（f_wedgeEnvLinePrice /
+// f_wedgeEnvSlope / f_wedgeEnvPush / f_wedgeEnvScore と候補探索）と同一です。
+//   ・確定Pivot High / Low を別配列で保持（ATRノイズ除外 / 上限で最古を破棄）
+//   ・Bear（Rising Wedge） : upSlope > 0 かつ loSlope > 0 かつ loSlope > upSlope
+//   ・Bull（Falling Wedge）: upSlope < 0 かつ loSlope < 0 かつ upSlope < loSlope
+//   ・Slope は ATR正規化して最低 / 最大でフィルター
+//   ・収束条件 WidthNow <= WidthStart × ContractionRatio
+//   ・Pattern Width（最小 / 最大）とラインからの許容誤差付き最低Touch数
+//   ・Quality（Touch数 / 平均誤差 / 収束度 / 横幅）で Bear・Bull の最良候補を独立に保持
+//
+//   候補が完成しただけではイベントを出しません。現在バーまで延長したラインを
+//   確定終値がATRバッファ込みで抜けた足だけがイベントになります。
+//     Bear : close < 下限ライン - ATR×バッファ → SHORT
+//     Bull : close > 上限ライン + ATR×バッファ → LONG
+//   上下ライン交差（WidthNow <= 0 / upper <= lower）で候補は即失効し、ブレイク期限、
+//   実体率フィルター、ブレイク足の色要求、ATR拡大フィルターも元コードどおりです。
+//
+// 各候補のブレイクは1回だけ（Broken管理）。同一足でBearとBullが両方確定した場合は
+// 両方のイベントを返し、方向の裁定は POINT MASTER §6 の同時発生設定に任せます。
+// 出力はイベント2値のみで、保持・期限・LONG⇔SHORT切替は POINT MASTER 側が行います。
+// 全6TF対象。共通MTF基盤の各TFコンテキストで評価するため request.security は追加していません。
+grpWedge = "④ Logic17 : Wedge パラメータ"
+wedgePivotLen        = input.int(3,     "Pivot Length",                  group = grpWedge, minval = 1)
+wedgeMinTouches      = input.int(2,     "最低Pivotタッチ数 (両サイド)",   group = grpWedge, minval = 2, maxval = 4)
+wedgeMaxPivots       = input.int(12,    "保持Pivot数 (各サイド)",         group = grpWedge, minval = 4, maxval = 24)
+wedgeNoiseATR        = input.float(0.5, "ノイズ除外 前Pivot値幅 ATR倍率", group = grpWedge, step = 0.05)
+wedgeTouchTolATR     = input.float(0.5, "ラインからの許容誤差 ATR倍率",   group = grpWedge, minval = 0.0, step = 0.05)
+wedgeMinSlopeATR     = input.float(0.01, "最低傾き slope/ATR (絶対値)",   group = grpWedge, minval = 0.0, step = 0.01)
+wedgeMaxSlopeATR     = input.float(2.0,  "最大傾き slope/ATR (絶対値)",   group = grpWedge, minval = 0.1, step = 0.1)
+wedgeContractionRatio = input.float(0.7, "収束率 WidthNow <= WidthStart ×", group = grpWedge, minval = 0.1, maxval = 1.0, step = 0.05)
+wedgeMinPatternBars  = input.int(8,     "パターン最小横幅",               group = grpWedge, minval = 1)
+wedgeMaxPatternBars  = input.int(80,    "パターン最大横幅",               group = grpWedge, minval = 2)
+wedgeBreakBufferATR  = input.float(0.1, "ラインブレイクのATRバッファ",     group = grpWedge, minval = 0.0, step = 0.05)
+wedgeBreakMaxBars    = input.int(20,    "候補完成後のブレイク期限",        group = grpWedge, minval = 1)
+useWedgeBreakColor   = input.bool(false, "ブレイク足の色を要求 (Bear=陰線/Bull=陽線)", group = grpWedge)
+useWedgeBodyFilter   = input.bool(true,  "ブレイク実体率フィルターを使う",  group = grpWedge)
+wedgeMinBodyRatio    = input.float(0.45, "最低ブレイク実体率",            group = grpWedge, minval = 0.0, maxval = 1.0, step = 0.05)
+useWedgeVolExpansion = input.bool(false, "ブレイク時のATR拡大を要求",      group = grpWedge)
+wedgeAtrExpandLen    = input.int(20,    "ATR拡大 比較本数",               group = grpWedge, minval = 1)
+wedgeAtrExpandMult   = input.float(1.1, "ATR > 平均ATR ×",               group = grpWedge, step = 0.05)
+useWedgeQualityFilter = input.bool(false, "Quality Filterを使う",         group = grpWedge)
+wedgeMinQuality      = input.int(50,    "最低Quality",                   group = grpWedge, minval = 0, maxval = 100)
+
+// --- Logic17 Wedge のパラメータ束（input の値をそのまま格納。index = 下のコメント順）---
+//     ロジック関数はここから array.get() で読むため、外部要素は この配列1個だけになります。
+var array<float> PRM_WEDGE = array.from(
+     wedgeMinTouches * 1.0,              // 00 : wedgeMinTouches
+     wedgeMaxPivots * 1.0,               // 01 : wedgeMaxPivots
+     wedgeNoiseATR,                      // 02 : wedgeNoiseATR
+     wedgeTouchTolATR,                   // 03 : wedgeTouchTolATR
+     wedgeMinSlopeATR,                   // 04 : wedgeMinSlopeATR
+     wedgeMaxSlopeATR,                   // 05 : wedgeMaxSlopeATR
+     wedgeContractionRatio,              // 06 : wedgeContractionRatio
+     wedgeMinPatternBars * 1.0,          // 07 : wedgeMinPatternBars
+     wedgeMaxPatternBars * 1.0,          // 08 : wedgeMaxPatternBars
+     wedgeBreakBufferATR,                // 09 : wedgeBreakBufferATR
+     wedgeBreakMaxBars * 1.0,            // 10 : wedgeBreakMaxBars
+     useWedgeBreakColor ? 1.0 : 0.0,     // 11 : useWedgeBreakColor
+     useWedgeBodyFilter ? 1.0 : 0.0,     // 12 : useWedgeBodyFilter
+     wedgeMinBodyRatio,                  // 13 : wedgeMinBodyRatio
+     useWedgeVolExpansion ? 1.0 : 0.0,   // 14 : useWedgeVolExpansion
+     wedgeAtrExpandMult,                 // 15 : wedgeAtrExpandMult
+     useWedgeQualityFilter ? 1.0 : 0.0,  // 16 : useWedgeQualityFilter
+     wedgeMinQuality * 1.0               // 17 : wedgeMinQuality
+ )
+
+// --- 元コードと同一の補助関数 ---
+f_wedgeLinePrice(_x1, _y1, _x2, _y2, _xNow) =>
+    float _res = na
+    if _x2 != _x1
+        float _slope = (_y2 - _y1) / (_x2 - _x1)
+        _res := _y1 + _slope * (_xNow - _x1)
+    _res
+
+f_wedgeSlope(_x1, _y1, _x2, _y2) =>
+    _x2 != _x1 ? (_y2 - _y1) / (_x2 - _x1) : na
+
+f_wedgePush(_p, _b, _price, _bar, _atr) =>
+    // --- パラメータ読み出し（PRM束。値は input と同一）---
+    int   _pWedgeMaxPivots         = int(array.get(PRM_WEDGE, 1))
+    float _pWedgeNoiseATR          = array.get(PRM_WEDGE, 2)
+    int _n = array.size(_p)
+    if _n == 0
+        array.push(_p, _price)
+        array.push(_b, _bar)
+    else
+        float _last = array.get(_p, _n - 1)
+        if math.abs(_price - _last) >= _atr * _pWedgeNoiseATR
+            array.push(_p, _price)
+            array.push(_b, _bar)
+    while array.size(_p) > _pWedgeMaxPivots
+        array.shift(_p)
+        array.shift(_b)
+
+f_wedgeScore(_touchHi, _touchLo, _avgErr, _atr, _wStart, _wNow, _patBars) =>
+    // --- パラメータ読み出し（PRM束。値は input と同一）---
+    float _pWedgeContractionRatio  = array.get(PRM_WEDGE, 6)
+    int   _pWedgeMinPatternBars    = int(array.get(PRM_WEDGE, 7))
+    int   _pWedgeMaxPatternBars    = int(array.get(PRM_WEDGE, 8))
+    float _touchPts = math.min(20.0, (_touchHi + _touchLo) * 4.0)
+    float _errPts = _atr > 0 ? math.max(0.0, 20.0 - (_avgErr / _atr) * 20.0) : 0.0
+    float _ratio = (not na(_wStart) and _wStart > 0 and not na(_wNow)) ? _wNow / _wStart : 1.0
+    float _contrPts = math.min(25.0, math.max(0.0, (1.0 - _ratio) / math.max(1.0 - _pWedgeContractionRatio, 0.01) * 25.0))
+    float _mid = (_pWedgeMinPatternBars + _pWedgeMaxPatternBars) / 2.0
+    float _barPts = _mid > 0 ? math.max(0.0, 15.0 * (1.0 - math.abs(_patBars - _mid) / _mid)) : 0.0
+    float _crossPts = math.min(20.0, math.max(0.0, (1.0 - _ratio) * 20.0))
+    math.min(100.0, _touchPts + _errPts + _contrPts + _barPts + _crossPts)
+
+f_wedgeEvents() =>
+    // --- パラメータ読み出し（PRM束。値は input と同一）---
+    int   _pWedgeMinTouches        = int(array.get(PRM_WEDGE, 0))
+    float _pWedgeTouchTolATR       = array.get(PRM_WEDGE, 3)
+    float _pWedgeMinSlopeATR       = array.get(PRM_WEDGE, 4)
+    float _pWedgeMaxSlopeATR       = array.get(PRM_WEDGE, 5)
+    float _pWedgeContractionRatio  = array.get(PRM_WEDGE, 6)
+    int   _pWedgeMinPatternBars    = int(array.get(PRM_WEDGE, 7))
+    int   _pWedgeMaxPatternBars    = int(array.get(PRM_WEDGE, 8))
+    float _pWedgeBreakBufferATR    = array.get(PRM_WEDGE, 9)
+    int   _pWedgeBreakMaxBars      = int(array.get(PRM_WEDGE, 10))
+    bool  _pUseWedgeBreakColor     = array.get(PRM_WEDGE, 11) > 0.5
+    bool  _pUseWedgeBodyFilter     = array.get(PRM_WEDGE, 12) > 0.5
+    float _pWedgeMinBodyRatio      = array.get(PRM_WEDGE, 13)
+    bool  _pUseWedgeVolExpansion   = array.get(PRM_WEDGE, 14) > 0.5
+    float _pWedgeAtrExpandMult     = array.get(PRM_WEDGE, 15)
+    bool  _pUseWedgeQualityFilter  = array.get(PRM_WEDGE, 16) > 0.5
+    int   _pWedgeMinQuality        = int(array.get(PRM_WEDGE, 17))
+    float _atr = ta.atr(14)
+    float _atrAvg = ta.sma(_atr, wedgeAtrExpandLen)
+    var array<float> _phP = array.new_float()
+    var array<int>   _phB = array.new_int()
+    var array<float> _plP = array.new_float()
+    var array<int>   _plB = array.new_int()
+    float _ph = ta.pivothigh(high, wedgePivotLen, wedgePivotLen)
+    float _pl = ta.pivotlow(low, wedgePivotLen, wedgePivotLen)
+    bool _newHigh = not na(_ph)
+    bool _newLow  = not na(_pl)
+    if _newHigh
+        f_wedgePush(_phP, _phB, _ph, bar_index - wedgePivotLen, _atr)
+    if _newLow
+        f_wedgePush(_plP, _plB, _pl, bar_index - wedgePivotLen, _atr)
+
+    // --- Bear候補（Rising Wedge）状態 ---
+    var bool  _bearActive = false
+    var bool  _bearBroken = false
+    var float _bearUpP1 = na
+    var int   _bearUpB1 = na
+    var float _bearUpP2 = na
+    var int   _bearUpB2 = na
+    var float _bearLoP1 = na
+    var int   _bearLoB1 = na
+    var float _bearLoP2 = na
+    var int   _bearLoB2 = na
+    var int   _bearFormBar = na
+    var float _bearQual = na
+    // --- Bull候補（Falling Wedge）状態 ---
+    var bool  _bullActive = false
+    var bool  _bullBroken = false
+    var float _bullUpP1 = na
+    var int   _bullUpB1 = na
+    var float _bullUpP2 = na
+    var int   _bullUpB2 = na
+    var float _bullLoP1 = na
+    var int   _bullLoB1 = na
+    var float _bullLoP2 = na
+    var int   _bullLoB2 = na
+    var int   _bullFormBar = na
+    var float _bullQual = na
+
+    int _nH = array.size(_phP)
+    int _nL = array.size(_plP)
+    float _touchTol = _atr * _pWedgeTouchTolATR
+
+    // --- 候補探索（新しいPivotが出た時のみ・右端は最新の高値/安値）---
+    if (_newHigh or _newLow) and _nH >= 2 and _nL >= 2
+        int   _kH  = _nH - 1
+        int   _kL  = _nL - 1
+        float _h2  = array.get(_phP, _kH)
+        int   _h2b = array.get(_phB, _kH)
+        float _l2  = array.get(_plP, _kL)
+        int   _l2b = array.get(_plB, _kL)
+        float _bestBear = na
+        float _bestBull = na
+        for _i = 0 to _kH - 1
+            float _h1  = array.get(_phP, _i)
+            int   _h1b = array.get(_phB, _i)
+            for _a = 0 to _kL - 1
+                float _l1  = array.get(_plP, _a)
+                int   _l1b = array.get(_plB, _a)
+                float _upSlope = f_wedgeSlope(_h1b, _h1, _h2b, _h2)
+                float _loSlope = f_wedgeSlope(_l1b, _l1, _l2b, _l2)
+                if not na(_upSlope) and not na(_loSlope)
+                    // Rising(Bear): 両方上昇・安値傾き>高値傾き / Falling(Bull): 両方下降・高値傾き<安値傾き
+                    bool _isBear = _upSlope > 0 and _loSlope > 0 and _loSlope > _upSlope
+                    bool _isBull = _upSlope < 0 and _loSlope < 0 and _upSlope < _loSlope
+                    if _isBear or _isBull
+                        int _startX = math.min(_h1b, _l1b)
+                        int _rightX = math.max(_h2b, _l2b)
+                        float _upStart = f_wedgeLinePrice(_h1b, _h1, _h2b, _h2, _startX)
+                        float _loStart = f_wedgeLinePrice(_l1b, _l1, _l2b, _l2, _startX)
+                        float _upNow = f_wedgeLinePrice(_h1b, _h1, _h2b, _h2, bar_index)
+                        float _loNow = f_wedgeLinePrice(_l1b, _l1, _l2b, _l2, bar_index)
+                        float _wStart = (not na(_upStart) and not na(_loStart)) ? _upStart - _loStart : na
+                        float _wNow   = (not na(_upNow) and not na(_loNow)) ? _upNow - _loNow : na
+                        int   _patBars = _rightX - _startX
+                        float _upSlopeATR = _atr > 0 ? _upSlope / _atr : na
+                        float _loSlopeATR = _atr > 0 ? _loSlope / _atr : na
+                        bool _slopeOk = not na(_upSlopeATR) and not na(_loSlopeATR) and math.abs(_upSlopeATR) >= _pWedgeMinSlopeATR and math.abs(_upSlopeATR) <= _pWedgeMaxSlopeATR and math.abs(_loSlopeATR) >= _pWedgeMinSlopeATR and math.abs(_loSlopeATR) <= _pWedgeMaxSlopeATR
+                        bool _widthOk = not na(_wStart) and not na(_wNow) and _wStart > 0 and _wNow > 0 and _wNow <= _wStart * _pWedgeContractionRatio
+                        bool _barsOk = _patBars >= _pWedgeMinPatternBars and _patBars <= _pWedgeMaxPatternBars
+                        if _slopeOk and _widthOk and _barsOk
+                            // タッチ数 / ラインからの誤差
+                            int _touchHi = 0
+                            float _errHiSum = 0.0
+                            for _m = 0 to _nH - 1
+                                int _mb = array.get(_phB, _m)
+                                if _mb >= _startX and _mb <= _rightX
+                                    float _lv = f_wedgeLinePrice(_h1b, _h1, _h2b, _h2, _mb)
+                                    if not na(_lv)
+                                        float _e = math.abs(array.get(_phP, _m) - _lv)
+                                        _errHiSum += _e
+                                        if _e <= _touchTol
+                                            _touchHi += 1
+                            int _touchLo = 0
+                            float _errLoSum = 0.0
+                            for _m = 0 to _nL - 1
+                                int _mb = array.get(_plB, _m)
+                                if _mb >= _startX and _mb <= _rightX
+                                    float _lv = f_wedgeLinePrice(_l1b, _l1, _l2b, _l2, _mb)
+                                    if not na(_lv)
+                                        float _e = math.abs(array.get(_plP, _m) - _lv)
+                                        _errLoSum += _e
+                                        if _e <= _touchTol
+                                            _touchLo += 1
+                            bool _touchOk = _touchHi >= _pWedgeMinTouches and _touchLo >= _pWedgeMinTouches
+                            float _avgErr = (_errHiSum + _errLoSum) / math.max(_touchHi + _touchLo, 1)
+                            float _score = f_wedgeScore(_touchHi, _touchLo, _avgErr, _atr, _wStart, _wNow, _patBars)
+                            if _touchOk
+                                if _isBear and (na(_bestBear) or _score > _bestBear)
+                                    _bestBear := _score
+                                    _bearActive := true
+                                    _bearBroken := false
+                                    _bearUpP1 := _h1
+                                    _bearUpB1 := _h1b
+                                    _bearUpP2 := _h2
+                                    _bearUpB2 := _h2b
+                                    _bearLoP1 := _l1
+                                    _bearLoB1 := _l1b
+                                    _bearLoP2 := _l2
+                                    _bearLoB2 := _l2b
+                                    _bearFormBar := bar_index
+                                    _bearQual := _score
+                                if _isBull and (na(_bestBull) or _score > _bestBull)
+                                    _bestBull := _score
+                                    _bullActive := true
+                                    _bullBroken := false
+                                    _bullUpP1 := _h1
+                                    _bullUpB1 := _h1b
+                                    _bullUpP2 := _h2
+                                    _bullUpB2 := _h2b
+                                    _bullLoP1 := _l1
+                                    _bullLoB1 := _l1b
+                                    _bullLoP2 := _l2
+                                    _bullLoB2 := _l2b
+                                    _bullFormBar := bar_index
+                                    _bullQual := _score
+
+    // 品質フィルター（採用候補が品質未満なら候補を無効化）
+    if _bearActive and _pUseWedgeQualityFilter and not na(_bearQual) and _bearQual < _pWedgeMinQuality
+        _bearActive := false
+    if _bullActive and _pUseWedgeQualityFilter and not na(_bullQual) and _bullQual < _pWedgeMinQuality
+        _bullActive := false
+
+    // --- 各候補を現在バーへ延長 ---
+    float _bearUpNow = _bearActive ? f_wedgeLinePrice(_bearUpB1, _bearUpP1, _bearUpB2, _bearUpP2, bar_index) : na
+    float _bearLoNow = _bearActive ? f_wedgeLinePrice(_bearLoB1, _bearLoP1, _bearLoB2, _bearLoP2, bar_index) : na
+    float _bearWNow  = (not na(_bearUpNow) and not na(_bearLoNow)) ? _bearUpNow - _bearLoNow : na
+    float _bullUpNow = _bullActive ? f_wedgeLinePrice(_bullUpB1, _bullUpP1, _bullUpB2, _bullUpP2, bar_index) : na
+    float _bullLoNow = _bullActive ? f_wedgeLinePrice(_bullLoB1, _bullLoP1, _bullLoB2, _bullLoP2, bar_index) : na
+    float _bullWNow  = (not na(_bullUpNow) and not na(_bullLoNow)) ? _bullUpNow - _bullLoNow : na
+
+    // --- ブレイク足フィルター ---
+    float _body = math.abs(close - open)
+    float _rng  = high - low
+    bool  _bodyOk = not _pUseWedgeBodyFilter or (_rng > 0 and (_body / _rng) >= _pWedgeMinBodyRatio)
+    bool  _volOk  = not _pUseWedgeVolExpansion or (not na(_atrAvg) and _atr > _atrAvg * _pWedgeAtrExpandMult)
+    bool  _bearColorOk = not _pUseWedgeBreakColor or close < open
+    bool  _bullColorOk = not _pUseWedgeBreakColor or close > open
+
+    // --- Bear候補: ライン交差失効 / 期限切れ / 下限下抜け ---
+    bool _bearLinesValid = not na(_bearUpNow) and not na(_bearLoNow) and not na(_bearWNow) and _bearWNow > 0 and _bearUpNow > _bearLoNow
+    bool _wedgeShort = false
+    if _bearActive and not _bearBroken
+        if not _bearLinesValid
+            _bearActive := false
+        else if not na(_bearFormBar) and (bar_index - _bearFormBar) > _pWedgeBreakMaxBars
+            _bearActive := false
+        else if close < _bearLoNow - _atr * _pWedgeBreakBufferATR and _bodyOk and _bearColorOk and _volOk
+            _wedgeShort := true
+            _bearBroken := true
+
+    // --- Bull候補: ライン交差失効 / 期限切れ / 上限上抜け ---
+    bool _bullLinesValid = not na(_bullUpNow) and not na(_bullLoNow) and not na(_bullWNow) and _bullWNow > 0 and _bullUpNow > _bullLoNow
+    bool _wedgeLong = false
+    if _bullActive and not _bullBroken
+        if not _bullLinesValid
+            _bullActive := false
+        else if not na(_bullFormBar) and (bar_index - _bullFormBar) > _pWedgeBreakMaxBars
+            _bullActive := false
+        else if close > _bullUpNow + _atr * _pWedgeBreakBufferATR and _bodyOk and _bullColorOk and _volOk
+            _wedgeLong := true
+            _bullBroken := true
+
+    // --- PRE（Phase B）: 正式採用済み Wedge 候補がブレイク待ちの間だけON（候補生成条件は変更なし）---
+    //     Bull(Falling) → PRE LONG / Bear(Rising) → PRE SHORT。
+    //     CURRENT用の Body / Color / ATR Expansion はPRE条件に入れない。
+    //     CURRENT発火後は Broken、ライン交差・期限切れ・品質未満は失効で即0。
+    bool _bullQualOk = not (_pUseWedgeQualityFilter and not na(_bullQual) and _bullQual < _pWedgeMinQuality)
+    bool _bearQualOk = not (_pUseWedgeQualityFilter and not na(_bearQual) and _bearQual < _pWedgeMinQuality)
+    bool _bullInTime = not (not na(_bullFormBar) and (bar_index - _bullFormBar) > _pWedgeBreakMaxBars)
+    bool _bearInTime = not (not na(_bearFormBar) and (bar_index - _bearFormBar) > _pWedgeBreakMaxBars)
+    bool _wedgePreLong  = _bullActive and not _bullBroken and _bullLinesValid and _bullInTime and _bullQualOk
+    bool _wedgePreShort = _bearActive and not _bearBroken and _bearLinesValid and _bearInTime and _bearQualOk
+
+    // 同一足で両方確定した場合も両方のイベントを返す（方向の裁定は POINT MASTER §6）
+    // ★V2: LONG = Bull Wedge の上限ライン / SHORT = Bear Wedge の下限ライン（線のブレイク。値と傾き）
+    float _v2WgSlpL = _wedgeLong  ? f_wedgeSlope(_bullUpB1, _bullUpP1, _bullUpB2, _bullUpP2) : na
+    float _v2WgSlpS = _wedgeShort ? f_wedgeSlope(_bearLoB1, _bearLoP1, _bearLoB2, _bearLoP2) : na
+    [_wedgeLong, _wedgeShort, _wedgePreLong, _wedgePreShort, _wedgeLong ? _bullUpNow : na, _wedgeShort ? _bearLoNow : na, _v2WgSlpL, _v2WgSlpS]
+
+// -------------------------------------------------------------------------------------
+// SIGNAL MODULE : Logic18 = Triangle Pattern（Ascending / Descending のみ）
+// -------------------------------------------------------------------------------------
+// 検出は元「トレンド + トライアングル 環境認識ストラテジー」（f_triangleEnvLinePrice /
+// f_triangleEnvSlope / f_triangleEnvHorizOk / f_triangleEnvPush / f_triangleEnvScore と
+// 候補探索）と同一です。
+//   ・確定Pivot High / Low を別配列で保持（ATRノイズ除外 / 上限で最古を破棄）
+//   ・Ascending  : 上限が水平 かつ 下限が上昇（Higher Low）
+//   ・Descending : 下限が水平 かつ 上限が下降（Lower High）
+//   ・水平判定は Percent / ATR / PercentOrATR / PercentAndATR の4モード
+//   ・収束条件 WidthNow <= WidthStart × ContractionRatio
+//   ・Pattern Width（最小 / 最大）、許容誤差付きの最低Touch数、最大Touch探索数
+//   ・Quality（Touch数 / 平均誤差 / 収束度 / 横幅 / 種類別ライン精度）で最良候補を採用
+//   ・最良と次点が完全同点なら候補競合として失効（方向を勝手に決めない）
+//
+// ★ Symmetrical Triangle は候補探索段階で作らず、イベント出力でも type 1/2 に限定します。
+//
+//   形が完成しただけではイベントを出しません。現在バーまで延長した境界ラインを
+//   確定終値がATRバッファ込みで抜けた足だけがイベントになります。
+//     上限上抜け → LONG（Ascending のブレイク / Descending の否定）
+//     下限下抜け → SHORT（Descending のブレイク / Ascending の否定）
+//   ライン交差（WidthNow <= 0 / upper <= lower）で候補は即失効し、Setup有効期限、
+//   ブレイク期限、実体率フィルター、ブレイク足の色要求、ATR拡大フィルターも元コードどおり。
+//   Retest / FakeBreak / Invalidationイベントモードは移植していません（Breakのみ）。
+//
+// 各候補のブレイクは1回だけ（_brokeDir 管理）。同一足で上下両方が確定した場合は
+// 両方のイベントを返し、方向の裁定は POINT MASTER §6 の同時発生設定に任せます。
+// 出力はイベント2値のみで、保持・期限・LONG⇔SHORT切替は POINT MASTER 側が行います。
+// 全6TF対象。共通MTF基盤の各TFコンテキストで評価するため request.security は追加していません。
+grpTri = "④ Logic18 : Triangle パラメータ"
+triPivotLen        = input.int(3,     "Pivot Length",                  group = grpTri, minval = 1)
+triMinTouches      = input.int(2,     "最低Pivotタッチ数 (両サイド)",   group = grpTri, minval = 2, maxval = 4)
+triMaxTouches      = input.int(6,     "最大タッチ数 (探索上限)",        group = grpTri, minval = 2, maxval = 10)
+triMaxPivots       = input.int(12,    "保持Pivot数 (各サイド)",         group = grpTri, minval = 4, maxval = 24)
+triNoiseATR        = input.float(0.5, "ノイズ除外 前Pivot値幅 ATR倍率", group = grpTri, step = 0.05)
+triTouchTolATR     = input.float(0.5, "ラインからの許容誤差 ATR倍率",   group = grpTri, minval = 0.0, step = 0.05)
+triHorizontalMode  = input.string("PercentOrATR", "水平判定モード", options = ["Percent", "ATR", "PercentOrATR", "PercentAndATR"], group = grpTri)
+triTolerancePct    = input.float(0.004, "水平許容率 (Percent)",        group = grpTri, minval = 0.0, step = 0.001)
+triToleranceATR    = input.float(0.5,  "水平許容差 (ATR倍率)",         group = grpTri, minval = 0.0, step = 0.05)
+triContractionRatio = input.float(0.9, "収束率 WidthNow <= WidthStart ×", group = grpTri, minval = 0.1, maxval = 1.0, step = 0.05)
+triMinPatternBars  = input.int(16,    "パターン最小横幅",               group = grpTri, minval = 1)
+triMaxPatternBars  = input.int(80,    "パターン最大横幅",               group = grpTri, minval = 2)
+triSetupValidBars  = input.int(50,    "セットアップ有効本数",            group = grpTri, minval = 1)
+triBreakMaxBars    = input.int(20,    "候補完成後のブレイク期限",        group = grpTri, minval = 1)
+triBreakBufferATR  = input.float(0.05, "ラインブレイクのATRバッファ",    group = grpTri, minval = 0.0, step = 0.05)
+useTriBreakColor   = input.bool(false, "ブレイク足の色を要求 (上抜け=陽線/下抜け=陰線)", group = grpTri)
+useTriBodyFilter   = input.bool(true,  "ブレイク実体率フィルターを使う",  group = grpTri)
+triMinBodyRatio    = input.float(0.45, "最低ブレイク実体率",            group = grpTri, minval = 0.0, maxval = 1.0, step = 0.05)
+useTriATRExpansion = input.bool(false, "ブレイク時のATR拡大を要求",      group = grpTri)
+triAtrExpandLen    = input.int(20,    "ATR拡大 比較本数",               group = grpTri, minval = 1)
+triAtrExpandMult   = input.float(1.1, "ATR > 平均ATR ×",               group = grpTri, step = 0.05)
+useTriQualityFilter = input.bool(false, "Quality Filterを使う",         group = grpTri)
+triMinQuality      = input.int(50,    "最低Quality",                   group = grpTri, minval = 0, maxval = 100)
+
+// --- Logic18 Triangle のパラメータ束（input の値をそのまま格納。index = 下のコメント順）---
+//     ロジック関数はここから array.get() で読むため、外部要素は この配列1個だけになります。
+var array<float> PRM_TRI = array.from(
+     triMinTouches * 1.0,                                                                                                        // 00 : triMinTouches
+     triMaxTouches * 1.0,                                                                                                        // 01 : triMaxTouches
+     triMaxPivots * 1.0,                                                                                                         // 02 : triMaxPivots
+     triNoiseATR,                                                                                                                // 03 : triNoiseATR
+     triTouchTolATR,                                                                                                             // 04 : triTouchTolATR
+     triHorizontalMode == "Percent" ? 0.0 : triHorizontalMode == "ATR" ? 1.0 : triHorizontalMode == "PercentOrATR" ? 2.0 : 3.0,  // 05 : triHorizontalMode
+     triTolerancePct,                                                                                                            // 06 : triTolerancePct
+     triToleranceATR,                                                                                                            // 07 : triToleranceATR
+     triContractionRatio,                                                                                                        // 08 : triContractionRatio
+     triMinPatternBars * 1.0,                                                                                                    // 09 : triMinPatternBars
+     triMaxPatternBars * 1.0,                                                                                                    // 10 : triMaxPatternBars
+     triSetupValidBars * 1.0,                                                                                                    // 11 : triSetupValidBars
+     triBreakMaxBars * 1.0,                                                                                                      // 12 : triBreakMaxBars
+     triBreakBufferATR,                                                                                                          // 13 : triBreakBufferATR
+     useTriBreakColor ? 1.0 : 0.0,                                                                                               // 14 : useTriBreakColor
+     useTriBodyFilter ? 1.0 : 0.0,                                                                                               // 15 : useTriBodyFilter
+     triMinBodyRatio,                                                                                                            // 16 : triMinBodyRatio
+     useTriATRExpansion ? 1.0 : 0.0,                                                                                             // 17 : useTriATRExpansion
+     triAtrExpandMult,                                                                                                           // 18 : triAtrExpandMult
+     useTriQualityFilter ? 1.0 : 0.0,                                                                                            // 19 : useTriQualityFilter
+     triMinQuality * 1.0                                                                                                         // 20 : triMinQuality
+ )
+
+// --- 元コードと同一の補助関数 ---
+f_triLinePrice(_x1, _y1, _x2, _y2, _xNow) =>
+    float _res = na
+    if _x2 != _x1
+        float _slope = (_y2 - _y1) / (_x2 - _x1)
+        _res := _y1 + _slope * (_xNow - _x1)
+    _res
+
+f_triSlope(_x1, _y1, _x2, _y2) =>
+    _x2 != _x1 ? (_y2 - _y1) / (_x2 - _x1) : na
+
+f_triHorizOk(_a, _b, _atr) =>
+    // --- パラメータ読み出し（PRM束。値は input と同一）---
+    int   _pTriHorizontalMode      = int(array.get(PRM_TRI, 5))
+    float _pTriTolerancePct        = array.get(PRM_TRI, 6)
+    float _pTriToleranceATR        = array.get(PRM_TRI, 7)
+    float _diff = math.abs(_a - _b)
+    bool _pctOk = _a != 0 and (_diff / _a) <= _pTriTolerancePct
+    bool _atrOk = _atr > 0 and _diff <= _atr * _pTriToleranceATR
+    _pTriHorizontalMode == 0              ? _pctOk :
+     _pTriHorizontalMode == 1             ? _atrOk :
+     _pTriHorizontalMode == 2             ? (_pctOk or _atrOk) :
+     (_pctOk and _atrOk)
+
+f_triPush(_p, _b, _price, _bar, _atr) =>
+    // --- パラメータ読み出し（PRM束。値は input と同一）---
+    int   _pTriMaxPivots           = int(array.get(PRM_TRI, 2))
+    float _pTriNoiseATR            = array.get(PRM_TRI, 3)
+    int _n = array.size(_p)
+    if _n == 0
+        array.push(_p, _price)
+        array.push(_b, _bar)
+    else
+        float _last = array.get(_p, _n - 1)
+        if math.abs(_price - _last) >= _atr * _pTriNoiseATR
+            array.push(_p, _price)
+            array.push(_b, _bar)
+    while array.size(_p) > _pTriMaxPivots
+        array.shift(_p)
+        array.shift(_b)
+
+f_triScore(_touchHi, _touchLo, _avgErr, _atr, _wStart, _wNow, _patBars, _lineP) =>
+    // --- パラメータ読み出し（PRM束。値は input と同一）---
+    float _pTriContractionRatio    = array.get(PRM_TRI, 8)
+    int   _pTriMinPatternBars      = int(array.get(PRM_TRI, 9))
+    int   _pTriMaxPatternBars      = int(array.get(PRM_TRI, 10))
+    float _touchPts = math.min(20.0, (_touchHi + _touchLo) * 4.0)
+    float _errPts = _atr > 0 ? math.max(0.0, 15.0 - (_avgErr / _atr) * 15.0) : 0.0
+    float _ratio = (not na(_wStart) and _wStart > 0 and not na(_wNow)) ? _wNow / _wStart : 1.0
+    float _contrPts = math.min(20.0, math.max(0.0, (1.0 - _ratio) / math.max(1.0 - _pTriContractionRatio, 0.01) * 20.0))
+    float _mid = (_pTriMinPatternBars + _pTriMaxPatternBars) / 2.0
+    float _barPts = _mid > 0 ? math.max(0.0, 10.0 * (1.0 - math.abs(_patBars - _mid) / _mid)) : 0.0
+    float _crossPts = math.min(10.0, math.max(0.0, (1.0 - _ratio) * 10.0))
+    math.min(100.0, _touchPts + _errPts + _contrPts + _barPts + _crossPts + math.min(25.0, math.max(0.0, _lineP)))
+
+f_triangleEvents() =>
+    // --- パラメータ読み出し（PRM束。値は input と同一）---
+    int   _pTriMinTouches          = int(array.get(PRM_TRI, 0))
+    int   _pTriMaxTouches          = int(array.get(PRM_TRI, 1))
+    float _pTriTouchTolATR         = array.get(PRM_TRI, 4)
+    float _pTriTolerancePct        = array.get(PRM_TRI, 6)
+    float _pTriContractionRatio    = array.get(PRM_TRI, 8)
+    int   _pTriMinPatternBars      = int(array.get(PRM_TRI, 9))
+    int   _pTriMaxPatternBars      = int(array.get(PRM_TRI, 10))
+    int   _pTriSetupValidBars      = int(array.get(PRM_TRI, 11))
+    int   _pTriBreakMaxBars        = int(array.get(PRM_TRI, 12))
+    float _pTriBreakBufferATR      = array.get(PRM_TRI, 13)
+    bool  _pUseTriBreakColor       = array.get(PRM_TRI, 14) > 0.5
+    bool  _pUseTriBodyFilter       = array.get(PRM_TRI, 15) > 0.5
+    float _pTriMinBodyRatio        = array.get(PRM_TRI, 16)
+    bool  _pUseTriATRExpansion     = array.get(PRM_TRI, 17) > 0.5
+    float _pTriAtrExpandMult       = array.get(PRM_TRI, 18)
+    bool  _pUseTriQualityFilter    = array.get(PRM_TRI, 19) > 0.5
+    int   _pTriMinQuality          = int(array.get(PRM_TRI, 20))
+    float _atr = ta.atr(14)
+    float _atrAvg = ta.sma(_atr, triAtrExpandLen)
+    var array<float> _phP = array.new_float()
+    var array<int>   _phB = array.new_int()
+    var array<float> _plP = array.new_float()
+    var array<int>   _plB = array.new_int()
+    float _ph = ta.pivothigh(high, triPivotLen, triPivotLen)
+    float _pl = ta.pivotlow(low, triPivotLen, triPivotLen)
+    bool _newHigh = not na(_ph)
+    bool _newLow  = not na(_pl)
+    if _newHigh
+        f_triPush(_phP, _phB, _ph, bar_index - triPivotLen, _atr)
+    if _newLow
+        f_triPush(_plP, _plB, _pl, bar_index - triPivotLen, _atr)
+
+    // --- 採用候補 状態（1候補・種類混線なし）---
+    var bool  _active = false
+    var int   _type   = 0     // 1=Ascending / 2=Descending（Symmetricalは作らない）
+    var float _upP1 = na
+    var int   _upB1 = na
+    var float _upP2 = na
+    var int   _upB2 = na
+    var float _loP1 = na
+    var int   _loB1 = na
+    var float _loP2 = na
+    var int   _loB2 = na
+    var float _wStart  = na
+    var int   _formBar = na
+    var float _quality = na
+    var int   _brokeDir = 0   // 1候補につきブレイクは1回だけ
+
+    int _nH = array.size(_phP)
+    int _nL = array.size(_plP)
+    float _touchTol = _atr * _pTriTouchTolATR
+
+    // --- 候補探索（新しいPivotが出た時のみ・右端は最新の高値/安値）---
+    if (_newHigh or _newLow) and _nH >= 2 and _nL >= 2
+        int   _kH  = _nH - 1
+        int   _kL  = _nL - 1
+        float _h2  = array.get(_phP, _kH)
+        int   _h2b = array.get(_phB, _kH)
+        float _l2  = array.get(_plP, _kL)
+        int   _l2b = array.get(_plB, _kL)
+        float _bestScore = na
+        float _secondBest = na
+        int   _bestType  = 0
+        float _cUpP1 = na
+        int   _cUpB1 = na
+        float _cLoP1 = na
+        int   _cLoB1 = na
+        float _cWStart = na
+        float _cQual = na
+        for _i = 0 to _kH - 1
+            float _h1  = array.get(_phP, _i)
+            int   _h1b = array.get(_phB, _i)
+            for _a = 0 to _kL - 1
+                float _l1  = array.get(_plP, _a)
+                int   _l1b = array.get(_plB, _a)
+                float _upSl = f_triSlope(_h1b, _h1, _h2b, _h2)
+                float _loSl = f_triSlope(_l1b, _l1, _l2b, _l2)
+                if not na(_upSl) and not na(_loSl)
+                    bool _upHoriz = f_triHorizOk(_h1, _h2, _atr)
+                    bool _loHoriz = f_triHorizOk(_l1, _l2, _atr)
+                    bool _isAsc  = _upHoriz and _loSl > 0
+                    bool _isDesc = _loHoriz and _upSl < 0
+                    // ★ Symmetrical（_upSl < 0 and _loSl > 0 で両方非水平）はここで作らない
+                    if _isAsc or _isDesc
+                        int _startX = math.min(_h1b, _l1b)
+                        int _rightX = math.max(_h2b, _l2b)
+                        float _upStart = f_triLinePrice(_h1b, _h1, _h2b, _h2, _startX)
+                        float _loStart = f_triLinePrice(_l1b, _l1, _l2b, _l2, _startX)
+                        float _upNw = f_triLinePrice(_h1b, _h1, _h2b, _h2, bar_index)
+                        float _loNw = f_triLinePrice(_l1b, _l1, _l2b, _l2, bar_index)
+                        float _wS = (not na(_upStart) and not na(_loStart)) ? _upStart - _loStart : na
+                        float _wN = (not na(_upNw) and not na(_loNw)) ? _upNw - _loNw : na
+                        int   _pB = _rightX - _startX
+                        bool _widthOk = not na(_wS) and not na(_wN) and _wS > 0 and _wN > 0 and _upNw > _loNw and _wN <= _wS * _pTriContractionRatio
+                        bool _barsOk = _pB >= _pTriMinPatternBars and _pB <= _pTriMaxPatternBars
+                        if _widthOk and _barsOk
+                            int _tHi = 0
+                            float _eHi = 0.0
+                            for _m = 0 to _nH - 1
+                                int _mb = array.get(_phB, _m)
+                                if _mb >= _startX and _mb <= _rightX and _tHi < _pTriMaxTouches
+                                    float _lv = f_triLinePrice(_h1b, _h1, _h2b, _h2, _mb)
+                                    if not na(_lv)
+                                        float _e = math.abs(array.get(_phP, _m) - _lv)
+                                        _eHi += _e
+                                        if _e <= _touchTol
+                                            _tHi += 1
+                            int _tLo = 0
+                            float _eLo = 0.0
+                            for _m = 0 to _nL - 1
+                                int _mb = array.get(_plB, _m)
+                                if _mb >= _startX and _mb <= _rightX and _tLo < _pTriMaxTouches
+                                    float _lv = f_triLinePrice(_l1b, _l1, _l2b, _l2, _mb)
+                                    if not na(_lv)
+                                        float _e = math.abs(array.get(_plP, _m) - _lv)
+                                        _eLo += _e
+                                        if _e <= _touchTol
+                                            _tLo += 1
+                            if _tHi >= _pTriMinTouches and _tLo >= _pTriMinTouches
+                                float _avgE = (_eHi + _eLo) / math.max(_tHi + _tLo, 1)
+                                // ライン精度点: Asc=上限水平精度 / Desc=下限水平精度
+                                float _lineP = 0.0
+                                if _isAsc
+                                    _lineP := (_h1 != 0 and _pTriTolerancePct > 0) ? math.max(0.0, 25.0 * (1.0 - (math.abs(_h1 - _h2) / _h1) / _pTriTolerancePct)) : 12.0
+                                else
+                                    _lineP := (_l1 != 0 and _pTriTolerancePct > 0) ? math.max(0.0, 25.0 * (1.0 - (math.abs(_l1 - _l2) / _l1) / _pTriTolerancePct)) : 12.0
+                                float _sc = f_triScore(_tHi, _tLo, _avgE, _atr, _wS, _wN, _pB, _lineP)
+                                int _ty = _isAsc ? 1 : 2
+                                if na(_bestScore) or _sc > _bestScore
+                                    _secondBest := _bestScore
+                                    _bestScore := _sc
+                                    _bestType := _ty
+                                    _cUpP1 := _h1
+                                    _cUpB1 := _h1b
+                                    _cLoP1 := _l1
+                                    _cLoB1 := _l1b
+                                    _cWStart := _wS
+                                    _cQual := _sc
+                                else if na(_secondBest) or _sc > _secondBest
+                                    _secondBest := _sc
+        // 候補競合: 最良と次点が完全同点なら失効（方向を勝手に決めない）。品質フィルターも適用。
+        bool _qualOk = not _pUseTriQualityFilter or (not na(_cQual) and _cQual >= _pTriMinQuality)
+        if _bestType != 0 and not na(_bestScore) and (na(_secondBest) or _bestScore > _secondBest) and _qualOk
+            _active := true
+            _type := _bestType
+            _upP1 := _cUpP1
+            _upB1 := _cUpB1
+            _upP2 := _h2
+            _upB2 := _h2b
+            _loP1 := _cLoP1
+            _loB1 := _cLoB1
+            _loP2 := _l2
+            _loB2 := _l2b
+            _wStart := _cWStart
+            _formBar := bar_index
+            _quality := _cQual
+            _brokeDir := 0        // 新候補 → ブレイク判定を再有効化
+        else if _bestType != 0 and not na(_bestScore) and not na(_secondBest) and _bestScore == _secondBest
+            _active := false
+
+    // --- 現在バーへライン延長 ---
+    float _upperNow = _active ? f_triLinePrice(_upB1, _upP1, _upB2, _upP2, bar_index) : na
+    float _lowerNow = _active ? f_triLinePrice(_loB1, _loP1, _loB2, _loP2, bar_index) : na
+    float _widthNow = (not na(_upperNow) and not na(_lowerNow)) ? _upperNow - _lowerNow : na
+
+    // --- ライン交差失効 / Setup有効期限 / ブレイク期限 ---
+    bool _linesValid = not na(_upperNow) and not na(_lowerNow) and not na(_widthNow) and _widthNow > 0 and _upperNow > _lowerNow
+    if _active
+        if not _linesValid
+            _active := false
+        else if not na(_formBar) and (bar_index - _formBar) > _pTriSetupValidBars
+            _active := false
+        else if _brokeDir == 0 and not na(_formBar) and (bar_index - _formBar) > _pTriBreakMaxBars
+            _active := false
+
+    // --- ブレイク足フィルター ---
+    float _body = math.abs(close - open)
+    float _rng  = high - low
+    bool  _bodyOk = not _pUseTriBodyFilter or (_rng > 0 and (_body / _rng) >= _pTriMinBodyRatio)
+    bool  _volOk  = not _pUseTriATRExpansion or (not na(_atrAvg) and _atr > _atrAvg * _pTriAtrExpandMult)
+    bool  _upColorOk = not _pUseTriBreakColor or close > open
+    bool  _loColorOk = not _pUseTriBreakColor or close < open
+
+    // --- ブレイク検出（Ascending / Descending のみ・1候補1ブレイク）---
+    bool _typeOk = _type == 1 or _type == 2
+    bool _upperBreak = _active and _typeOk and _brokeDir == 0 and _linesValid and close > _upperNow + _atr * _pTriBreakBufferATR and _bodyOk and _upColorOk and _volOk
+    bool _lowerBreak = _active and _typeOk and _brokeDir == 0 and _linesValid and close < _lowerNow - _atr * _pTriBreakBufferATR and _bodyOk and _loColorOk and _volOk
+    if _upperBreak
+        _brokeDir := 1
+    if _lowerBreak
+        _brokeDir := -1
+
+    // --- PRE（Phase B）: 正式候補（_active）の形状Bias。候補未完成段階はPREにしない ---
+    //     Ascending(_type 1) → PRE LONG / Descending(_type 2) → PRE SHORT（raw State Factor は 1.0。0.5 は §7 の PRE_LOGIC_FACTOR[Logic18]）。
+    //     「CURRENT方向の予約」ではなく形状Biasなので、Asc PRE LONG 中の下抜け CURRENT SHORT 等は正常。
+    //     失効・上下いずれかのブレイク（_brokeDir != 0）で即0。
+    bool _triSetupInTime = not (not na(_formBar) and (bar_index - _formBar) > _pTriSetupValidBars)
+    bool _triBreakInTime = not (not na(_formBar) and (bar_index - _formBar) > _pTriBreakMaxBars)
+    bool _triPreBase  = _active and _typeOk and _brokeDir == 0 and _linesValid and _triSetupInTime and _triBreakInTime
+    bool _triPreLong  = _triPreBase and _type == 1
+    bool _triPreShort = _triPreBase and _type == 2
+
+    // 上限上抜け → LONG（Ascブレイク / Desc否定）/ 下限下抜け → SHORT（Descブレイク / Asc否定）
+    // 同一足で両方確定した場合も両方のイベントを返す（方向の裁定は POINT MASTER §6）
+    // ★V2: LONG = 上限ライン / SHORT = 下限ライン（線のブレイク。値と傾き）
+    float _v2TrSlpL = _upperBreak ? f_triSlope(_upB1, _upP1, _upB2, _upP2) : na
+    float _v2TrSlpS = _lowerBreak ? f_triSlope(_loB1, _loP1, _loB2, _loP2) : na
+    [_upperBreak, _lowerBreak, _triPreLong, _triPreShort, _upperBreak ? _upperNow : na, _lowerBreak ? _lowerNow : na, _v2TrSlpL, _v2TrSlpS]
+
+// -------------------------------------------------------------------------------------
+// LONG / SHORT の bool 配列 → ビットマスク（Engine A / B / C 共通）
+// -------------------------------------------------------------------------------------
+// ビット位置は「そのEngine内での通し番号（0始まり）」です。
+// Engine をまたぐ元のロジック番号への対応は §6 で行います。
+f_packMasks(longs, shorts) =>
+    float lm = 0.0
+    float sm = 0.0
+    for i = 0 to array.size(longs) - 1
+        float bit = math.pow(2, i)
+        lm += array.get(longs,  i) ? bit : 0.0
+        sm += array.get(shorts, i) ? bit : 0.0
+    [lm, sm]
+
+// =====================================================================================
+// Engine B : Logic13〜18（Trendline / H&S / DT/DB / Wedge / Triangle）
+// =====================================================================================
+f_signalMasksB() =>
+    // -------------------------------------------------------------------------------
+    // ▼▼▼ ここから：Engine B のロジック判定 ▼▼▼
+    // -------------------------------------------------------------------------------
+    // Logic13 : Trendline Rebound / Logic14 : Trendline Break（同じTrendline状態から両方を取得）
+    [l13Long, l13Short, l14Long, l14Short, x13L, x13S, s13L, s13S, x14L, x14S, s14L, s14S] = f_trendlineEvents()
+
+    // Logic15 : H&S Pattern（逆三尊ネックライン上抜け = LONG / 三尊ネックライン下抜け = SHORT）
+    [l15Long, l15Short, l15PreLong, l15PreShort, x15L, x15S, s15L, s15S] = f_hsEvents()
+
+    // Logic16 : Double Top / Bottom（DBネック上抜け = LONG / DTネック下抜け = SHORT）
+    [l16Long, l16Short, l16PreLong, l16PreShort, x16L, x16S, s16L, s16S] = f_dtdbEvents()
+
+    // Logic17 : Wedge Pattern（Bull上限上抜け = LONG / Bear下限下抜け = SHORT）
+    [l17Long, l17Short, l17PreLong, l17PreShort, x17L, x17S, s17L, s17S] = f_wedgeEvents()
+
+    // Logic18 : Triangle Pattern（上限上抜け = LONG / 下限下抜け = SHORT・Asc / Desc のみ）
+    [l18Long, l18Short, l18PreLong, l18PreShort, x18L, x18S, s18L, s18S] = f_triangleEvents()
+
+    // ★Engine B へロジックを追加する時はここに定義し、下の array.from と ENG_B_N を更新する
+    // -------------------------------------------------------------------------------
+    // ▲▲▲ ここまで（Engine B）▲▲▲
+    // -------------------------------------------------------------------------------
+    // Engine B 内のビット順（0始まり）= Logic13, 14, ..., 18
+    longsB  = array.from(l13Long,  l14Long,  l15Long,  l16Long,  l17Long,  l18Long)
+    shortsB = array.from(l13Short, l14Short, l15Short, l16Short, l17Short, l18Short)
+    [lmB, smB] = f_packMasks(longsB, shortsB)
+
+    // PRE ビットマスク（Phase B）。Logic13 / 14 は PRE 対象外なので常に 0。
+    // Triangle（Logic18）の factor はマスクには持たず、§7 で PRE_LOGIC_FACTOR[Logic18] を掛ける。
+    preLongsB  = array.from(false, false, l15PreLong,  l16PreLong,  l17PreLong,  l18PreLong)
+    preShortsB = array.from(false, false, l15PreShort, l16PreShort, l17PreShort, l18PreShort)
+    [preLmB, preSmB] = f_packMasks(preLongsB, preShortsB)
+    // ★V2 追加出力（判定には使わない）: Logic13〜18 の否定ライン（成立時の値）と傾き（この TF 1本あたり）
+    [lmB, smB, preLmB, preSmB, close, x13L, x13S, x14L, x14S, x15L, x15S, x16L, x16S, x17L, x17S, x18L, x18S, s13L, s13S, s14L, s14S, s15L, s15S, s16L, s16S, s17L, s17S, s18L, s18S]
+
+// ビットマスクから「ロジック番号 idx」のフラグを取り出す
+f_bitOn(mask, idx) =>
+    na(mask) ? false : math.floor(mask / math.pow(2, idx)) % 2 > 0.5
+// =====================================================================================
+// §5. 5M / 15M 取得（元版の非リペイント方式のまま。1M の取得は持たない）
+// =====================================================================================
+// request.security(..., <式>[1], lookahead = barmerge.lookahead_on)（直近の確定足。[1] は必須）
+// V2 用の追加出力（この TF 足の close 等・否定ライン）は 1 個の UDT にまとめて返す。
+// request 呼び出し 2 本、タプル要素 6 × 2 = 12 個。
+type SRCBX
+    float f0 = na
+    float f1 = na
+    float f2 = na
+    float f3 = na
+    float f4 = na
+    float f5 = na
+    float f6 = na
+    float f7 = na
+    float f8 = na
+    float f9 = na
+    float f10 = na
+    float f11 = na
+    float f12 = na
+    float f13 = na
+    float f14 = na
+    float f15 = na
+    float f16 = na
+    float f17 = na
+    float f18 = na
+    float f19 = na
+    float f20 = na
+    float f21 = na
+    float f22 = na
+    float f23 = na
+    float f24 = na
+
+f_srcArr(SRCBX o) =>
+    SRCBX q = na(o) ? SRCBX.new() : o
+    array.from(q.f0, q.f1, q.f2, q.f3, q.f4, q.f5, q.f6, q.f7, q.f8, q.f9, q.f10, q.f11, q.f12, q.f13, q.f14, q.f15, q.f16, q.f17, q.f18, q.f19, q.f20, q.f21, q.f22, q.f23, q.f24)
+
+f_htfPacket() =>
+    [lmRaw, smRaw, plmRaw, psmRaw, xC, x13L, x13S, x14L, x14S, x15L, x15S, x16L, x16S, x17L, x17S, x18L, x18S, s13L, s13S, s14L, s14S, s15L, s15S, s16L, s16S, s17L, s17S, s18L, s18S] = f_signalMasksB()
+    float lm  = nz(lmRaw)
+    float sm  = nz(smRaw)
+    float plm = nz(plmRaw)
+    float psm = nz(psmRaw)
+    int   tt  = time
+    [lm[1], sm[1], plm[1], psm[1], tt[1], SRCBX.new(xC[1], x13L[1], x13S[1], x14L[1], x14S[1], x15L[1], x15S[1], x16L[1], x16S[1], x17L[1], x17S[1], x18L[1], x18S[1], s13L[1], s13S[1], s14L[1], s14S[1], s15L[1], s15S[1], s16L[1], s16S[1], s17L[1], s17S[1], s18L[1], s18S[1])]   // ★[1] は必須
+
+[lm5, sm5, plm5, psm5, tt5, ox5]         = request.security(syminfo.tickerid, tfStr2, f_htfPacket(), lookahead = barmerge.lookahead_on)
+[lm15, sm15, plm15, psm15, tt15, ox15]   = request.security(syminfo.tickerid, tfStr3, f_htfPacket(), lookahead = barmerge.lookahead_on)
+float im5   = 0.0
+float im15  = 0.0
+float sp5   = 0.0
+float sp15  = 0.0
+
+
+// =====================================================================================
+// §6. V2 有効根拠（ロジック × TF × 方向）と抑止前 PRE（1 分足あり版と同じ扱い。TF は 5M / 15M の 2 枠）
+// =====================================================================================
+// 生シグナル成立時に登録し、元版の保持本数（期限）と価格否定（その TF の確定終値）の早い方で解除。
+// 同方向の新シグナルで再登録、同じロジック × TF で反対方向の新シグナルが出たら切替で解除。
+// 同一足で両方向が出た場合の裁定は元版の「状態管理ルール」と同じ。
+// 否定ルール（V2_RULE）: 0 ライン（成立時の値 + 傾き × 経過本数）/ 1 EMA 現在値 / 2 Fib 継承（価格ラインなし）/
+//                         3 状態型（SAT）/ 4 成立足の安値・高値（Stoch）
+// PRE は抑止前の State Factor（0 / 1、SAT のみ 0 / 1/3 / 2/3）を、その TF の確定足ごとに上書き（保持なし）。
+// 内部 index : ti 0 = 5M / 1 = 15M（BUS の TF ID は 5M = 1 / 15M = 2 で別物）
+var LAST_TFTIME = array.new_int(N_TF, 0)
+var V2_RULE  = array.from(0, 0, 0, 0, 0, 0)
+var V2_VALID = array.new_bool(N_LOGIC * N_TF * 2, false)   // index = f_idx(li, ti) × 2 + (0 LONG / 1 SHORT)
+var V2_PRICE = array.new_bool(N_LOGIC * N_TF * 2, false)
+var V2_REM   = array.new_int(N_LOGIC * N_TF * 2, 0)
+var V2_AGE   = array.new_int(N_LOGIC * N_TF * 2, 0)
+var V2_LVL   = array.new_float(N_LOGIC * N_TF * 2, na)
+var V2_SLP   = array.new_float(N_LOGIC * N_TF * 2, 0.0)
+var V2_PRE   = array.new_float(N_LOGIC * N_TF * 2, 0.0)     // 抑止前 PRE State Factor
+var V2_NEG   = array.new_int(N_TF * 2, 0)
+var V2_WARM  = array.new_int(N_TF, 0)
+var V2_BADX  = array.new_bool(N_TF, false)
+
+f_v2ApplyTf(int ti, float lm, float sm, float plm, float psm, float im, float sp, array<float> x) =>
+    float tc = array.get(x, 0)
+    array.set(V2_WARM, ti, array.get(V2_WARM, ti) + 1)
+    array.set(V2_BADX, ti, array.get(V2_BADX, ti) or na(tc))
+    for li = 0 to N_LOGIC - 1
+        int  k      = f_idx(li, ti)
+        int  rule   = array.get(V2_RULE, li)
+        bool isSt   = rule == 3
+        int  ei     = 0
+        bool rawL   = f_bitOn(lm, li)
+        bool rawS   = f_bitOn(sm, li)
+        bool both   = rawL and rawS
+        bool sigL   = both ? conflictMode == CONF_LONG  : rawL
+        bool sigS   = both ? conflictMode == CONF_SHORT : rawS
+        bool fibInv = false
+        float emaNow = array.get(x, ei)
+        for d = 0 to 1
+            int   j     = k * 2 + d
+            bool  reg   = d == 0 ? sigL : sigS
+            bool  opp   = d == 0 ? sigS : sigL
+            bool  vld   = array.get(V2_VALID, j)
+            bool  aging = vld and not isSt
+            int   age1  = array.get(V2_AGE, j) + (aging ? 1 : 0)
+            int   rem1  = array.get(V2_REM, j) - (aging ? 1 : 0)
+            float lv    = rule == 1 ? emaNow : array.get(V2_LVL, j) + array.get(V2_SLP, j) * age1
+            bool  negd  = aging and rem1 > 0 and rule != 2 and array.get(V2_PRICE, j) and not na(lv) and not na(tc) and (d == 0 ? tc < lv : tc > lv)
+            bool  alive = vld and rem1 > 0 and not negd
+            float lvN   = array.get(x, 1 + math.min(math.max(li, 0), 5) * 2 + d)
+            float slN   = nz(array.get(x, 13 + math.min(math.max(li, 0), 5) * 2 + d))
+            bool  pOk   = rule == 2 or (rule == 1 ? not na(emaNow) : not na(lvN))
+            bool  regNew = reg and not isSt
+            array.set(V2_VALID, j, (isSt ? reg : (reg ? true : opp ? false : alive)) and not fibInv)
+            array.set(V2_PRICE, j, isSt ? true : regNew ? pOk : array.get(V2_PRICE, j))
+            array.set(V2_REM,   j, regNew ? array.get(HOLD_ALL, k) : rem1)
+            array.set(V2_AGE,   j, regNew ? 0 : age1)
+            array.set(V2_LVL,   j, regNew ? lvN : array.get(V2_LVL, j))
+            array.set(V2_SLP,   j, regNew ? slN : array.get(V2_SLP, j))
+            array.set(V2_NEG,   ti * 2 + d, array.get(V2_NEG, ti * 2 + d) + (negd ? 1 : 0))
+            // 抑止前 PRE（その TF の確定足1本ぶんの現在値で上書き）
+            array.set(V2_PRE, j, d == 0 ? (f_bitOn(plm, li) ? 1.0 : 0.0) : (f_bitOn(psm, li) ? 1.0 : 0.0))
+    N_LOGIC
+
+// 5M / 15M : その TF の確定足が新しくなった瞬間だけ更新（1 分足あり版と同じタイミング）
+int t5  = nz(tt5)
+int t15 = nz(tt15)
+if t5 > array.get(LAST_TFTIME, 0)
+    array.set(LAST_TFTIME, 0, t5)
+    f_v2ApplyTf(0, nz(lm5), nz(sm5), nz(plm5), nz(psm5), nz(im5), nz(sp5), f_srcArr(ox5))
+if t15 > array.get(LAST_TFTIME, 1)
+    array.set(LAST_TFTIME, 1, t15)
+    f_v2ApplyTf(1, nz(lm15), nz(sm15), nz(plm15), nz(psm15), nz(im15), nz(sp15), f_srcArr(ox15))
+
+
+// =====================================================================================
+// §7. データ準備 / 更新整合（5M / 15M のみ）と BUS 出力
+// =====================================================================================
+//   5M / 15M : 受信した確定足の開始時刻（tt[1]）が「この足の TF 区間の直前に足が存在した区間」と一致すること
+//              （休場・週末は直前に足が存在した区間と比べるので不整合にしない）
+//   値 : 処理した TF 足の確定終値が na なら不整合 / 準備 : 不整合なしで各 TF の処理本数 >= その TF の最大保持本数
+//   1M は取得しないので、1M の準備は待たない。
+bool isChart5M = timeframe.isminutes and timeframe.multiplier == 5
+var int bk5Cur   = na
+var int bk5Prev  = na
+var int bk15Cur  = na
+var int bk15Prev = na
+int bk5  = time - time % 300000
+int bk15 = time - time % 900000
+bk5Prev  := na(bk5Cur)  or bk5  != bk5Cur  ? bk5Cur  : bk5Prev
+bk5Cur   := bk5
+bk15Prev := na(bk15Cur) or bk15 != bk15Cur ? bk15Cur : bk15Prev
+bk15Cur  := bk15
+
+f_maxHold(int ti) =>
+    int mx = 1
+    for li = 0 to N_LOGIC - 1
+        mx := math.max(mx, array.get(HOLD_ALL, f_idx(li, ti)))
+    mx
+
+bool t5Miss  = t5 == 0 or na(bk5Prev)
+bool t15Miss = t15 == 0 or na(bk15Prev)
+bool t5Bad   = not t5Miss  and t5  != bk5Prev
+bool t15Bad  = not t15Miss and t15 != bk15Prev
+bool valBad  = array.get(V2_BADX, 0) or array.get(V2_BADX, 1)
+var int need5  = f_maxHold(0)
+var int need15 = f_maxHold(1)
+bool srcBad  = t5Bad or t15Bad or valBad
+bool srcWarm = array.get(V2_WARM, 0) >= need5 and array.get(V2_WARM, 1) >= need15
+// STATUS : 0 出力中 / 1 データ準備中 / 3 5分足以外 / 4 更新不整合
+int srcStatusNow = not isChart5M ? 3 : srcBad ? 4 : (t5Miss or t15Miss or not srcWarm) ? 1 : 0
+
+// 系統ごとの点（TF ti）: [LONG 確認済み 0/1, LONG 統合 ×3（0〜3）, SHORT 確認済み, SHORT 統合 ×3]
+f_famPts(int ti, int li0, int li1) =>
+    bool  cL = false
+    bool  cS = false
+    float iL = 0.0
+    float iS = 0.0
+    for li = li0 to li1
+        int  j  = f_idx(li, ti) * 2
+        bool vL = array.get(V2_VALID, j)     and array.get(V2_PRICE, j)
+        bool vS = array.get(V2_VALID, j + 1) and array.get(V2_PRICE, j + 1)
+        cL := cL or vL
+        cS := cS or vS
+        iL := math.max(iL, math.max(vL ? 1.0 : 0.0, array.get(V2_PRE, j)))
+        iS := math.max(iS, math.max(vS ? 1.0 : 0.0, array.get(V2_PRE, j + 1)))
+    [cL ? 1 : 0, int(math.round(iL * 3)), cS ? 1 : 0, int(math.round(iS * 3))]
+
+f_fam1(int ti, int li0, int li1, int off) =>
+    [cL, qL, cS, qS] = f_famPts(ti, li0, li1)
+    (cL + 2 * (qL >= 3 ? 1 : 0) + 4 * cS + 8 * (qS >= 3 ? 1 : 0)) * math.pow(2, off)
+
+f_unpriced(int ti) =>
+    bool u = false
+    for li = 0 to N_LOGIC - 1
+        int j = f_idx(li, ti) * 2
+        u := u or (array.get(V2_VALID, j) and not array.get(V2_PRICE, j)) or (array.get(V2_VALID, j + 1) and not array.get(V2_PRICE, j + 1))
+    u
+
+f_payload(int ti) =>
+    float base = (array.get(V2_NEG, ti * 2) > 0 ? 1 : 0) + (array.get(V2_NEG, ti * 2 + 1) > 0 ? 2 : 0) + (f_unpriced(ti) ? 4 : 0)
+    base + f_fam1(ti, 0, 5, 3)
+
+int   BUS_BASE   = 1577836800000          // 2020-01-01 00:00 UTC
+float BUS_SLOTS  = 4194304.0              // 2^22
+int   BUS_FORMAT = 2                      // 5分・15分専用版（1 分足あり版は 1）
+f_bus(int tfId, float payload, int tclose) =>
+    float slot = (tclose - BUS_BASE) / 300000.0
+    bool  ok   = slot >= 0 and slot < BUS_SLOTS and slot == math.floor(slot) and payload >= 0 and payload < 2097152
+    ok ? BUS_FORMAT + 4 * 2 + 16 * tfId + 64 * slot + 268435456.0 * payload : na
+
+var float bus5  = na
+var float bus15 = na
+var int   srcLastBar = 0
+var int   srcStatus  = 1
+if isChart5M and barstate.isconfirmed and time > srcLastBar
+    srcLastBar := time
+    srcStatus  := srcStatusNow
+    array.set(V2_WARM, 0, t5Bad  or t5Miss  or array.get(V2_BADX, 0) ? 0 : array.get(V2_WARM, 0))
+    array.set(V2_WARM, 1, t15Bad or t15Miss or array.get(V2_BADX, 1) ? 0 : array.get(V2_WARM, 1))
+    // BUS の TF ID は 5M = 1 / 15M = 2（内部 index 0 / 1 とは別）
+    bus5  := srcStatusNow == 0 ? f_bus(1, f_payload(0), time_close) : na
+    bus15 := srcStatusNow == 0 ? f_bus(2, f_payload(1), time_close) : na
+    array.fill(V2_NEG, 0)
+    array.fill(V2_BADX, false)
+
+plot(isChart5M ? bus5  : na, "B 5M BUS",  display = display.data_window)
+plot(isChart5M ? bus15 : na, "B 15M BUS", display = display.data_window)
+plot(isChart5M ? srcStatus : 3, "B STATUS", display = display.data_window)
+

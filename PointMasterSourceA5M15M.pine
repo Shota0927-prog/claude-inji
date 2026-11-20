@@ -1,0 +1,786 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © point_master
+
+//@version=5
+
+// =====================================================================================
+// POINT MASTER SOURCE A 5M15M  ―  POINT MASTER B 5分・15分専用版 Source A（Logic01〜12 : FVG / Accum / EMA）
+// =====================================================================================
+// 1 分足あり版 Source（PM-SRC-A-V2）から 1 分足の取得・状態・準備確認・保持設定・BUS を取り除き、
+// 5 分足と 15 分足だけで、担当ロジックの検知・抑止前 PRE・V2 有効根拠（否定ライン / 価格否定 / 期限 / Fib 解除）・
+// 系統点・データ準備確認を行う版。5M / 15M の処理内容と取得方式（[1] + lookahead_on）は 1 分足あり版と同じ。
+// 検知モジュール（入力・PRM 束・ロジック関数・Engine 関数）は V2 版からそのまま移している（条件の変更なし）。
+// 取り除いたもの : 他 Source のロジック / 1H・4H・1D の取得 / ロジック名・Weight / 元版の ST_STATE・スコア・PRE スコア・
+//                  PHASE・VALID TP / 旧テーブル・旧アラート・LOT ADJUST / モード A / 判定（Decision が担当）
+// 使い方 : 5 分足チャートに追加し、PointMasterDecision5M15M（PM-DEC-515）の入力
+//          「A 5M BUS / A 15M BUS」へ、この Source の同名出力を接続する。TF は 5M / 15M 固定。
+// 【BUS 仕様（Decision への受け渡し）】plot の値 1 本 = 1 TF ぶんの集約結果（非負整数 < 2^49）
+//   bus = 1(format) + 4 × SourceID + 16 × TFID + 64 × slot + 2^28 × payload
+//     bit 0-1   : format = 2（5分・15分専用版。1 分足あり版の BUS は format 1 なので Decision 5M15M は受け付けない）
+//     bit 2-3   : SourceID（1 = A / 2 = B / 3 = C）
+//     bit 4-5   : TFID（1 = 5M / 2 = 15M。この版は 1M を出さない）
+//     bit 6-27  : slot = (集約結果を確定した 5 分足の確定時刻 time_close − 2020-01-01 00:00 UTC) / 5 分
+//                 0〜4,194,303（2020-01-01 00:05 〜 2059-11-23 頃の 5 分足）。範囲外は折り返さず na
+//     bit 28-48 : payload（21 bit）
+//       bit 0 : LONG 方向の根拠がこの 5 分足の処理中に価格否定された / bit 1 : SHORT 方向
+//       bit 2 : 価格基準なし（未対応）の有効根拠がある
+//       bit 3- : 系統ごとに [LONG 確認済み 1bit, LONG 統合, SHORT 確認済み 1bit, SHORT 統合]
+//                統合は SAT だけ 2bit（0〜3 = 強度 0 / 1/3 / 2/3 / 1）、他の系統は 1bit（強度 0 / 1 しか取らない）
+//   最大値 < 2^49 = 562,949,953,421,312 ≤ 2^53 − 1。各フィールドは重ならず、境界値まで可逆。
+//   未準備・不整合の 5 分足では na（根拠ゼロを有効値として送らない）。
+//   値は 5 分足の確定時点で確定し、足の途中では最後に確定した値を出し続ける。
+//   payload の系統配置（この Source）: 価格帯（Logic01〜04）= bit 3-6 / MA（Logic05〜12）= bit 7-10
+// =====================================================================================
+indicator(
+     title         = "POINT MASTER SOURCE A 5M15M",
+     shorttitle    = "PM-A-515",
+     overlay       = true,
+     max_bars_back = 500
+ )
+
+// =====================================================================================
+// §0. 定数（この Source 内のロジック番号は 0 始まりのローカル番号。0〜3 = Logic01〜04 / 4〜11 = Logic05〜12）
+// =====================================================================================
+int N_LOGIC = 12
+int N_TF    = 2            // 内部 index 0 = 5M / 1 = 15M（1M は持たない）
+int CONF_IGNORE = 0
+int CONF_LONG   = 1
+int CONF_SHORT  = 2
+f_idx(li, ti) => li * N_TF + ti
+// 時間足（5M / 15M 固定）。tfStr1 は Engine A の EMA 対象 TF 判定（元版は 1M / 5M のみ対象）で参照されるだけで、
+// 1M のデータ取得には使わない（この版は 1M を取得しない。15M へ EMA ロジックを新たに適用しない）
+tfStr1 = "1"
+tfStr2 = "5"
+tfStr3 = "15"
+
+// =====================================================================================
+// §3. 保持本数（元版と同じ input・初期値。5M / 15M のみ）＝ V2 有効根拠の期限
+// =====================================================================================
+grpH1 = "③ Logic01 保持本数"
+h01b = input.int(6, "5M",  group = grpH1, minval = 1, inline = "h1a")
+h01c = input.int(4, "15M", group = grpH1, minval = 1, inline = "h1a")
+grpH2 = "③ Logic02 (FVG Rebound) 保持本数"
+h02b = input.int(6, "5M",  group = grpH2, minval = 1, inline = "h2a")
+h02c = input.int(4, "15M", group = grpH2, minval = 1, inline = "h2a")
+grpH3 = "③ Logic03 (Accum Rebound) 保持本数"
+h03b = input.int(6, "5M",  group = grpH3, minval = 1, inline = "h3a")
+h03c = input.int(4, "15M", group = grpH3, minval = 1, inline = "h3a")
+grpH4 = "③ Logic04 (Accum Break) 保持本数"
+h04b = input.int(6, "5M",  group = grpH4, minval = 1, inline = "h4a")
+h04c = input.int(4, "15M", group = grpH4, minval = 1, inline = "h4a")
+grpH5  = "③ Logic05 (EMA200 Reb) 保持本数"
+h05b = input.int(6, "5M", group = grpH5,  minval = 1, inline = "h5")
+grpH6  = "③ Logic06 (EMA1000 Reb) 保持本数"
+h06b = input.int(6, "5M", group = grpH6,  minval = 1, inline = "h6")
+grpH7  = "③ Logic07 (EMA2000 Reb) 保持本数"
+h07b = input.int(6, "5M", group = grpH7,  minval = 1, inline = "h7")
+grpH8  = "③ Logic08 (EMA3000 Reb) 保持本数"
+h08b = input.int(6, "5M", group = grpH8,  minval = 1, inline = "h8")
+grpH9  = "③ Logic09 (EMA200 Brk) 保持本数"
+h09b = input.int(6, "5M", group = grpH9,  minval = 1, inline = "h9")
+grpH10 = "③ Logic10 (EMA1000 Brk) 保持本数"
+h10b = input.int(6, "5M", group = grpH10, minval = 1, inline = "h10")
+grpH11 = "③ Logic11 (EMA2000 Brk) 保持本数"
+h11b = input.int(6, "5M", group = grpH11, minval = 1, inline = "h11")
+grpH12 = "③ Logic12 (EMA3000 Brk) 保持本数"
+h12b = input.int(6, "5M", group = grpH12, minval = 1, inline = "h12")
+HOLD01 = array.from(h01b, h01c)
+HOLD02 = array.from(h02b, h02c)
+HOLD03 = array.from(h03b, h03c)
+HOLD04 = array.from(h04b, h04c)
+HOLD05 = array.from(h05b, 1)    // EMA は 5M のみ（元版でも 15M は対象外。15M はイベントが出ないダミー値）
+HOLD06 = array.from(h06b, 1)    // EMA は 5M のみ（元版でも 15M は対象外。15M はイベントが出ないダミー値）
+HOLD07 = array.from(h07b, 1)    // EMA は 5M のみ（元版でも 15M は対象外。15M はイベントが出ないダミー値）
+HOLD08 = array.from(h08b, 1)    // EMA は 5M のみ（元版でも 15M は対象外。15M はイベントが出ないダミー値）
+HOLD09 = array.from(h09b, 1)    // EMA は 5M のみ（元版でも 15M は対象外。15M はイベントが出ないダミー値）
+HOLD10 = array.from(h10b, 1)    // EMA は 5M のみ（元版でも 15M は対象外。15M はイベントが出ないダミー値）
+HOLD11 = array.from(h11b, 1)    // EMA は 5M のみ（元版でも 15M は対象外。15M はイベントが出ないダミー値）
+HOLD12 = array.from(h12b, 1)    // EMA は 5M のみ（元版でも 15M は対象外。15M はイベントが出ないダミー値）
+var HOLD_ALL = array.new_int(0)
+if array.size(HOLD_ALL) == 0
+    array.concat(HOLD_ALL, HOLD01)
+    array.concat(HOLD_ALL, HOLD02)
+    array.concat(HOLD_ALL, HOLD03)
+    array.concat(HOLD_ALL, HOLD04)
+    array.concat(HOLD_ALL, HOLD05)
+    array.concat(HOLD_ALL, HOLD06)
+    array.concat(HOLD_ALL, HOLD07)
+    array.concat(HOLD_ALL, HOLD08)
+    array.concat(HOLD_ALL, HOLD09)
+    array.concat(HOLD_ALL, HOLD10)
+    array.concat(HOLD_ALL, HOLD11)
+    array.concat(HOLD_ALL, HOLD12)
+
+grpRule = "⑤ 状態管理ルール"
+conflictStr = input.string("無視 (現状維持)", "同一ロジック・同一TFで両方向が同時発生した時",
+     options = ["無視 (現状維持)", "LONG優先", "SHORT優先"], group = grpRule)
+conflictMode = conflictStr == "LONG優先" ? CONF_LONG : conflictStr == "SHORT優先" ? CONF_SHORT : CONF_IGNORE
+
+// =====================================================================================
+// §4. 検知モジュール（V2 版からそのまま移したもの）
+// =====================================================================================
+
+// -------------------------------------------------------------------------------------
+// SIGNAL MODULE : Logic01 = FVG Absorption
+// -------------------------------------------------------------------------------------
+// 出力は「その確定足で吸収が新規発生したか」のイベント2値だけです。
+// 保持 / 保持期限 / 同方向再発生 / LONG⇔SHORT切替 は一切行いません（POINT MASTER の責務）。
+//
+//   Bearish FVG（上端 = low[2]）を終値で上抜け → LONG イベント
+//   Bullish FVG（下端 = high[2]）を終値で下抜け → SHORT イベント
+//   ※ ヒゲだけの抜けでは成立しません（終値でFVG全体を抜けること）
+//
+// 最新の Bullish FVG / Bearish FVG を1本ずつ保持し、各FVGにつき吸収は1回だけ。
+// 新しい同方向FVGが形成されたら、再び吸収判定が可能になります。
+// この関数は §5 の共通MTF基盤から各時間足のコンテキストで評価されるため、
+// FVG専用の request.security は一切追加していません。
+grpFVG = "④ Logic01 : FVG吸収 パラメータ"
+fvgAtrLen   = input.int(14,    "ATR期間",                group = grpFVG, minval = 1)
+fvgMinThick = input.float(0.0, "FVG最小厚み (FVG幅/ATR)", group = grpFVG, step = 0.05, minval = 0)
+useAbsColor = input.bool(true, "吸収: 方向と同じローソク色を要求", group = grpFVG)
+useAbsBody  = input.bool(true, "吸収: 最低実体率を要求",   group = grpFVG, inline = "body")
+fvgAbsBody  = input.float(0.50, "比率",                  group = grpFVG, inline = "body", step = 0.05)
+useAbsEdge  = input.bool(true, "吸収: 終値端寄せを要求",   group = grpFVG, inline = "edge")
+fvgAbsEdge  = input.float(0.60, "比率",                  group = grpFVG, inline = "edge", step = 0.05)
+
+// --- Logic01 FVG Absorption のパラメータ束（input の値をそのまま格納。index = 下のコメント順）---
+//     ロジック関数はここから array.get() で読むため、外部要素は この配列1個だけになります。
+var array<float> PRM_FVG = array.from(
+     fvgMinThick,              // 00 : fvgMinThick
+     useAbsColor ? 1.0 : 0.0,  // 01 : useAbsColor
+     useAbsBody ? 1.0 : 0.0,   // 02 : useAbsBody
+     fvgAbsBody,               // 03 : fvgAbsBody
+     useAbsEdge ? 1.0 : 0.0,   // 04 : useAbsEdge
+     fvgAbsEdge                // 05 : fvgAbsEdge
+ )
+
+f_fvgAbsEvent() =>
+    // --- パラメータ読み出し（PRM束。値は input と同一）---
+    float _pFvgMinThick            = array.get(PRM_FVG, 0)
+    bool  _pUseAbsColor            = array.get(PRM_FVG, 1) > 0.5
+    bool  _pUseAbsBody             = array.get(PRM_FVG, 2) > 0.5
+    float _pFvgAbsBody             = array.get(PRM_FVG, 3)
+    bool  _pUseAbsEdge             = array.get(PRM_FVG, 4) > 0.5
+    float _pFvgAbsEdge             = array.get(PRM_FVG, 5)
+    float _atr = ta.atr(fvgAtrLen)
+    var float _bullBot  = na     // Bullish FVG 下端 (= high[2])
+    var int   _bullBar  = na
+    var bool  _bullUsed = true   // 吸収済みフラグ（1FVGにつき1回）
+    var float _bearTop  = na     // Bearish FVG 上端 (= low[2])
+    var int   _bearBar  = na
+    var bool  _bearUsed = true
+
+    // FVG形成：最新の1本だけを監視対象とし、吸収済みフラグをリセットする
+    if _atr > 0 and low > high[2] and (low - high[2]) / _atr >= _pFvgMinThick
+        _bullBot  := high[2]
+        _bullBar  := bar_index
+        _bullUsed := false
+    if _atr > 0 and high < low[2] and (low[2] - high) / _atr >= _pFvgMinThick
+        _bearTop  := low[2]
+        _bearBar  := bar_index
+        _bearUsed := false
+
+    // 吸収品質フィルター（3条件は個別にON/OFF可能）
+    float _rng   = high - low
+    float _body  = math.abs(close - open)
+    bool  _bodyOk = _rng > 0 and _body / _rng >= _pFvgAbsBody
+    bool  _nearHi = _rng > 0 and (close - low)  / _rng >= _pFvgAbsEdge
+    bool  _nearLo = _rng > 0 and (high - close) / _rng >= _pFvgAbsEdge
+
+    // 吸収イベント（最低条件 = 終値でFVG全体を抜ける）
+    bool _long  = not na(_bearTop) and not _bearUsed and bar_index > _bearBar and close > _bearTop and (not _pUseAbsColor or close > open) and (not _pUseAbsBody or _bodyOk) and (not _pUseAbsEdge or _nearHi)
+    bool _short = not na(_bullBot) and not _bullUsed and bar_index > _bullBar and close < _bullBot and (not _pUseAbsColor or close < open) and (not _pUseAbsBody or _bodyOk) and (not _pUseAbsEdge or _nearLo)
+
+    // 同一足で両方成立した場合も両FVGを使用済みにする（方向の裁定は POINT MASTER §6 に任せる）
+    if _long
+        _bearUsed := true
+    if _short
+        _bullUsed := true
+    // ★V2: 判定条件は変更せず、V2 の価格否定用に「成立時の否定ライン」を追加で返す（成立しない足は na）
+    //     LONG = 上抜けた Bearish FVG 上端 / SHORT = 下抜けた Bullish FVG 下端（帯のブレイク）
+    [_long, _short, _long ? _bearTop : na, _short ? _bullBot : na]
+
+// -------------------------------------------------------------------------------------
+// SIGNAL MODULE : Logic02 = FVG Rebound
+// -------------------------------------------------------------------------------------
+// 出力は「その確定足で反発が新規発生したか」のイベント2値だけです。
+// 保持 / 保持期限 / 同方向再発生 / LONG⇔SHORT切替 は行いません（POINT MASTER の責務）。
+//
+//   Bullish FVG（top = low / bottom = high[2]）へのサポート反発 → LONG イベント
+//   Bearish FVG（top = low[2] / bottom = high）へのレジ反発     → SHORT イベント
+//
+// 反発の条件（元コードと同一）
+//   LONG  : low <= top / 侵入率 (top - low)/幅 <= 最大侵入率 /
+//           close >= bottom + 幅 × 回復位置 / 陽線 (close > open)
+//   SHORT : high >= bottom / 侵入率 (high - bottom)/幅 <= 最大侵入率 /
+//           close <= top - 幅 × 回復位置 / 陰線 (close < open)
+//
+// 各FVGにつき反発は1回だけ。FVG完全否定（Bullish: close <= bottom / Bearish: close >= top）
+// が起きたFVGからは以後反発を出しません。どちらも新しい同方向FVG形成でリセットされます。
+// Logic01 と同じく §5 の共通MTF基盤から評価されるため、request.security は追加していません。
+grpREB = "④ Logic02 : FVG反発 パラメータ"
+rebAtrLen   = input.int(14,     "ATR期間",                group = grpREB, minval = 1)
+rebMinThick = input.float(0.0,  "FVG最小厚み (FVG幅/ATR)", group = grpREB, step = 0.05, minval = 0)
+rebDepthMax = input.float(0.30, "反発 最大侵入率 (FVG幅比率)", group = grpREB, step = 0.05, minval = 0)
+rebRecover  = input.float(0.90, "反発 回復位置 (FVG幅比率)",   group = grpREB, step = 0.05, minval = 0, maxval = 1)
+
+// --- Logic02 FVG Rebound のパラメータ束（input の値をそのまま格納。index = 下のコメント順）---
+//     ロジック関数はここから array.get() で読むため、外部要素は この配列1個だけになります。
+var array<float> PRM_REB = array.from(
+     rebMinThick,  // 00 : rebMinThick
+     rebDepthMax,  // 01 : rebDepthMax
+     rebRecover    // 02 : rebRecover
+ )
+
+f_fvgReboundEvent() =>
+    // --- パラメータ読み出し（PRM束。値は input と同一）---
+    float _pRebMinThick            = array.get(PRM_REB, 0)
+    float _pRebDepthMax            = array.get(PRM_REB, 1)
+    float _pRebRecover             = array.get(PRM_REB, 2)
+    float _atr = ta.atr(rebAtrLen)
+    var float _bTop  = na      // Bullish FVG 上端 (= low)
+    var float _bBot  = na      // Bullish FVG 下端 (= high[2])
+    var int   _bBar  = na
+    var bool  _bUsed = true    // 反発済みフラグ（1FVGにつき1回）
+    var bool  _bDead = true    // 完全否定フラグ
+    var float _rTop  = na      // Bearish FVG 上端 (= low[2])
+    var float _rBot  = na      // Bearish FVG 下端 (= high)
+    var int   _rBar  = na
+    var bool  _rUsed = true
+    var bool  _rDead = true
+
+    // FVG形成：最新の1本だけを監視対象とし、反発済み / 完全否定フラグをリセットする
+    if _atr > 0 and low > high[2] and (low - high[2]) / _atr >= _pRebMinThick
+        _bTop  := low
+        _bBot  := high[2]
+        _bBar  := bar_index
+        _bUsed := false
+        _bDead := false
+    if _atr > 0 and high < low[2] and (low[2] - high) / _atr >= _pRebMinThick
+        _rTop  := low[2]
+        _rBot  := high
+        _rBar  := bar_index
+        _rUsed := false
+        _rDead := false
+
+    // FVG完全否定：以後そのFVGから反発を出さない（新しい同方向FVG形成でリセット）
+    if not na(_bBot) and close <= _bBot
+        _bDead := true
+    if not na(_rTop) and close >= _rTop
+        _rDead := true
+
+    // 反発イベント（各FVG1回のみ）
+    float _bW = _bTop - _bBot
+    float _rW = _rTop - _rBot
+    bool _long  = not _bUsed and not _bDead and not na(_bW) and _bW > 0 and bar_index > _bBar and low <= _bTop and (_bTop - low) / _bW <= _pRebDepthMax and close >= _bBot + _bW * _pRebRecover and close > open
+    bool _short = not _rUsed and not _rDead and not na(_rW) and _rW > 0 and bar_index > _rBar and high >= _rBot and (high - _rBot) / _rW <= _pRebDepthMax and close <= _rTop - _rW * _pRebRecover and close < open
+
+    // 同一足で両方成立した場合も両FVGを反発使用済みにする（方向の裁定は POINT MASTER §6 に任せる）
+    if _long
+        _bUsed := true
+    if _short
+        _rUsed := true
+    // ★V2: 判定条件は変更せず、V2 の価格否定用に「成立時の否定ライン」を追加で返す（成立しない足は na）
+    //     LONG = 反発した Bullish FVG 下端 / SHORT = 反発した Bearish FVG 上端（帯の反発）
+    [_long, _short, _long ? _bBot : na, _short ? _rTop : na]
+
+// -------------------------------------------------------------------------------------
+// SIGNAL MODULE : Logic03 = Accum Rebound / Logic04 = Accum Break
+// -------------------------------------------------------------------------------------
+// Accum判定・箱の上下限は元 Accum ストラテジー（f_accumNTDetect / f_accumEnvBox）と同一。
+// 判定パラメータも同じ9項目で、簡略化・変更は一切していません。
+//   boxHigh = そのAccum内の max(open, close) / boxLow = min(open, close)（実体基準）
+// 箱は「Accum終了が確定した足」で上下限を固定します（形成中の箱は上下限が動くため使わない）。
+//
+//   Logic03 : 下限タッチ + 陽線確定 → LONG / 上限タッチ + 陰線確定 → SHORT（未ブレイクの箱のみ）
+//   Logic04 : 確定終値で上限を上抜け → LONG / 下限を下抜け → SHORT
+//             上抜け後に確定終値で箱内へ復帰 → SHORT（上方向ブレイク失敗）
+//             下抜け後に確定終値で箱内へ復帰 → LONG（下方向ブレイク失敗）
+//
+// ブレイク状態は箱ごとに1つだけ保持し、新しい箱を確定した時点でその箱基準に作り直します。
+// そのため「別の箱への侵入」で前の箱のブレイクが反転することはありません。
+// イベントは状態が変化した確定足だけ。同じ状態が続く間は再発生しません。
+// 出力は4つのイベントのみで、保持・期限・方向切替は POINT MASTER 側が行います。
+grpACC = "④ Logic03/04 : Accum パラメータ"
+accRangeLen    = input.int(10,     "Accum判定レンジ本数",           group = grpACC, minval = 6)
+accBaseLen     = input.int(20,     "基準平均本数",                 group = grpACC, minval = 10)
+accAtrLen      = input.int(14,     "ATR本数",                      group = grpACC, minval = 1)
+accMinUpper    = input.int(4,      "上半分の最低終値本数",           group = grpACC, minval = 1)
+accMinLower    = input.int(4,      "下半分の最低終値本数",           group = grpACC, minval = 1)
+accMaxRun      = input.int(4,      "同色連続の上限",                group = grpACC, minval = 1)
+accAtrMult     = input.float(2.5,  "Accum レンジ幅 / ATR 上限",     group = grpACC, minval = 0.5,  step = 0.1)
+accBarRatioMax = input.float(0.70, "Accum 平均値幅/基準平均 上限",   group = grpACC, minval = 0.1,  step = 0.01)
+accDriftMax    = input.float(0.30, "Accum ドリフト上限",            group = grpACC, minval = 0.05, maxval = 1.0, step = 0.05)
+accTouchTol    = input.float(1.0,  "境界タッチ許容($) ※反発判定用",  group = grpACC, minval = 0.0,  step = 0.1)
+
+// --- Logic03/04 Accum のパラメータ束（input の値をそのまま格納。index = 下のコメント順）---
+//     ロジック関数はここから array.get() で読むため、外部要素は この配列1個だけになります。
+var array<float> PRM_ACC = array.from(
+     accMinUpper * 1.0,  // 00 : accMinUpper
+     accMinLower * 1.0,  // 01 : accMinLower
+     accMaxRun * 1.0,    // 02 : accMaxRun
+     accAtrMult,         // 03 : accAtrMult
+     accBarRatioMax,     // 04 : accBarRatioMax
+     accDriftMax,        // 05 : accDriftMax
+     accTouchTol         // 06 : accTouchTol
+ )
+
+// Accum成立判定（元コードの f_accumNTDetect と同一。条件・計算方法とも変更なし）
+f_accumDetect() =>
+    // --- パラメータ読み出し（PRM束。値は input と同一）---
+    int   _pAccMinUpper            = int(array.get(PRM_ACC, 0))
+    int   _pAccMinLower            = int(array.get(PRM_ACC, 1))
+    int   _pAccMaxRun              = int(array.get(PRM_ACC, 2))
+    float _pAccAtrMult             = array.get(PRM_ACC, 3)
+    float _pAccBarRatioMax         = array.get(PRM_ACC, 4)
+    float _pAccDriftMax            = array.get(PRM_ACC, 5)
+    _atr       = ta.atr(accAtrLen)
+    _bodyTop   = math.max(open, close)
+    _bodyBot   = math.min(open, close)
+    _rangeHigh = ta.highest(_bodyTop, accRangeLen)
+    _rangeLow  = ta.lowest(_bodyBot, accRangeLen)
+    _rangeNow  = _rangeHigh - _rangeLow
+    _rangeMid  = (_rangeHigh + _rangeLow) * 0.5
+    int _upperCloses = 0
+    int _lowerCloses = 0
+    int _bullRun = 0
+    int _bearRun = 0
+    int _maxBullRun = 0
+    int _maxBearRun = 0
+    for i = 0 to accRangeLen - 1
+        _upperCloses += close[i] > _rangeMid ? 1 : 0
+        _lowerCloses += close[i] < _rangeMid ? 1 : 0
+        bool _isBull = close[i] > open[i]
+        bool _isBear = close[i] < open[i]
+        if _isBull
+            _bullRun += 1
+            _bearRun := 0
+        else if _isBear
+            _bearRun += 1
+            _bullRun := 0
+        else
+            _bullRun := 0
+            _bearRun := 0
+        _maxBullRun := math.max(_maxBullRun, _bullRun)
+        _maxBearRun := math.max(_maxBearRun, _bearRun)
+    _startMid = (open[accRangeLen - 1] + close[accRangeLen - 1]) * 0.5
+    _endMid   = (open + close) * 0.5
+    _drift    = math.abs(_endMid - _startMid)
+    _condAtr    = _atr > 0 and _rangeNow <= _atr * _pAccAtrMult
+    _rangeShort = ta.highest(_bodyTop, accRangeLen) - ta.lowest(_bodyBot, accRangeLen)
+    _rangeBase  = ta.highest(_bodyTop, accBaseLen)  - ta.lowest(_bodyBot, accBaseLen)
+    _condBar      = _rangeBase > 0 and _rangeShort <= _rangeBase * _pAccBarRatioMax
+    _condBalance  = _upperCloses >= _pAccMinUpper and _lowerCloses >= _pAccMinLower
+    _condDrift    = _rangeNow > 0 and (_drift / _rangeNow) <= _pAccDriftMax
+    _condColorRun = _maxBullRun <= _pAccMaxRun and _maxBearRun <= _pAccMaxRun
+    bool _isAccum = _condAtr and _condBar and _condBalance and _condDrift and _condColorRun
+    float _hi = ta.highest(math.max(open, close), accRangeLen)
+    float _lo = ta.lowest(math.min(open, close),  accRangeLen)
+    [_isAccum, _hi, _lo]
+
+// Accum箱の管理 + Logic03 / Logic04 のイベント生成（1関数で両ロジック分を返す）
+f_accumEvents() =>
+    // --- パラメータ読み出し（PRM束。値は input と同一）---
+    float _pAccTouchTol            = array.get(PRM_ACC, 6)
+    [_isA, _hi, _lo] = f_accumDetect()
+    var float _fHi   = na    // 形成中の箱（上下限が動く）
+    var float _fLo   = na
+    var float _bxHi  = na    // 確定した箱（上下限は以後不変）
+    var float _bxLo  = na
+    var int   _bk    = 0     // ブレイク状態 0=箱内 / 1=上抜け中 / -1=下抜け中（箱ごとに作り直す）
+    var bool  _loArm = true  // 同一接触で反発イベントを繰り返さないためのアーム
+    var bool  _upArm = true
+
+    // 形成中の箱を実体基準で拡張（元コードと同じ）
+    if _isA and not nz(_isA[1], false)
+        _fHi := _hi
+        _fLo := _lo
+    if _isA
+        float _bt = math.max(open, close)
+        float _bb = math.min(open, close)
+        _fHi := math.max(nz(_fHi, _bt), _bt)
+        _fLo := math.min(nz(_fLo, _bb), _bb)
+
+    // Accum終了確定 → 箱を確定（上下限を固定）。
+    // ブレイク状態はこの新しい箱を基準に初期化するだけで、イベントは出さない。
+    if nz(_isA[1], false) and not _isA
+        _bxHi  := _fHi
+        _bxLo  := _fLo
+        _bk    := close > _bxHi ? 1 : close < _bxLo ? -1 : 0
+        _loArm := true
+        _upArm := true
+
+    bool _rebLong  = false
+    bool _rebShort = false
+    bool _brkLong  = false
+    bool _brkShort = false
+    float _v2BrkLvlL = na     // ★V2: Logic04 の否定ライン（跨いだ箱の境界）
+    float _v2BrkLvlS = na
+
+    if not na(_bxHi) and not na(_bxLo)
+        // --- Logic04 : ブレイク / ブレイク失敗の箱内復帰（確定終値のみ・状態変化時だけ）---
+        int _new = close > _bxHi ? 1 : close < _bxLo ? -1 : 0
+        if _new != _bk
+            if _new == 1
+                _brkLong := true          // 上限を確定終値で上抜け
+                _v2BrkLvlL := _bxHi
+            else if _new == -1
+                _brkShort := true         // 下限を確定終値で下抜け
+                _v2BrkLvlS := _bxLo
+            else if _bk == 1
+                _brkShort := true         // 上抜け失敗：同じ箱の中へ確定終値で復帰
+                _v2BrkLvlS := _bxHi
+            else
+                _brkLong := true          // 下抜け失敗：同じ箱の中へ確定終値で復帰
+                _v2BrkLvlL := _bxLo
+            _bk := _new
+
+        // --- Logic03 : 境界反発（未ブレイクの箱のみ・元コードのタッチ条件）---
+        bool _loTouch = low  <= _bxLo + _pAccTouchTol and high >= _bxLo - _pAccTouchTol
+        bool _upTouch = high >= _bxHi - _pAccTouchTol and low  <= _bxHi + _pAccTouchTol
+        if not _loTouch
+            _loArm := true
+        if not _upTouch
+            _upArm := true
+        // タッチだけでは成立させず、反発方向のローソクが確定した足で発火する。
+        // 方向ローソクでなかった足ではアームを落とさないので、同じ接触中に次の足で成立できる。
+        if _bk == 0 and _loTouch and _loArm and close > open
+            _rebLong := true              // 下限タッチ + 陽線確定 → LONG
+            _loArm   := false
+        if _bk == 0 and _upTouch and _upArm and close < open
+            _rebShort := true             // 上限タッチ + 陰線確定 → SHORT
+            _upArm    := false
+    // ★V2: 判定条件は変更せず、V2 の価格否定用に「成立時の否定ライン」を追加で返す（成立しない足は na）
+    //     Logic03 : LONG = 箱の下限 / SHORT = 箱の上限（帯の反発）
+    //     Logic04 : 跨いだ箱の境界（上抜け LONG = 上限 / 下抜け失敗の復帰 LONG = 下限 / SHORT は逆）
+    [_rebLong, _rebShort, _brkLong, _brkShort, _rebLong ? _bxLo : na, _rebShort ? _bxHi : na, _v2BrkLvlL, _v2BrkLvlS]
+
+// -------------------------------------------------------------------------------------
+// SIGNAL MODULE : Logic05〜08 = EMA Rebound / Logic09〜12 = EMA Break
+// -------------------------------------------------------------------------------------
+// 判定は元 EMA ストラテジー（f_emaEnvEvt）と同一。EMA1本ぶんを1関数で処理し、
+// EMA200 / 1000 / 2000 / 3000 に同じ関数を適用します（EMA別に関数は作りません）。
+//
+//   Rebound LONG  : close[1] >= EMA[1] かつ low  <= EMA + 許容幅 かつ close > EMA
+//   Rebound SHORT : close[1] <= EMA[1] かつ high >= EMA - 許容幅 かつ close < EMA
+//   Break   LONG  : close[1] <= EMA[1] かつ close > EMA（跨いだ確定足のみ）
+//   Break   SHORT : close[1] >= EMA[1] かつ close < EMA（跨いだ確定足のみ）
+//
+// ブレイク後に終値で逆側へ戻った足は、そのまま逆方向の Break 条件を満たすため
+// 逆方向イベントになります（上抜け後に終値がEMA下 → SHORT / 下抜け後に上 → LONG）。
+// EMAの上下にいるだけ・ヒゲだけでは発火しません。
+//
+// 各EMAは独立したロジック（Logic05〜12）なので、OR でまとめず別々に加点されます。
+// Rebound と Break も別ロジックなので互いに解除しません。
+// 対象は1M・5Mのみ。共通MTF基盤の各TFコンテキストで4本まとめて計算するので、
+// EMA用の request.security は1つも追加していません。
+grpEMA = "④ Logic05〜12 : EMA パラメータ"
+emaLenA     = input.int(200,   "EMA期間 A (Logic05/09)",  group = grpEMA, minval = 1)
+emaLenB     = input.int(1000,  "EMA期間 B (Logic06/10)",  group = grpEMA, minval = 1)
+emaLenC     = input.int(2000,  "EMA期間 C (Logic07/11)",  group = grpEMA, minval = 1)
+emaLenD     = input.int(3000,  "EMA期間 D (Logic08/12)",  group = grpEMA, minval = 1)
+useEmaTol   = input.bool(true, "EMA接触許容幅を使う",      group = grpEMA)
+emaTolATR   = input.float(0.5, "EMA接触許容幅 ATR倍率",    group = grpEMA, minval = 0.0, step = 0.05)
+
+// --- Logic05〜12 EMA のパラメータ束（input の値をそのまま格納。index = 下のコメント順）---
+//     ロジック関数はここから array.get() で読むため、外部要素は この配列1個だけになります。
+var array<float> PRM_EMA = array.from(
+     useEmaTol ? 1.0 : 0.0,  // 00 : useEmaTol
+     emaTolATR               // 01 : emaTolATR
+ )
+emaTolAtrLen= input.int(14,    "接触許容 ATR期間",         group = grpEMA, minval = 1)
+
+// EMA1本ぶんの Rebound / Break イベント（_on = そのTFでEMAロジックを使うか）
+f_emaEvents(_on, _emaNow, _emaPrev, _atr) =>
+    // --- パラメータ読み出し（PRM束。値は input と同一）---
+    bool  _pUseEmaTol              = array.get(PRM_EMA, 0) > 0.5
+    float _pEmaTolATR              = array.get(PRM_EMA, 1)
+    float _tol = _pUseEmaTol ? _atr * _pEmaTolATR : 0.0
+    bool _rebL = _on and close[1] >= _emaPrev and low  <= _emaNow + _tol and close > _emaNow
+    bool _rebS = _on and close[1] <= _emaPrev and high >= _emaNow - _tol and close < _emaNow
+    bool _brkL = _on and close[1] <= _emaPrev and close > _emaNow
+    bool _brkS = _on and close[1] >= _emaPrev and close < _emaNow
+    [_rebL, _rebS, _brkL, _brkS]
+
+// -------------------------------------------------------------------------------------
+// LONG / SHORT の bool 配列 → ビットマスク（Engine A / B / C 共通）
+// -------------------------------------------------------------------------------------
+// ビット位置は「そのEngine内での通し番号（0始まり）」です。
+// Engine をまたぐ元のロジック番号への対応は §6 で行います。
+f_packMasks(longs, shorts) =>
+    float lm = 0.0
+    float sm = 0.0
+    for i = 0 to array.size(longs) - 1
+        float bit = math.pow(2, i)
+        lm += array.get(longs,  i) ? bit : 0.0
+        sm += array.get(shorts, i) ? bit : 0.0
+    [lm, sm]
+
+// =====================================================================================
+// Engine A : Logic01〜12（FVG Absorption / FVG Rebound / Accum / EMA）
+// =====================================================================================
+f_signalMasksA() =>
+    // -------------------------------------------------------------------------------
+    // ▼▼▼ ここから：Engine A のロジック判定 ▼▼▼
+    // -------------------------------------------------------------------------------
+    // Logic01 : FVG Absorption（吸収が新規発生した確定足だけ true。保持は POINT MASTER 側）
+    [l01Long, l01Short, x01L, x01S] = f_fvgAbsEvent()
+
+    // Logic02 : FVG Rebound（反発が新規発生した確定足だけ true。保持は POINT MASTER 側）
+    [l02Long, l02Short, x02L, x02S] = f_fvgReboundEvent()
+
+    // Logic03 : Accum Rebound / Logic04 : Accum Break
+    // （同じAccum箱の状態から2ロジック分のイベントを取得。互いに独立したロジックとして扱う）
+    [l03Long, l03Short, l04Long, l04Short, x03L, x03S, x04L, x04S] = f_accumEvents()
+
+    // Logic05〜12 : EMA200/1000/2000/3000 の Rebound(05〜08) と Break(09〜12)
+    // EMAロジックは1M・5M（TFスロット1・2）だけを対象にする
+    bool _emaTfOk = timeframe.in_seconds() == timeframe.in_seconds(tfStr1) or timeframe.in_seconds() == timeframe.in_seconds(tfStr2)
+    float _emaAtr = ta.atr(emaTolAtrLen)
+    float _emaA = ta.ema(close, emaLenA)
+    float _emaB = ta.ema(close, emaLenB)
+    float _emaC = ta.ema(close, emaLenC)
+    float _emaD = ta.ema(close, emaLenD)
+    [l05Long, l05Short, l09Long, l09Short] = f_emaEvents(_emaTfOk, _emaA, _emaA[1], _emaAtr)
+    [l06Long, l06Short, l10Long, l10Short] = f_emaEvents(_emaTfOk, _emaB, _emaB[1], _emaAtr)
+    [l07Long, l07Short, l11Long, l11Short] = f_emaEvents(_emaTfOk, _emaC, _emaC[1], _emaAtr)
+    [l08Long, l08Short, l12Long, l12Short] = f_emaEvents(_emaTfOk, _emaD, _emaD[1], _emaAtr)
+
+    // ★Engine A へロジックを追加する時はここに定義し、下の array.from と ENG_A_N を更新する
+    // -------------------------------------------------------------------------------
+    // ▲▲▲ ここまで（Engine A）▲▲▲
+    // -------------------------------------------------------------------------------
+    // Engine A 内のビット順（0始まり）= Logic01, 02, ..., 12
+    longsA  = array.from(l01Long,  l02Long,  l03Long,  l04Long,  l05Long,  l06Long,  l07Long,  l08Long,  l09Long,  l10Long,  l11Long,  l12Long)
+    shortsA = array.from(l01Short, l02Short, l03Short, l04Short, l05Short, l06Short, l07Short, l08Short, l09Short, l10Short, l11Short, l12Short)
+    [lmA, smA] = f_packMasks(longsA, shortsA)
+    // ★V2 追加出力（判定には使わない）: この TF 足の close / high / low、EMA A〜D の現在値、Logic01〜04 の否定ライン
+    float xC  = close
+    float xH  = high
+    float xL  = low
+    float xEa = _emaA
+    float xEb = _emaB
+    float xEc = _emaC
+    float xEd = _emaD
+    [lmA, smA, xC, xH, xL, xEa, xEb, xEc, xEd, x01L, x01S, x02L, x02S, x03L, x03S, x04L, x04S]
+
+// ビットマスクから「ロジック番号 idx」のフラグを取り出す
+f_bitOn(mask, idx) =>
+    na(mask) ? false : math.floor(mask / math.pow(2, idx)) % 2 > 0.5
+// =====================================================================================
+// §5. 5M / 15M 取得（元版の非リペイント方式のまま。1M の取得は持たない）
+// =====================================================================================
+// request.security(..., <式>[1], lookahead = barmerge.lookahead_on)（直近の確定足。[1] は必須）
+// V2 用の追加出力（この TF 足の close 等・否定ライン）は 1 個の UDT にまとめて返す。
+// request 呼び出し 2 本、タプル要素 4 × 2 = 8 個。
+type SRCAX
+    float f0 = na
+    float f1 = na
+    float f2 = na
+    float f3 = na
+    float f4 = na
+    float f5 = na
+    float f6 = na
+    float f7 = na
+    float f8 = na
+    float f9 = na
+    float f10 = na
+    float f11 = na
+    float f12 = na
+    float f13 = na
+    float f14 = na
+
+f_srcArr(SRCAX o) =>
+    SRCAX q = na(o) ? SRCAX.new() : o
+    array.from(q.f0, q.f1, q.f2, q.f3, q.f4, q.f5, q.f6, q.f7, q.f8, q.f9, q.f10, q.f11, q.f12, q.f13, q.f14)
+
+f_htfPacket() =>
+    [lmRaw, smRaw, xC, xH, xL, xEa, xEb, xEc, xEd, x01L, x01S, x02L, x02S, x03L, x03S, x04L, x04S] = f_signalMasksA()
+    float lm = nz(lmRaw)
+    float sm = nz(smRaw)
+    int   tt = time
+    [lm[1], sm[1], tt[1], SRCAX.new(xC[1], xH[1], xL[1], xEa[1], xEb[1], xEc[1], xEd[1], x01L[1], x01S[1], x02L[1], x02S[1], x03L[1], x03S[1], x04L[1], x04S[1])]   // ★[1] は必須（外すと未来参照）
+
+[lm5, sm5, tt5, ox5]     = request.security(syminfo.tickerid, tfStr2, f_htfPacket(), lookahead = barmerge.lookahead_on)
+[lm15, sm15, tt15, ox15] = request.security(syminfo.tickerid, tfStr3, f_htfPacket(), lookahead = barmerge.lookahead_on)
+float plm5  = 0.0
+float psm5  = 0.0
+float plm15 = 0.0
+float psm15 = 0.0
+float im5   = 0.0
+float im15  = 0.0
+float sp5   = 0.0
+float sp15  = 0.0
+
+
+// =====================================================================================
+// §6. V2 有効根拠（ロジック × TF × 方向）と抑止前 PRE（1 分足あり版と同じ扱い。TF は 5M / 15M の 2 枠）
+// =====================================================================================
+// 生シグナル成立時に登録し、元版の保持本数（期限）と価格否定（その TF の確定終値）の早い方で解除。
+// 同方向の新シグナルで再登録、同じロジック × TF で反対方向の新シグナルが出たら切替で解除。
+// 同一足で両方向が出た場合の裁定は元版の「状態管理ルール」と同じ。
+// 否定ルール（V2_RULE）: 0 ライン（成立時の値 + 傾き × 経過本数）/ 1 EMA 現在値 / 2 Fib 継承（価格ラインなし）/
+//                         3 状態型（SAT）/ 4 成立足の安値・高値（Stoch）
+// PRE は抑止前の State Factor（0 / 1、SAT のみ 0 / 1/3 / 2/3）を、その TF の確定足ごとに上書き（保持なし）。
+// 内部 index : ti 0 = 5M / 1 = 15M（BUS の TF ID は 5M = 1 / 15M = 2 で別物）
+var LAST_TFTIME = array.new_int(N_TF, 0)
+var V2_RULE  = array.from(0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1)
+var V2_VALID = array.new_bool(N_LOGIC * N_TF * 2, false)   // index = f_idx(li, ti) × 2 + (0 LONG / 1 SHORT)
+var V2_PRICE = array.new_bool(N_LOGIC * N_TF * 2, false)
+var V2_REM   = array.new_int(N_LOGIC * N_TF * 2, 0)
+var V2_AGE   = array.new_int(N_LOGIC * N_TF * 2, 0)
+var V2_LVL   = array.new_float(N_LOGIC * N_TF * 2, na)
+var V2_SLP   = array.new_float(N_LOGIC * N_TF * 2, 0.0)
+var V2_PRE   = array.new_float(N_LOGIC * N_TF * 2, 0.0)     // 抑止前 PRE State Factor
+var V2_NEG   = array.new_int(N_TF * 2, 0)
+var V2_WARM  = array.new_int(N_TF, 0)
+var V2_BADX  = array.new_bool(N_TF, false)
+
+f_v2ApplyTf(int ti, float lm, float sm, float plm, float psm, float im, float sp, array<float> x) =>
+    float tc = array.get(x, 0)
+    array.set(V2_WARM, ti, array.get(V2_WARM, ti) + 1)
+    array.set(V2_BADX, ti, array.get(V2_BADX, ti) or na(tc))
+    for li = 0 to N_LOGIC - 1
+        int  k      = f_idx(li, ti)
+        int  rule   = array.get(V2_RULE, li)
+        bool isSt   = rule == 3
+        int  ei     = rule == 1 ? 3 + math.max(li - 4, 0) % 4 : 3
+        bool rawL   = f_bitOn(lm, li)
+        bool rawS   = f_bitOn(sm, li)
+        bool both   = rawL and rawS
+        bool sigL   = both ? conflictMode == CONF_LONG  : rawL
+        bool sigS   = both ? conflictMode == CONF_SHORT : rawS
+        bool fibInv = false
+        float emaNow = array.get(x, ei)
+        for d = 0 to 1
+            int   j     = k * 2 + d
+            bool  reg   = d == 0 ? sigL : sigS
+            bool  opp   = d == 0 ? sigS : sigL
+            bool  vld   = array.get(V2_VALID, j)
+            bool  aging = vld and not isSt
+            int   age1  = array.get(V2_AGE, j) + (aging ? 1 : 0)
+            int   rem1  = array.get(V2_REM, j) - (aging ? 1 : 0)
+            float lv    = rule == 1 ? emaNow : array.get(V2_LVL, j) + array.get(V2_SLP, j) * age1
+            bool  negd  = aging and rem1 > 0 and rule != 2 and array.get(V2_PRICE, j) and not na(lv) and not na(tc) and (d == 0 ? tc < lv : tc > lv)
+            bool  alive = vld and rem1 > 0 and not negd
+            float lvN   = li <= 3 ? array.get(x, 7 + math.min(math.max(li, 0), 3) * 2 + d) : float(na)
+            float slN   = 0.0
+            bool  pOk   = rule == 2 or (rule == 1 ? not na(emaNow) : not na(lvN))
+            bool  regNew = reg and not isSt
+            array.set(V2_VALID, j, (isSt ? reg : (reg ? true : opp ? false : alive)) and not fibInv)
+            array.set(V2_PRICE, j, isSt ? true : regNew ? pOk : array.get(V2_PRICE, j))
+            array.set(V2_REM,   j, regNew ? array.get(HOLD_ALL, k) : rem1)
+            array.set(V2_AGE,   j, regNew ? 0 : age1)
+            array.set(V2_LVL,   j, regNew ? lvN : array.get(V2_LVL, j))
+            array.set(V2_SLP,   j, regNew ? slN : array.get(V2_SLP, j))
+            array.set(V2_NEG,   ti * 2 + d, array.get(V2_NEG, ti * 2 + d) + (negd ? 1 : 0))
+            // 抑止前 PRE（その TF の確定足1本ぶんの現在値で上書き）
+            array.set(V2_PRE, j, 0.0)
+    N_LOGIC
+
+// 5M / 15M : その TF の確定足が新しくなった瞬間だけ更新（1 分足あり版と同じタイミング）
+int t5  = nz(tt5)
+int t15 = nz(tt15)
+if t5 > array.get(LAST_TFTIME, 0)
+    array.set(LAST_TFTIME, 0, t5)
+    f_v2ApplyTf(0, nz(lm5), nz(sm5), nz(plm5), nz(psm5), nz(im5), nz(sp5), f_srcArr(ox5))
+if t15 > array.get(LAST_TFTIME, 1)
+    array.set(LAST_TFTIME, 1, t15)
+    f_v2ApplyTf(1, nz(lm15), nz(sm15), nz(plm15), nz(psm15), nz(im15), nz(sp15), f_srcArr(ox15))
+
+
+// =====================================================================================
+// §7. データ準備 / 更新整合（5M / 15M のみ）と BUS 出力
+// =====================================================================================
+//   5M / 15M : 受信した確定足の開始時刻（tt[1]）が「この足の TF 区間の直前に足が存在した区間」と一致すること
+//              （休場・週末は直前に足が存在した区間と比べるので不整合にしない）
+//   値 : 処理した TF 足の確定終値が na なら不整合 / 準備 : 不整合なしで各 TF の処理本数 >= その TF の最大保持本数
+//   1M は取得しないので、1M の準備は待たない。
+bool isChart5M = timeframe.isminutes and timeframe.multiplier == 5
+var int bk5Cur   = na
+var int bk5Prev  = na
+var int bk15Cur  = na
+var int bk15Prev = na
+int bk5  = time - time % 300000
+int bk15 = time - time % 900000
+bk5Prev  := na(bk5Cur)  or bk5  != bk5Cur  ? bk5Cur  : bk5Prev
+bk5Cur   := bk5
+bk15Prev := na(bk15Cur) or bk15 != bk15Cur ? bk15Cur : bk15Prev
+bk15Cur  := bk15
+
+f_maxHold(int ti) =>
+    int mx = 1
+    for li = 0 to N_LOGIC - 1
+        mx := math.max(mx, array.get(HOLD_ALL, f_idx(li, ti)))
+    mx
+
+bool t5Miss  = t5 == 0 or na(bk5Prev)
+bool t15Miss = t15 == 0 or na(bk15Prev)
+bool t5Bad   = not t5Miss  and t5  != bk5Prev
+bool t15Bad  = not t15Miss and t15 != bk15Prev
+bool valBad  = array.get(V2_BADX, 0) or array.get(V2_BADX, 1)
+var int need5  = f_maxHold(0)
+var int need15 = f_maxHold(1)
+bool srcBad  = t5Bad or t15Bad or valBad
+bool srcWarm = array.get(V2_WARM, 0) >= need5 and array.get(V2_WARM, 1) >= need15
+// STATUS : 0 出力中 / 1 データ準備中 / 3 5分足以外 / 4 更新不整合
+int srcStatusNow = not isChart5M ? 3 : srcBad ? 4 : (t5Miss or t15Miss or not srcWarm) ? 1 : 0
+
+// 系統ごとの点（TF ti）: [LONG 確認済み 0/1, LONG 統合 ×3（0〜3）, SHORT 確認済み, SHORT 統合 ×3]
+f_famPts(int ti, int li0, int li1) =>
+    bool  cL = false
+    bool  cS = false
+    float iL = 0.0
+    float iS = 0.0
+    for li = li0 to li1
+        int  j  = f_idx(li, ti) * 2
+        bool vL = array.get(V2_VALID, j)     and array.get(V2_PRICE, j)
+        bool vS = array.get(V2_VALID, j + 1) and array.get(V2_PRICE, j + 1)
+        cL := cL or vL
+        cS := cS or vS
+        iL := math.max(iL, math.max(vL ? 1.0 : 0.0, array.get(V2_PRE, j)))
+        iS := math.max(iS, math.max(vS ? 1.0 : 0.0, array.get(V2_PRE, j + 1)))
+    [cL ? 1 : 0, int(math.round(iL * 3)), cS ? 1 : 0, int(math.round(iS * 3))]
+
+f_fam1(int ti, int li0, int li1, int off) =>
+    [cL, qL, cS, qS] = f_famPts(ti, li0, li1)
+    (cL + 2 * (qL >= 3 ? 1 : 0) + 4 * cS + 8 * (qS >= 3 ? 1 : 0)) * math.pow(2, off)
+
+f_unpriced(int ti) =>
+    bool u = false
+    for li = 0 to N_LOGIC - 1
+        int j = f_idx(li, ti) * 2
+        u := u or (array.get(V2_VALID, j) and not array.get(V2_PRICE, j)) or (array.get(V2_VALID, j + 1) and not array.get(V2_PRICE, j + 1))
+    u
+
+f_payload(int ti) =>
+    float base = (array.get(V2_NEG, ti * 2) > 0 ? 1 : 0) + (array.get(V2_NEG, ti * 2 + 1) > 0 ? 2 : 0) + (f_unpriced(ti) ? 4 : 0)
+    base + f_fam1(ti, 0, 3, 3) + f_fam1(ti, 4, 11, 7)
+
+int   BUS_BASE   = 1577836800000          // 2020-01-01 00:00 UTC
+float BUS_SLOTS  = 4194304.0              // 2^22
+int   BUS_FORMAT = 2                      // 5分・15分専用版（1 分足あり版は 1）
+f_bus(int tfId, float payload, int tclose) =>
+    float slot = (tclose - BUS_BASE) / 300000.0
+    bool  ok   = slot >= 0 and slot < BUS_SLOTS and slot == math.floor(slot) and payload >= 0 and payload < 2097152
+    ok ? BUS_FORMAT + 4 * 1 + 16 * tfId + 64 * slot + 268435456.0 * payload : na
+
+var float bus5  = na
+var float bus15 = na
+var int   srcLastBar = 0
+var int   srcStatus  = 1
+if isChart5M and barstate.isconfirmed and time > srcLastBar
+    srcLastBar := time
+    srcStatus  := srcStatusNow
+    array.set(V2_WARM, 0, t5Bad  or t5Miss  or array.get(V2_BADX, 0) ? 0 : array.get(V2_WARM, 0))
+    array.set(V2_WARM, 1, t15Bad or t15Miss or array.get(V2_BADX, 1) ? 0 : array.get(V2_WARM, 1))
+    // BUS の TF ID は 5M = 1 / 15M = 2（内部 index 0 / 1 とは別）
+    bus5  := srcStatusNow == 0 ? f_bus(1, f_payload(0), time_close) : na
+    bus15 := srcStatusNow == 0 ? f_bus(2, f_payload(1), time_close) : na
+    array.fill(V2_NEG, 0)
+    array.fill(V2_BADX, false)
+
+plot(isChart5M ? bus5  : na, "A 5M BUS",  display = display.data_window)
+plot(isChart5M ? bus15 : na, "A 15M BUS", display = display.data_window)
+plot(isChart5M ? srcStatus : 3, "A STATUS", display = display.data_window)
+

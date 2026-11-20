@@ -1,0 +1,351 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © point_master
+
+//@version=5
+// =====================================================================================
+// POINT MASTER DECISION 5M15M  ―  B 判定の 5 分・15 分専用版（Source A / B / C 5M15M の BUS を受け取る）
+// =====================================================================================
+// 1 分足あり版 Decision（PM-DEC-V2）から 1 分足への依存（1M BUS 3 入力・デコード・状態検査・1 分の逆方向警戒・表の 1M 行）
+// を取り除いた版。request.* は使わない。それ以外の B の判定（継続の候補条件・優先順・初期値・基準の更新方向・
+// 突破確認を先にする順序・復帰 / 再開の連続確認・手仕舞いの重複防止・LONG / SHORT の独立評価・
+// データ準備 / 不整合の間の状態凍結）は 1 分足あり版と同じ。
+//   判定条件の変更は「逆方向警戒を 5 分だけにした」ことのみ（1 分の逆方向警戒を外した）。
+//   その結果、継続の開始・復帰の時刻、保存基準、手仕舞い候補の時刻は 1 分足あり版と変わる場合がある。
+//
+// 【接続（6 入力）】同じ 5 分足チャートに PM-A-515 / PM-B-515 / PM-C-515 とこの Decision を追加し、
+//   A 5M BUS ← PM-A-515: A 5M BUS / A 15M BUS ← PM-A-515: A 15M BUS
+//   B 5M BUS ← PM-B-515: B 5M BUS / B 15M BUS ← PM-B-515: B 15M BUS
+//   C 5M BUS ← PM-C-515: C 5M BUS / C 15M BUS ← PM-C-515: C 15M BUS
+//   を選び、「6 入力を接続済み」を ON にする（OFF の間は判定しない）。
+//
+// 【BUS 仕様】bus = format + 4 × SourceID + 16 × TFID + 64 × slot + 2^28 × payload（非負整数 < 2^49）
+//   format = 2（5分・15分専用版。1 分足あり版の BUS は format 1 なので受け付けない）
+//   SourceID 1 = A / 2 = B / 3 = C、TFID 1 = 5M / 2 = 15M（内部配列の index 0 = 5M / 1 = 15M とは別）
+//   slot = (集約結果を確定した 5 分足の time_close − 2020-01-01 00:00 UTC) / 5 分（0〜4,194,303。範囲外は無効）
+//   payload の配置・系統の強度は 1 分足あり版と同じ（A : 価格帯 bit 3-6 / MA 7-10、B : 形状 3-6、
+//     C : 価格帯 3-6 / Fib 7-10 / SAT 11-16 / ストキャス 17-20、bit 0 / 1 価格否定、bit 2 価格基準なし）
+//
+// 【出力】（既存 PM-VERIFY-V2 でそのまま検証できる名前・コード）
+//   V2 LONG CODE / V2 SHORT CODE : 0 判断材料不足 / 1 継続 / 2 警戒 / 3 手仕舞い候補 / na 未準備・不整合・接続不正
+//   V2 STATUS : 0 判定中 / 1 データ準備中（Source の BUS が na）/ 3 5分足以外 / 4 時刻不一致 / 5 未接続・接続不正
+//   V2 MODEL  : 2（B 系。1 分足あり / なしの区別には使えない。比較時は接続元の shorttitle を確認する）
+// =====================================================================================
+indicator(
+     title      = "POINT MASTER DECISION 5M15M",
+     shorttitle = "PM-DEC-515",
+     overlay    = true
+ )
+
+// =====================================================================================
+// §0. 接続（Source A / B / C の BUS）
+// =====================================================================================
+grpIn = "⓪ 接続（PM-A-515 / PM-B-515 / PM-C-515 の BUS 6 本）"
+inA5  = input.source(close, "A 5M BUS",  group = grpIn, inline = "inA")
+inA15 = input.source(close, "A 15M BUS", group = grpIn, inline = "inA")
+inB5  = input.source(close, "B 5M BUS",  group = grpIn, inline = "inB")
+inB15 = input.source(close, "B 15M BUS", group = grpIn, inline = "inB")
+inC5  = input.source(close, "C 5M BUS",  group = grpIn, inline = "inC")
+inC15 = input.source(close, "C 15M BUS", group = grpIn, inline = "inC")
+decConnected = input.bool(false, "6 入力を接続済み（確認したら ON）", group = grpIn,
+     tooltip = "各入力に Source の同名出力（例 A 5M BUS ← PM-A-515: A 5M BUS）を選んでから ON にしてください。OFF の間は判定しません。")
+
+// =====================================================================================
+// §1. V2-B 設定（分割前の ⑩ と同じ初期値。初期値は仮説。黙って最適化しない）
+// =====================================================================================
+grpV2B = "① B 設定（5分・15分専用。初期値は 1 分足あり版と同じ・仮説）"
+v2bMinPts    = input.float(2.0, "継続 : 5M / 15M の確認済み根拠点 最低値", group = grpV2B, minval = 0.0, step = 1.0,
+     tooltip = "評価方向の確認済み根拠点がこの値以上、かつ反対方向より多い（同点は優勢としない）。")
+v2bWarnPts   = input.float(2.0, "逆方向警戒 : 5M の逆方向 統合根拠点 合計", group = grpV2B, minval = 0.0, step = 0.5)
+v2bWarnFams  = input.int(2,     "逆方向警戒 : 5M の寄与系統数", group = grpV2B, minval = 1, maxval = 6)
+v2bRecover   = input.int(2,     "警戒からの復帰 / 手仕舞い後の再開 : 5M 足の連続本数", group = grpV2B, minval = 1)
+v2bPivLeft   = input.int(2,     "5M 確定ピボット 左本数", group = grpV2B, minval = 1, inline = "v2piv")
+v2bPivRight  = input.int(2,     "右本数",                group = grpV2B, minval = 1, inline = "v2piv")
+
+grpView = "② 表示"
+v2ViewStr = input.string("両方", "表示する評価方向", options = ["LONG保有", "SHORT保有", "両方"], group = grpView,
+     tooltip = "表示だけの切替（計算は常に LONG / SHORT 両方）。「保有」は評価対象の呼称で、実口座のポジションは検知しません。")
+v2Show   = input.bool(true, "判定表を表示", group = grpView)
+v2Pos    = input.string(position.bottom_right, "表示位置", group = grpView,
+     options = [position.bottom_right, position.bottom_left, position.middle_right, position.middle_left, position.top_left, position.top_right, position.bottom_center])
+tblSize  = input.string(size.small, "文字サイズ", options = [size.tiny, size.small, size.normal, size.large], group = grpView)
+colLong  = input.color(color.new(#26a69a, 0),  "LONG 色",  group = grpView, inline = "col")
+colShort = input.color(color.new(#ef5350, 0),  "SHORT 色", group = grpView, inline = "col")
+colBg    = input.color(color.new(#1e222d, 20), "背景色",   group = grpView)
+colTxt   = input.color(color.new(#d1d4dc, 0),  "文字色",   group = grpView)
+
+bool isChart5M = timeframe.isminutes and timeframe.multiplier == 5
+
+// =====================================================================================
+// §2. BUS のデコードと検証
+// =====================================================================================
+int   BUS_BASE  = 1577836800000          // 2020-01-01 00:00 UTC
+float BUS_SLOTS = 4194304.0              // 2^22
+float BUS_MAX   = 562949953421312.0      // 2^49（これ以上は不正）
+// 期待する slot（この 5 分足の確定時刻）。範囲外は折り返さず無効
+float decSlotF  = (time_close - BUS_BASE) / 300000.0
+bool  decSlotOk = decSlotF >= 0 and decSlotF < BUS_SLOTS and decSlotF == math.floor(decSlotF)
+
+int   BUS_FORMAT = 2                     // 5分・15分専用版（1 分足あり版の format 1 は不正として扱う）
+// 1 入力の検証。戻り値 [状態 0 OK / 1 na / 4 時刻不一致 / 5 不正・取り違え・旧形式, payload]
+f_dec(float v, int srcId, int tfId, float payMax) =>
+    bool  num = not na(v) and v >= 0 and v < BUS_MAX and v == math.floor(v)
+    float fmt = num ? v % 4 : na
+    float sId = num ? math.floor(v / 4) % 4 : na
+    float tId = num ? math.floor(v / 16) % 4 : na
+    float sl  = num ? math.floor(v / 64) % BUS_SLOTS : na
+    float pay = num ? math.floor(v / 268435456.0) : na
+    int   st  = na(v) ? 1 : (not num or fmt != BUS_FORMAT or sId != srcId or tId != tfId or pay >= payMax) ? 5 : (not decSlotOk or sl != decSlotF) ? 4 : 0
+    [st, pay]
+
+// BUS の TF ID : 5M = 1 / 15M = 2
+[stA5,  pA5]  = f_dec(inA5,  1, 1, 2048.0)
+[stA15, pA15] = f_dec(inA15, 1, 2, 2048.0)
+[stB5,  pB5]  = f_dec(inB5,  2, 1, 128.0)
+[stB15, pB15] = f_dec(inB15, 2, 2, 128.0)
+[stC5,  pC5]  = f_dec(inC5,  3, 1, 2097152.0)
+[stC15, pC15] = f_dec(inC15, 3, 2, 2097152.0)
+DEC_ST = array.from(stA5, stA15, stB5, stB15, stC5, stC15)
+int decWorst = array.includes(DEC_ST, 5) ? 5 : array.includes(DEC_ST, 4) ? 4 : array.includes(DEC_ST, 1) ? 1 : 0
+// V2 STATUS : 0 判定中 / 1 データ準備中 / 3 5分足以外 / 4 時刻不一致 / 5 未接続・接続不正
+int v2StatusNow = not isChart5M ? 3 : not decConnected ? 5 : decWorst
+
+f_bit(float p, int b) =>
+    math.floor(p / math.pow(2, b)) % 2
+
+// 6 系統の統合（内部 index = ti × 2 + d、ti 0 = 5M / 1 = 15M、d 0 = LONG / 1 = SHORT）
+//   価格帯は A（Logic01〜04）と C（Logic19〜20）の最大値（足し算しない）。系統 × TF × 方向で最大 1 点。
+//   系統の順（合計の順序も分割前と同じ）: 価格帯 / MA / 形状 / Fib / SAT / ストキャス
+//   戻り値 [確認済み点, 統合点, 寄与系統数, 価格否定（方向別）, 価格基準なしあり]
+f_merge(array<float> pa, array<float> pb, array<float> pc) =>
+    bCurT = array.new_float(4, 0.0)
+    bIntT = array.new_float(4, 0.0)
+    bFamT = array.new_int(4, 0)
+    negs  = array.new_int(4, 0)
+    bool unp = false
+    for x = 0 to 3
+        int   ti = int(x / 2)
+        int   d  = x % 2
+        int   o  = d * 2
+        float a  = array.get(pa, ti)
+        float b  = array.get(pb, ti)
+        float c  = array.get(pc, ti)
+        float cP = math.max(f_bit(a, 3 + o), f_bit(c, 3 + o))
+        float iP = math.max(f_bit(a, 4 + o), f_bit(c, 4 + o))
+        float cM = f_bit(a, 7 + o)
+        float iM = f_bit(a, 8 + o)
+        float cG = f_bit(b, 3 + o)
+        float iG = f_bit(b, 4 + o)
+        float cF = f_bit(c, 7 + o)
+        float iF = f_bit(c, 8 + o)
+        float cS = f_bit(c, 11 + d * 3)
+        float iS = (math.floor(c / math.pow(2, 12 + d * 3)) % 4) / 3.0
+        float cK = f_bit(c, 17 + o)
+        float iK = f_bit(c, 18 + o)
+        array.set(bCurT, x, cP + cM + cG + cF + cS + cK)
+        array.set(bIntT, x, iP + iM + iG + iF + iS + iK)
+        array.set(bFamT, x, (iP > 0 ? 1 : 0) + (iM > 0 ? 1 : 0) + (iG > 0 ? 1 : 0) + (iF > 0 ? 1 : 0) + (iS > 0 ? 1 : 0) + (iK > 0 ? 1 : 0))
+        array.set(negs, x, f_bit(a, d) + f_bit(b, d) + f_bit(c, d) > 0 ? 1 : 0)
+        unp := unp or f_bit(a, 2) + f_bit(b, 2) + f_bit(c, 2) > 0
+    [bCurT, bIntT, bFamT, negs, unp]
+
+// =====================================================================================
+// §3. 5M 確定ピボット（チャート 5 分足。右側確認が終わった足で値が出る）と V2-B 状態
+// =====================================================================================
+float v2PivLowNow  = ta.pivotlow(low,  v2bPivLeft, v2bPivRight)
+float v2PivHighNow = ta.pivothigh(high, v2bPivLeft, v2bPivRight)
+var float v2LastPL    = na      // 直近の確定ピボット安値（LONG の押し安値候補）
+var bool  v2LastPLNeg = false   // 確定後に 5M 確定終値で否定されたか
+var float v2LastPH    = na      // 直近の確定ピボット高値（SHORT の戻り高値候補）
+var bool  v2LastPHNeg = false
+
+// 状態（index 0 = LONG 評価 / 1 = SHORT 評価。LONG / SHORT は配列の別 index で完全に分離）
+var V2_CODE    = array.new_int(2, 0)
+var V2_REASON  = array.new_string(2, "根拠不足")
+var V2B_EP     = array.new_bool(2, false)    // 継続エピソード中
+var V2B_CAU    = array.new_bool(2, false)    // エピソード中の警戒（復帰確認が必要）
+var V2B_AFTER  = array.new_bool(2, false)    // 手仕舞い候補の後（再開に連続確認が必要）
+var V2B_RECOV  = array.new_int(2, 0)         // 候補条件の連続成立本数（5M 足）
+var V2B_BASIS  = array.new_float(2, na)      // 保存した基準（LONG 押し安値 / SHORT 戻り高値）
+var V2B_BSTAT  = array.new_int(2, 0)         // 0 確認待ち / 1 設定済み / 2 突破
+var V2B_BLAST  = array.new_float(2, na)      // 最後に突破された基準
+// 診断値（dir × 6）: 0 5M確認(自) / 1 5M確認(逆) / 2 15M確認(自) / 3 15M確認(逆) / 4 5M逆統合 / 5 5M逆系統数
+var V2B_DIAG   = array.new_float(12, na)
+var V2_NEG     = array.new_int(4, 0)         // この 5 分足の価格否定（内部 index ti × 2 + d、ti 0 = 5M / 1 = 15M）
+var bool   v2Unpriced   = false
+var int    v2LastBar    = 0
+var int    v2LastStatus = 5
+
+f_v2Label(int code) =>
+    code == 1 ? "継続" : code == 2 ? "警戒" : code == 3 ? "手仕舞い候補" : "判断材料不足"
+
+f_v2Color(int code) =>
+    code == 1 ? color.new(#4CAF50, 0) : code == 2 ? color.new(#FFD54F, 0) : code == 3 ? color.new(#FF1744, 0) : color.gray
+
+f_v2Join(string a, string b) =>
+    a == "" ? b : b == "" ? a : a + " / " + b
+
+// =====================================================================================
+// B（5分・15分専用）: 評価方向 di（0 LONG / 1 SHORT）の 1 確定 5 分足ぶんの状態遷移
+//   1 分足あり版の f_v2BStep から 1 分の逆方向警戒（w1）を外し、配列の参照位置を 5M = 0 / 15M = 1 にしたもの。それ以外は同じ。
+//   更新するのは V2B_* / V2_CODE / V2_REASON / V2B_DIAG の index di の要素だけ。
+//   判定順 : ① 保存基準の突破（手仕舞い候補）→ ② エピソード中の基準更新 → ③ 候補条件 → ④ 継続 / 警戒 / 判断材料不足
+// =====================================================================================
+f_v2BStep(int di, array<float> bCurT, array<float> bIntT, array<int> bFamT, float newPL, float newPH, float lastPL, bool lastPLNeg, float lastPH, bool lastPHNeg) =>
+    int   D       = di == 0 ? 1 : -1
+    int   od      = 1 - di
+    int   N       = v2bRecover
+    float own5    = array.get(bCurT, 0 * 2 + di)
+    float opp5    = array.get(bCurT, 0 * 2 + od)
+    float own15   = array.get(bCurT, 1 * 2 + di)
+    float opp15   = array.get(bCurT, 1 * 2 + od)
+    bool  c5      = own5  >= v2bMinPts and own5  > opp5
+    bool  c15     = own15 >= v2bMinPts and own15 > opp15
+    bool  w5      = array.get(bIntT, 0 * 2 + od) >= v2bWarnPts and array.get(bFamT, 0 * 2 + od) >= v2bWarnFams
+    bool  warn    = w5
+    bool  warnCur = w5 and array.get(bCurT, 0 * 2 + od) > 0
+    bool  negHit  = array.get(V2_NEG, 0 * 2 + di) > 0 or array.get(V2_NEG, 1 * 2 + di) > 0
+    bool  ep      = array.get(V2B_EP, di)
+    bool  cau     = array.get(V2B_CAU, di)
+    bool  after   = array.get(V2B_AFTER, di)
+    int   rec     = array.get(V2B_RECOV, di)
+    float basis   = array.get(V2B_BASIS, di)
+    int   bstat   = array.get(V2B_BSTAT, di)
+    // ① 保存した基準の突破（同じ足の基準更新より先に確認。終値 = 基準は突破にしない）
+    bool  breach  = ep and not na(basis) and (D == 1 ? close < basis : close > basis)
+    // ② エピソード中の基準更新（LONG はより高い安値 / SHORT はより低い高値へだけ。現在価格に否定されていないもの）
+    float basisUp = D == 1 ? (not na(newPL) and close > newPL and newPL > basis ? newPL : basis) : (not na(newPH) and close < newPH and newPH < basis ? newPH : basis)
+    // 開始用の基準：その時点で利用可能な直近の確定ピボット（否定済み・逆側にあるものは使わない）
+    float lastP   = D == 1 ? (not na(newPL) ? newPL : lastPL) : (not na(newPH) ? newPH : lastPH)
+    bool  lastNeg = D == 1 ? (not na(newPL) ? false : lastPLNeg) : (not na(newPH) ? false : lastPHNeg)
+    bool  startOk = not na(lastP) and not lastNeg and (D == 1 ? lastP < close : lastP > close)
+    bool  basisOk = ep or startOk
+    // ③ 候補条件
+    bool  cand    = c5 and c15 and basisOk and not warn
+    int   rc      = rec + 1
+    bool  inEp    = ep and not breach
+    bool  startNow = not ep and cand and (not after or rc >= N)
+    // ④ コードと次の状態
+    int   code    = breach ? 3 : inEp ? (cand ? (cau ? (rc >= N ? 1 : 2) : 1) : 2) : (cand ? (startNow ? 1 : 2) : (warn ? 2 : 0))
+    bool  epN     = breach ? false : inEp ? true : startNow
+    bool  cauN    = breach ? false : inEp ? (cand ? (cau and rc < N) : true) : false
+    bool  afterN  = breach ? true : startNow ? false : after
+    int   recN    = breach ? 0 : inEp ? (cand ? (cau ? (rc >= N ? 0 : rc) : rec) : 0) : (cand ? (startNow ? 0 : rc) : 0)
+    float basisN  = breach ? na : inEp ? basisUp : startNow ? lastP : basis
+    int   bstatN  = breach ? 2 : startNow ? 1 : (not epN and bstat == 1 ? 0 : bstat)
+    // 理由（候補条件が崩れた内訳）
+    string pts    = str.tostring(own5, "0.##") + " vs " + str.tostring(opp5, "0.##")
+    string pts15  = str.tostring(own15, "0.##") + " vs " + str.tostring(opp15, "0.##")
+    string s1     = not c5 ? (ep ? "5分の優勢消失" : "5分の根拠不足") + "（" + pts + "）" : ""
+    string s2     = not c15 ? "15分の確認なし（" + pts15 + "）" : ""
+    string s3     = warn ? (warnCur ? "逆方向CURRENT" : "逆方向PRE") + "（5M）" : ""
+    string s4     = negHit ? "根拠の価格否定" : ""
+    string s5     = not basisOk ? "基準待ち（使用可能な確定ピボットなし）" : ""
+    string sub    = f_v2Join(f_v2Join(f_v2Join(f_v2Join(s1, s2), s3), s4), s5)
+    string rcS    = str.tostring(rc) + "/" + str.tostring(N)
+    string why    = breach ? "基準突破（確定ピボット " + str.tostring(basis, format.mintick) + " を 5M 確定終値が否定）" :
+         inEp ? (cand ? (cau ? (rc >= N ? "継続（復帰確認 " + rcS + " 完了）" : "復帰確認中 " + rcS) : "継続（5M " + pts + " / 15M " + pts15 + "）") : sub) :
+         cand ? (startNow ? "継続開始（基準 " + str.tostring(lastP, format.mintick) + "）" : "復帰確認中（手仕舞い後）" + rcS) :
+         (sub == "" ? "根拠不足" : sub)
+    array.set(V2B_EP,    di, epN)
+    array.set(V2B_CAU,   di, cauN)
+    array.set(V2B_AFTER, di, afterN)
+    array.set(V2B_RECOV, di, recN)
+    array.set(V2B_BASIS, di, basisN)
+    array.set(V2B_BSTAT, di, bstatN)
+    array.set(V2B_BLAST, di, breach ? basis : array.get(V2B_BLAST, di))
+    array.set(V2_CODE,   di, code)
+    array.set(V2_REASON, di, why)
+    array.set(V2B_DIAG, di * 6 + 0, own5)
+    array.set(V2B_DIAG, di * 6 + 1, opp5)
+    array.set(V2B_DIAG, di * 6 + 2, own15)
+    array.set(V2B_DIAG, di * 6 + 3, opp15)
+    array.set(V2B_DIAG, di * 6 + 4, array.get(bIntT, 0 * 2 + od))
+    array.set(V2B_DIAG, di * 6 + 5, array.get(bFamT, 0 * 2 + od))
+    code
+
+
+// =====================================================================================
+// §4. 確定5分足ごとの更新（更新順 : ピボット否定 → B の判定 → ピボット記録。分割前と同じ）
+//   判定可能（V2 STATUS 0）な足でだけ判定・エピソード・基準を更新し、それ以外は状態を凍結する。
+//   ピボットの記録は価格だけで決まるため、判定可否に関係なく毎確定足で行う。
+// =====================================================================================
+if isChart5M and barstate.isconfirmed and time > v2LastBar
+    v2LastBar    := time
+    v2LastStatus := v2StatusNow
+    v2LastPLNeg := v2LastPLNeg or (not na(v2LastPL) and close < v2LastPL)
+    v2LastPHNeg := v2LastPHNeg or (not na(v2LastPH) and close > v2LastPH)
+    float newPL = v2PivLowNow
+    float newPH = v2PivHighNow
+    if v2StatusNow == 0
+        [bCurT, bIntT, bFamT, negs, unp] = f_merge(array.from(pA5, pA15), array.from(pB5, pB15), array.from(pC5, pC15))
+        array.clear(V2_NEG)
+        array.concat(V2_NEG, negs)
+        v2Unpriced := unp
+        for di = 0 to 1
+            f_v2BStep(di, bCurT, bIntT, bFamT, newPL, newPH, v2LastPL, v2LastPLNeg, v2LastPH, v2LastPHNeg)
+    v2LastPLNeg := na(newPL) ? v2LastPLNeg : close < newPL
+    v2LastPL    := na(newPL) ? v2LastPL    : newPL
+    v2LastPHNeg := na(newPH) ? v2LastPHNeg : close > newPH
+    v2LastPH    := na(newPH) ? v2LastPH    : newPH
+
+// ---- 出力（足の途中は最後に確定した値。準備中・不整合・接続不正・5分足以外は na）----
+int   v2StatusOut = isChart5M ? v2LastStatus : 3
+float v2OutLong   = v2StatusOut == 0 ? array.get(V2_CODE, 0) : na
+float v2OutShort  = v2StatusOut == 0 ? array.get(V2_CODE, 1) : na
+plot(v2OutLong,   "V2 LONG CODE",  display = display.data_window)
+plot(v2OutShort,  "V2 SHORT CODE", display = display.data_window)
+plot(v2StatusOut, "V2 STATUS",     display = display.data_window)
+plot(2,           "V2 MODEL",      display = display.data_window)
+plot(v2StatusOut == 0 ? (v2Unpriced ? 1 : 0) : na, "V2 B UNPRICED EVIDENCE", display = display.data_window)
+
+// =====================================================================================
+// §5. 判定表（B：5分・15分専用。1 分の逆方向警戒の行は持たない）
+// =====================================================================================
+var v2Tbl = table.new(v2Pos, 3, 14, border_width = 1)
+bool v2ShowL = v2ViewStr != "SHORT保有"
+bool v2ShowS = v2ViewStr != "LONG保有"
+
+f_v2Cell(int c, int r, string txt, color tc) =>
+    table.cell(v2Tbl, c, r, txt, text_color = tc, bgcolor = colBg, text_size = tblSize)
+
+f_v2Row(int r, string label, color lc, string tL, color cL, string tS, color cS) =>
+    f_v2Cell(0, r, label, lc)
+    if v2ShowL
+        f_v2Cell(1, r, tL, cL)
+    if v2ShowS
+        f_v2Cell(2, r, tS, cS)
+    r + 1
+
+f_stMark(int st) =>
+    st == 0 ? "○" : st == 1 ? "na" : st == 4 ? "時刻✕" : "✕"
+
+if barstate.islast
+    table.clear(v2Tbl, 0, 0, 2, 13)
+    if v2Show
+        int r = f_v2Row(0, "PM B：5分・15分専用（PM-DEC-515）", colTxt, "LONG保有 評価", colLong, "SHORT保有 評価", colShort)
+        if v2StatusOut != 0
+            string st = v2StatusOut == 3 ? "5分足チャート専用です" : v2StatusOut == 5 and not decConnected ? "「6 入力を接続済み」が OFF：判定していません" :
+                 v2StatusOut == 5 ? "接続不正（Source / TF の取り違え・1 分足あり版の BUS・BUS 以外の入力）" : v2StatusOut == 4 ? "時刻不一致（Source の BUS が この 5 分足のものではない）" : "データ準備中（Source の BUS が na）"
+            f_v2Cell(0, 1, st + "：V2 出力は na", color.new(#FF9800, 0))
+            f_v2Cell(0, 2, "A 5M/15M : " + f_stMark(stA5) + " / " + f_stMark(stA15) + "  ← PM-A-515 の A 5M BUS / A 15M BUS", colTxt)
+            f_v2Cell(0, 3, "B 5M/15M : " + f_stMark(stB5) + " / " + f_stMark(stB15) + "  ← PM-B-515 の B 5M BUS / B 15M BUS", colTxt)
+            f_v2Cell(0, 4, "C 5M/15M : " + f_stMark(stC5) + " / " + f_stMark(stC15) + "  ← PM-C-515 の C 5M BUS / C 15M BUS", colTxt)
+        else
+            r := f_v2Row(r, "判定（確定5分足）", colTxt, f_v2Label(array.get(V2_CODE, 0)), f_v2Color(array.get(V2_CODE, 0)), f_v2Label(array.get(V2_CODE, 1)), f_v2Color(array.get(V2_CODE, 1)))
+            r := f_v2Row(r, "理由", colTxt, array.get(V2_REASON, 0), colTxt, array.get(V2_REASON, 1), colTxt)
+            r := f_v2Row(r, "5M 確認済み点（自 vs 逆）", colTxt,
+                 str.tostring(array.get(V2B_DIAG, 0), "0") + " vs " + str.tostring(array.get(V2B_DIAG, 1), "0"), colTxt,
+                 str.tostring(array.get(V2B_DIAG, 6), "0") + " vs " + str.tostring(array.get(V2B_DIAG, 7), "0"), colTxt)
+            r := f_v2Row(r, "15M 確認済み点（自 vs 逆）", colTxt,
+                 str.tostring(array.get(V2B_DIAG, 2), "0") + " vs " + str.tostring(array.get(V2B_DIAG, 3), "0"), colTxt,
+                 str.tostring(array.get(V2B_DIAG, 8), "0") + " vs " + str.tostring(array.get(V2B_DIAG, 9), "0"), colTxt)
+            r := f_v2Row(r, "5M 逆方向 統合点（系統数）", colTxt,
+                 str.tostring(array.get(V2B_DIAG, 4), "0.##") + "（" + str.tostring(array.get(V2B_DIAG, 5), "0") + "）", colTxt,
+                 str.tostring(array.get(V2B_DIAG, 10), "0.##") + "（" + str.tostring(array.get(V2B_DIAG, 11), "0") + "）", colTxt)
+            r := f_v2Row(r, "基準（5M 確定ピボット）", colTxt,
+                 array.get(V2B_BSTAT, 0) == 1 ? "設定済み " + str.tostring(array.get(V2B_BASIS, 0), format.mintick) : array.get(V2B_BSTAT, 0) == 2 ? "突破 " + str.tostring(array.get(V2B_BLAST, 0), format.mintick) : "確認待ち",
+                 array.get(V2B_BSTAT, 0) == 2 ? color.new(#FF1744, 0) : colTxt,
+                 array.get(V2B_BSTAT, 1) == 1 ? "設定済み " + str.tostring(array.get(V2B_BASIS, 1), format.mintick) : array.get(V2B_BSTAT, 1) == 2 ? "突破 " + str.tostring(array.get(V2B_BLAST, 1), format.mintick) : "確認待ち",
+                 array.get(V2B_BSTAT, 1) == 2 ? color.new(#FF1744, 0) : colTxt)
+            f_v2Cell(0, r, v2Unpriced ? "価格基準なし（未対応）の有効根拠あり：B の点数に不算入" : "", color.new(#FF9800, 0))
+            f_v2Cell(0, r + 1, "※点数 = 系統×TF×方向で最大1点（Weight不使用）。基準は確定ピボット基準", color.gray)
