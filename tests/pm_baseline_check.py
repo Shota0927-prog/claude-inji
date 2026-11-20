@@ -56,7 +56,7 @@ for f in UNTOUCHED:
 for f in FILES:
     old = git_show(BASELINE, f).split('\n')
     new = open(f, encoding='utf-8').read().split('\n')
-    removed = [l.strip() for l in difflib.ndiff(old, new) if l.startswith('- ')]
+    removed = [l[2:].strip() for l in difflib.ndiff(old, new) if l.startswith('- ')]
     bad = [l for l in removed if l and not l.startswith('//') and l not in ALLOWED_CHANGED]
     check(f'{f}: no baseline code line removed except documented default-equivalent replacements ({len(removed)} removed lines checked)', not bad)
     if bad:

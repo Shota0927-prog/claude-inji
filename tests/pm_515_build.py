@@ -118,6 +118,24 @@ BUS_DOC = '''// 【BUS 仕様（Decision への受け渡し）】plot の値 1 �
 '''
 
 
+def adopt_block(cfg):
+    """採用設定の input と V2_ADOPT（f_idx(li, ti) = li × 2 + ti の順）"""
+    g = '"⑧ 採用設定（実験用。初期値 = 全て採用）"'
+    out = [f'adoptModeStr = input.string("全て採用", "B の系統点へ採用するロジック", options = ["全て採用", "カスタム（下のチェック）"], group = {g},',
+           '     tooltip = "全て採用 = 変更前と同じ。カスタムでは下のチェックを外したロジック × 時間足を、B の確認済み点・統合点・寄与系統数・価格否定・価格基準なしから外します（検知と保持は変えません）。")',
+           'bool adoptAll = adoptModeStr == "全て採用"']
+    vals = []
+    for i, lab in enumerate(cfg['labels']):
+        only5 = cfg['id'] == 'A' and i >= 4
+        out.append(f'ad{i}m5  = input.bool(true, "{lab} 5M", group = {g}, inline = "ad{i}")')
+        if not only5:
+            out.append(f'ad{i}m15 = input.bool(true, "15M", group = {g}, inline = "ad{i}")')
+        vals.append(f'adoptAll or ad{i}m5')
+        vals.append('true' if only5 else f'adoptAll or ad{i}m15')
+    out.append('V2_ADOPT = array.from(' + ', '.join(vals) + ')')
+    return '\n'.join(out)
+
+
 def infra(cfg):
     """Source 共通の基盤（5M / 15M 取得・V2 有効根拠・準備判定・BUS）。内部 index 0 = 5M / 1 = 15M"""
     S = cfg['id']
@@ -202,6 +220,9 @@ float sp15  = 0.0
 // 内部 index : ti 0 = 5M / 1 = 15M（BUS の TF ID は 5M = 1 / 15M = 2 で別物）
 var LAST_TFTIME = array.new_int(N_TF, 0)
 var V2_RULE  = array.from({cfg['rules']})
+// B の系統点へ採用するか（ロジック × TF。index = f_idx(li, ti)）。採用 OFF は確認済み点・統合点（PRE 含む）・寄与系統数・
+// 価格否定フラグ・価格基準なしから外す。検知・保持・価格否定の計算そのものは変えない（単体診断の生シグナルは採用前）。
+""" + adopt_block(cfg) + f"""
 var V2_VALID = array.new_bool(N_LOGIC * N_TF * 2, false)   // index = f_idx(li, ti) × 2 + (0 LONG / 1 SHORT)
 var V2_PRICE = array.new_bool(N_LOGIC * N_TF * 2, false)
 var V2_REM   = array.new_int(N_LOGIC * N_TF * 2, 0)
@@ -257,7 +278,7 @@ f_v2ApplyTf(int ti, float lm, float sm, float plm, float psm, float im, float sp
             array.set(V2_AGE,   j, regNew ? 0 : age1)
             array.set(V2_LVL,   j, regNew ? lvN : array.get(V2_LVL, j))
             array.set(V2_SLP,   j, regNew ? slN : array.get(V2_SLP, j))
-            array.set(V2_NEG,   ti * 2 + d, array.get(V2_NEG, ti * 2 + d) + (negd ? 1 : 0))
+            array.set(V2_NEG,   ti * 2 + d, array.get(V2_NEG, ti * 2 + d) + (negd and array.get(V2_ADOPT, k) ? 1 : 0))
             // 抑止前 PRE（その TF の確定足1本ぶんの現在値で上書き）
             array.set(V2_PRE, j, {cfg['pre']})
             // 単体診断（上で計算済みの値を記録するだけ）
@@ -325,12 +346,13 @@ f_famPts(int ti, int li0, int li1) =>
     float iS = 0.0
     for li = li0 to li1
         int  j  = f_idx(li, ti) * 2
-        bool vL = array.get(V2_VALID, j)     and array.get(V2_PRICE, j)
-        bool vS = array.get(V2_VALID, j + 1) and array.get(V2_PRICE, j + 1)
+        bool ad = array.get(V2_ADOPT, f_idx(li, ti))      // 採用 OFF は CURRENT も PRE も入れない
+        bool vL = ad and array.get(V2_VALID, j)     and array.get(V2_PRICE, j)
+        bool vS = ad and array.get(V2_VALID, j + 1) and array.get(V2_PRICE, j + 1)
         cL := cL or vL
         cS := cS or vS
-        iL := math.max(iL, math.max(vL ? 1.0 : 0.0, array.get(V2_PRE, j)))
-        iS := math.max(iS, math.max(vS ? 1.0 : 0.0, array.get(V2_PRE, j + 1)))
+        iL := math.max(iL, math.max(vL ? 1.0 : 0.0, ad ? array.get(V2_PRE, j)     : 0.0))
+        iS := math.max(iS, math.max(vS ? 1.0 : 0.0, ad ? array.get(V2_PRE, j + 1) : 0.0))
     [cL ? 1 : 0, int(math.round(iL * 3)), cS ? 1 : 0, int(math.round(iS * 3))]
 
 f_fam1(int ti, int li0, int li1, int off) =>
@@ -341,7 +363,7 @@ f_unpriced(int ti) =>
     bool u = false
     for li = 0 to N_LOGIC - 1
         int j = f_idx(li, ti) * 2
-        u := u or (array.get(V2_VALID, j) and not array.get(V2_PRICE, j)) or (array.get(V2_VALID, j + 1) and not array.get(V2_PRICE, j + 1))
+        u := u or (array.get(V2_ADOPT, f_idx(li, ti)) and ((array.get(V2_VALID, j) and not array.get(V2_PRICE, j)) or (array.get(V2_VALID, j + 1) and not array.get(V2_PRICE, j + 1))))
     u
 
 f_payload(int ti) =>
@@ -390,8 +412,9 @@ f_study(int status, int tclose) =>
     int   st   = STUDY_NA ? 6 : status
     int   j    = f_idx(STUDY_LI, STUDY_TI) * 2
     bool  nb   = array.get(V2_NEWBAR, STUDY_TI)
-    bool  cL   = array.get(V2_VALID, j)     and array.get(V2_PRICE, j)
-    bool  cS   = array.get(V2_VALID, j + 1) and array.get(V2_PRICE, j + 1)
+    bool  ad   = array.get(V2_ADOPT, f_idx(STUDY_LI, STUDY_TI))
+    bool  cL   = ad and array.get(V2_VALID, j)     and array.get(V2_PRICE, j)
+    bool  cS   = ad and array.get(V2_VALID, j + 1) and array.get(V2_PRICE, j + 1)
     bool  isSt = array.get(V2_RULE, STUDY_LI) == 3
     int   ageL = cL ? (isSt ? array.get(V2_SINCE, j)     : array.get(V2_AGE, j))     : -1
     int   ageS = cS ? (isSt ? array.get(V2_SINCE, j + 1) : array.get(V2_AGE, j + 1)) : -1
@@ -402,7 +425,7 @@ f_study(int status, int tclose) =>
          4096.0 * f_cap6(array.get(V2_SINCE, j)) + 262144.0 * f_cap6(array.get(V2_SINCE, j + 1)) +
          16777216.0 * f_cap6(ageL) + 1073741824.0 * f_cap6(ageS) + (nb ? 68719476736.0 : 0) +
          137438953472.0 * (slot % 16384)
-    float meta = 1 + 4 * {sid} + 16 * (STUDY_TI + 1) + 64 * ({cfg['goff']} + STUDY_LI + 1) + 2048 * st + 16384 * 1 + 32768.0 * slot
+    float meta = 1 + 4 * {sid} + 16 * (STUDY_TI + 1) + 64 * ({cfg['goff']} + STUDY_LI + 1) + 2048 * st + 16384 * (ad ? 1 : 0) + 32768.0 * slot
     [sOk and st == 0 ? data : na, sOk ? meta : na]
 
 var float studyData = na
