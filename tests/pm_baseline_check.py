@@ -1,6 +1,7 @@
 """比較元コミット（BASELINE）と現行 5分・15分版の一致確認。Pine 上の実行確認ではない。
-  静的 : 現行 Source / Decision の差分が「通常 BUS・判定の経路に触れない追加」と、
-         既定値で元と同じ値になる式変更（採用設定・系統 Weight）に限られることを確認する。
+  静的 : 対象外ファイル（1 分足あり版・Mode A・Verifier V2・元版）が変わっていないこと、
+         現行 Source / Decision の既存 plot の名前と順序・既存入力・title が保たれていることを確認する。
+         （時刻修正版以降は、比較元と同じチャート足位置でのコード一致は求めない）
   モデル : 採用 = 全て、保持 = 元、Weight = 全て 1 のとき、通常 BUS の payload・系統点・B 判定コード・基準が
           比較元と一致することを確認する（tests/pm_baseline_model.py）。
 使い方 : python3 -I tests/pm_baseline_check.py
@@ -67,11 +68,9 @@ for f in UNTOUCHED:
 for f in FILES:
     old = git_show(BASELINE, f).split('\n')
     new = open(f, encoding='utf-8').read().split('\n')
-    removed = [l[2:].strip() for l in difflib.ndiff(old, new) if l.startswith('- ')]
-    bad = [l for l in removed if l and not l.startswith('//') and l not in ALLOWED_CHANGED]
-    check(f'{f}: no baseline code line removed except documented default-equivalent replacements ({len(removed)} removed lines checked)', not bad)
-    if bad:
-        print('\n'.join(bad))
+    # 時刻修正版（TIMEFIX、3ef7e5a 以降）は取得・適用・出力の時点を意図的に変えたので、比較元と同じチャート足位置での
+    # コード行・BUS の一致は求めない（tests/pm_timefix_sim.py の元足 ID 対応と固定ケースで確認する）。
+    # ここでは既存 plot・入力・title が保たれていることと、対象外ファイルが変わっていないことだけを確認する。
     # 既存 plot の名前と順序が保たれている（追加分は末尾）
     import re
     po = re.findall(r'^\s*plot\([^"]*"([^"]+)"', '\n'.join(old), re.M)

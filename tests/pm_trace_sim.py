@@ -1,4 +1,5 @@
-"""時刻照合（Source A の TRACE 出力 → Logic Verifier の照合）の固定ケース。Pine 上の実行確認ではない。
+"""【時刻修正前（9a4a3d2 まで）の経路の記録】時刻照合の固定ケース。Pine 上の実行確認ではない。
+時刻修正版（3ef7e5a 以降）の経路は tests/pm_timefix_sim.py を参照。
 現行コードの経路を写したもの:
   Source A : request.security(tfStr2="5", f_htfPacket() の [1], lookahead_on)  → チャート 5 分足 n で「直前に確定した 5M 足 n-1」が届く
              新しい元足（tt5 > LAST_TFTIME[0]）なら f_v2ApplyTf(0) で処理、チャート足 n の確定時に STUDY / TRACE を出力（slot = n の time_close）

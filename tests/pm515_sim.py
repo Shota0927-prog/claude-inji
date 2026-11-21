@@ -1,4 +1,5 @@
 """B 5分・15分専用版（PM-A/B/C-515 → PM-DEC-515）の Python モデル確認。Pine 上の実行確認ではない。
+※ BUS 形式は時刻修正前（format 2）を写したもの。時刻修正版（format 3）は tests/pm_timefix_sim.py。B 判定の規則は同じ。
   - PM-DEC-515 の f_v2BStep（内部 index 0 = 5M / 1 = 15M、5M の逆方向警戒のみ）を式のまま写し、
     1 分足あり版の B（tests/pmv2_sim.py の ModeB）と比較する
   - BUS : format 2 のみ受理、旧 format 1 / Source・TF 取り違え / 古い時刻 / na / 未接続 を無効
