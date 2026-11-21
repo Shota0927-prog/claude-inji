@@ -64,9 +64,13 @@ ENG_A = ENG_A.replace(old_ret, old_ret[:-1] + ', xTc, xCp, xEaP, xAtr, xOn]')
 old_b = '    [lmB, smB, preLmB, preSmB, x13L,'
 assert ENG_B.count(old_b) == 1
 ENG_B = ENG_B.replace(old_b, '    [lmB, smB, preLmB, preSmB, close, x13L,')
+# 時刻修正版 : 元足の確定時刻（time_close）を UDT の末尾へ追加（15M の確定境界ゲートと照合用。判定には使わない）
+_rb = [l for l in ENG_B.split('\n') if l.startswith('    [lmB, smB, preLmB, preSmB, close, x13L,')]
+assert len(_rb) == 1
+ENG_B = ENG_B.replace(_rb[0], _rb[0][:-1] + ', time_close]')
 old_c = '    [lmC, smC, imC, preLmC, preSmC, satPreSigned, x19L, x19S, x20L, x20S]'
 assert ENG_C.count(old_c) == 1
-ENG_C = ENG_C.replace(old_c, '    [lmC, smC, imC, preLmC, preSmC, satPreSigned, close, high, low, x19L, x19S, x20L, x20S]')
+ENG_C = ENG_C.replace(old_c, '    [lmC, smC, imC, preLmC, preSmC, satPreSigned, close, high, low, x19L, x19S, x20L, x20S, time_close]')
 
 
 def holds(nums):
@@ -116,7 +120,7 @@ COMMON_HEAD = '''// This Pine Script® code is subject to the terms of the Mozil
 
 BUS_DOC = '''// 【BUS 仕様（Decision への受け渡し）】plot の値 1 本 = 1 TF ぶんの集約結果（非負整数 < 2^49）
 //   bus = 1(format) + 4 × SourceID + 16 × TFID + 64 × slot + 2^28 × payload
-//     bit 0-1   : format = 2（5分・15分専用版。1 分足あり版の BUS は format 1 なので Decision 5M15M は受け付けない）
+//     bit 0-1   : format = 3（時刻修正版。旧 5分・15分版 = 2、1 分足あり版 = 1。Decision 5M15M は 3 だけ受け付ける）
 //     bit 2-3   : SourceID（1 = A / 2 = B / 3 = C）
 //     bit 4-5   : TFID（1 = 5M / 2 = 15M。この版は 1M を出さない）
 //     bit 6-27  : slot = (集約結果を確定した 5 分足の確定時刻 time_close − 2020-01-01 00:00 UTC) / 5 分
@@ -158,68 +162,78 @@ def infra(cfg):
     xs = cfg['xs']
     eng = cfg['eng']
     o = []
+    pre5 = {'A': '', 'B': 'g5plm, g5psm, ', 'C': 'g5im, g5plm, g5psm, g5sp, '}[S]
+    gxs = ', '.join('g5_' + v for v in xs)
     o.append(f"""// =====================================================================================
-// §5. 5M / 15M 取得（元版の非リペイント方式のまま。1M の取得は持たない）
+// §5. 取得（時刻修正版）: 5M = チャート自身で Engine を評価 / 15M = 現在の 15M 結果（lookahead_off・[1] なし）
 // =====================================================================================
-// request.security(..., <式>[1], lookahead = barmerge.lookahead_on)（直近の確定足。[1] は必須）
-// V2 用の追加出力（この TF 足の close 等・否定ライン）は 1 個の UDT にまとめて返す。
-// request 呼び出し 2 本、タプル要素 {cfg['tuple']} × 2 = {cfg['tuple'] * 2} 個。
+// 5M : 5 分足チャート自身のコンテキストで担当 Engine をグローバルで毎バー 1 回評価する（request なし・[1] シフトなし）。
+//      マスク・PRE・解除・SAT 強度・否定ライン・EMA / TL 値・OHLC・time / time_close はすべて同じ現在の 5M 足の値。
+//      状態への適用は §6 で、チャート足の確定時（barstate.isconfirmed）に 1 回だけ行う。
+// 15M : request.security(tfStr3, 現在の 15M Engine 結果, lookahead = barmerge.lookahead_off)。[1] なし。
+//      形成中の値が動くことはあるが、§6 の確定境界ゲート（15M 区間の最後の 5M 足が確定し、元足の time / time_close が
+//      一致した時だけ）以外では一切使わない。lookahead_on のまま [1] を外す方式は未来の値が漏れるので使わない。
+// V2 用の追加出力は 1 個の UDT。request 呼び出し 1 本（15M）、タプル要素 {cfg['tuple']} 個。
 type SRC{S}X
 """ + ''.join(f'    float f{i} = na\n' for i in range(nx)) + f"""
 f_srcArr(SRC{S}X o) =>
     SRC{S}X q = na(o) ? SRC{S}X.new() : o
-    array.from(""" + ', '.join(f'q.f{i}' for i in range(nx)) + """)
+    array.from(""" + ', '.join(f'q.f{i}' for i in range(nx)) + f""")
+
+// ---- 5M : チャート自身の Engine 結果（毎バー 1 回。診断・通常出力はこの 1 回の結果を共用）----
+[g5lm, g5sm, {pre5}{gxs}] = {eng}()
+x5Obj = SRC{S}X.new({gxs})
 """)
     if S == 'A':
-        o.append(f"""f_htfPacket() =>
-    [lmRaw, smRaw, {', '.join(xs)}] = {eng}()
-    float lm = nz(lmRaw)
-    float sm = nz(smRaw)
-    int   tt = time
-    [lm[1], sm[1], tt[1], SRC{S}X.new({', '.join(v + '[1]' for v in xs)})]   // ★[1] は必須（外すと未来参照）
-
-[lm5, sm5, tt5, ox5]     = request.security(syminfo.tickerid, tfStr2, f_htfPacket(), lookahead = barmerge.lookahead_on)
-[lm15, sm15, tt15, ox15] = request.security(syminfo.tickerid, tfStr3, f_htfPacket(), lookahead = barmerge.lookahead_on)
+        o.append(f"""float lm5   = nz(g5lm)
+float sm5   = nz(g5sm)
 float plm5  = 0.0
 float psm5  = 0.0
+float im5   = 0.0
+float sp5   = 0.0
+
+// ---- 15M : 現在の 15M Engine 結果（[1] なし・lookahead_off）----
+f_htfPacket() =>
+    [lmRaw, smRaw, {', '.join(xs)}] = {eng}()
+    [nz(lmRaw), nz(smRaw), time, SRC{S}X.new({', '.join(xs)})]
+
+[lm15, sm15, tt15, ox15] = request.security(syminfo.tickerid, tfStr3, f_htfPacket(), lookahead = barmerge.lookahead_off)
 float plm15 = 0.0
 float psm15 = 0.0
-float im5   = 0.0
 float im15  = 0.0
-float sp5   = 0.0
 float sp15  = 0.0
 """)
     elif S == 'B':
-        o.append(f"""f_htfPacket() =>
-    [lmRaw, smRaw, plmRaw, psmRaw, {', '.join(xs)}] = {eng}()
-    float lm  = nz(lmRaw)
-    float sm  = nz(smRaw)
-    float plm = nz(plmRaw)
-    float psm = nz(psmRaw)
-    int   tt  = time
-    [lm[1], sm[1], plm[1], psm[1], tt[1], SRC{S}X.new({', '.join(v + '[1]' for v in xs)})]   // ★[1] は必須
-
-[lm5, sm5, plm5, psm5, tt5, ox5]         = request.security(syminfo.tickerid, tfStr2, f_htfPacket(), lookahead = barmerge.lookahead_on)
-[lm15, sm15, plm15, psm15, tt15, ox15]   = request.security(syminfo.tickerid, tfStr3, f_htfPacket(), lookahead = barmerge.lookahead_on)
+        o.append(f"""float lm5   = nz(g5lm)
+float sm5   = nz(g5sm)
+float plm5  = nz(g5plm)
+float psm5  = nz(g5psm)
 float im5   = 0.0
-float im15  = 0.0
 float sp5   = 0.0
+
+// ---- 15M : 現在の 15M Engine 結果（[1] なし・lookahead_off）----
+f_htfPacket() =>
+    [lmRaw, smRaw, plmRaw, psmRaw, {', '.join(xs)}] = {eng}()
+    [nz(lmRaw), nz(smRaw), nz(plmRaw), nz(psmRaw), time, SRC{S}X.new({', '.join(xs)})]
+
+[lm15, sm15, plm15, psm15, tt15, ox15] = request.security(syminfo.tickerid, tfStr3, f_htfPacket(), lookahead = barmerge.lookahead_off)
+float im15  = 0.0
 float sp15  = 0.0
 """)
     else:
-        o.append(f"""f_htfPacket() =>
-    [lmRaw, smRaw, imRaw, plmRaw, psmRaw, spRaw, {', '.join(xs)}] = {eng}()
-    float lm  = nz(lmRaw)
-    float sm  = nz(smRaw)
-    float im  = nz(imRaw)
-    float plm = nz(plmRaw)
-    float psm = nz(psmRaw)
-    float sp  = nz(spRaw)
-    int   tt  = time
-    [lm[1], sm[1], im[1], plm[1], psm[1], sp[1], tt[1], SRC{S}X.new({', '.join(v + '[1]' for v in xs)})]   // ★[1] は必須
+        o.append(f"""float lm5   = nz(g5lm)
+float sm5   = nz(g5sm)
+float im5   = nz(g5im)
+float plm5  = nz(g5plm)
+float psm5  = nz(g5psm)
+float sp5   = nz(g5sp)
 
-[lm5, sm5, im5, plm5, psm5, sp5, tt5, ox5]               = request.security(syminfo.tickerid, tfStr2, f_htfPacket(), lookahead = barmerge.lookahead_on)
-[lm15, sm15, im15, plm15, psm15, sp15, tt15, ox15]       = request.security(syminfo.tickerid, tfStr3, f_htfPacket(), lookahead = barmerge.lookahead_on)
+// ---- 15M : 現在の 15M Engine 結果（[1] なし・lookahead_off）----
+f_htfPacket() =>
+    [lmRaw, smRaw, imRaw, plmRaw, psmRaw, spRaw, {', '.join(xs)}] = {eng}()
+    [nz(lmRaw), nz(smRaw), nz(imRaw), nz(plmRaw), nz(psmRaw), nz(spRaw), time, SRC{S}X.new({', '.join(xs)})]
+
+[lm15, sm15, im15, plm15, psm15, sp15, tt15, ox15] = request.security(syminfo.tickerid, tfStr3, f_htfPacket(), lookahead = barmerge.lookahead_off)
 """)
     o.append(f"""
 // =====================================================================================
@@ -304,35 +318,44 @@ f_v2ApplyTf(int ti, float lm, float sm, float plm, float psm, float im, float sp
             array.set(V2_SINCE, j, raw ? 0 : since < 0 ? -1 : since + 1)
     N_LOGIC
 
-// 5M / 15M : その TF の確定足が新しくなった瞬間だけ更新（1 分足あり版と同じタイミング）
-int t5  = nz(tt5)
-int t15 = nz(tt15)
-if t5 > array.get(LAST_TFTIME, 0)
+// ---- 確定 5 分足での適用（時刻修正版）。同じ確定足の中で ① 5M → ② 15M（境界のときだけ）の順に 1 回ずつ ----
+bool isChart5M = timeframe.isminutes and timeframe.multiplier == 5
+// ① 5M : 今確定したチャート足そのもの（元足 ID = チャートの time）。確定前は状態へ反映しない
+int  t5  = time
+x5 = f_srcArr(x5Obj)
+if isChart5M and barstate.isconfirmed and t5 > array.get(LAST_TFTIME, 0)
     array.set(LAST_TFTIME, 0, t5)
-    f_v2ApplyTf(0, nz(lm5), nz(sm5), nz(plm5), nz(psm5), nz(im5), nz(sp5), f_srcArr(ox5))
-if t15 > array.get(LAST_TFTIME, 1)
+    f_v2ApplyTf(0, lm5, sm5, plm5, psm5, im5, sp5, x5)
+// ② 15M : 15M 区間の最後の 5M 足が確定した時だけ、今閉じた 15M 足の結果を受理する（AND 条件）
+//    ・チャート足の time_close = その 15M 区間の time_close(15)（例 10:00〜10:15 は 10:10〜10:15 の 5M 足の確定時だけ）
+//    ・取得した元足の time = その区間の time(15)、元足の time_close = チャート足の time_close
+//    ・元足 ID が最後に受理した 15M 足より新しい / close・時刻が na でない
+//    境界以外の 5M 足では、最後に受理した確定 15M 状態をそのまま維持（形成中の取得値へ差し替えない）。
+//    保持本数・経過本数は受理した確定 15M 足 1 本につき 1 回だけ進む。request 式の中で barstate.isconfirmed は使わない。
+int  t15      = nz(tt15)
+int  q15Open  = time(tfStr3)
+int  q15Close = time_close(tfStr3)
+bool atB15    = not na(q15Close) and time_close == q15Close
+x15 = f_srcArr(ox15)
+bool acc15 = isChart5M and barstate.isconfirmed and atB15 and not na(tt15) and t15 == q15Open and array.get(x15, {cfg['tcidx']}) == time_close and t15 > array.get(LAST_TFTIME, 1) and not na(array.get(x15, 0))
+if acc15
     array.set(LAST_TFTIME, 1, t15)
-    f_v2ApplyTf(1, nz(lm15), nz(sm15), nz(plm15), nz(psm15), nz(im15), nz(sp15), f_srcArr(ox15))
+    f_v2ApplyTf(1, nz(lm15), nz(sm15), nz(plm15), nz(psm15), nz(im15), nz(sp15), x15)
 """)
     o.append(f"""
 // =====================================================================================
 // §7. データ準備 / 更新整合（5M / 15M のみ）と BUS 出力
 // =====================================================================================
-//   5M / 15M : 受信した確定足の開始時刻（tt[1]）が「この足の TF 区間の直前に足が存在した区間」と一致すること
-//              （休場・週末は直前に足が存在した区間と比べるので不整合にしない）
+//   5M  : 今確定したチャート足そのものを処理済みであること（元足 = チャート足）
+//   15M : 15M 区間の最後の 5M 足（境界）では「今閉じた 15M 足」、それ以外の足では「直前に足が存在した 15M 区間」の
+//         確定足が最後に受理されていること。休場・週末は実際に足が存在した区間で比べる（一律 +15 分にしない）。
+//         期待する境界でパケットが無い / 一致しない場合は、前の 15M を新しい足の代わりにせず不整合（準備本数は数え直し）
 //   値 : 処理した TF 足の確定終値が na なら不整合 / 準備 : 不整合なしで各 TF の処理本数 >= その TF の最大保持本数
-//   1M は取得しないので、1M の準備は待たない。
-bool isChart5M = timeframe.isminutes and timeframe.multiplier == 5
-var int bk5Cur   = na
-var int bk5Prev  = na
 var int bk15Cur  = na
 var int bk15Prev = na
-int bk5  = time - time % 300000
-int bk15 = time - time % 900000
-bk5Prev  := na(bk5Cur)  or bk5  != bk5Cur  ? bk5Cur  : bk5Prev
-bk5Cur   := bk5
-bk15Prev := na(bk15Cur) or bk15 != bk15Cur ? bk15Cur : bk15Prev
-bk15Cur  := bk15
+bk15Prev := na(bk15Cur) or q15Open != bk15Cur ? bk15Cur : bk15Prev
+bk15Cur  := q15Open
+int exp15 = atB15 ? bk15Cur : bk15Prev
 
 f_maxHold(int ti) =>
     int mx = 1
@@ -340,10 +363,10 @@ f_maxHold(int ti) =>
         mx := math.max(mx, array.get(HOLD_ALL, f_idx(li, ti)))
     mx
 
-bool t5Miss  = t5 == 0 or na(bk5Prev)
-bool t15Miss = t15 == 0 or na(bk15Prev)
-bool t5Bad   = not t5Miss  and t5  != bk5Prev
-bool t15Bad  = not t15Miss and t15 != bk15Prev
+bool t5Miss  = array.get(LAST_TFTIME, 0) == 0
+bool t15Miss = array.get(LAST_TFTIME, 1) == 0 or na(exp15)
+bool t5Bad   = isChart5M and barstate.isconfirmed and array.get(LAST_TFTIME, 0) != t5
+bool t15Bad  = not t15Miss and array.get(LAST_TFTIME, 1) != exp15
 bool valBad  = array.get(V2_BADX, 0) or array.get(V2_BADX, 1)
 var int need5  = f_maxHold(0)
 var int need15 = f_maxHold(1)
@@ -386,7 +409,7 @@ f_payload(int ti) =>
 
 int   BUS_BASE   = 1577836800000          // 2020-01-01 00:00 UTC
 float BUS_SLOTS  = 4194304.0              // 2^22
-int   BUS_FORMAT = 2                      // 5分・15分専用版（1 分足あり版は 1）
+int   BUS_FORMAT = 3                      // 時刻修正版（旧 5分・15分版 = 2 / 1 分足あり版 = 1）
 f_bus(int tfId, float payload, int tclose) =>
     float slot = (tclose - BUS_BASE) / 300000.0
     bool  ok   = slot >= 0 and slot < BUS_SLOTS and slot == math.floor(slot) and payload >= 0 and payload < 2097152
@@ -395,7 +418,7 @@ f_bus(int tfId, float payload, int tclose) =>
 // ---- 単体診断 BUS（STUDY DATA BUS / STUDY META BUS）-------------------------------------
 // 選んだ 1 ロジック × 1 TF の、既に計算済みの値を 5 分足の確定時点で整数へ詰める（検知関数・request は呼び直さない）。
 // STUDY META BUS（非負整数 < 2^37）
-//   bit 0-1 format = 1 / bit 2-3 SourceID（1 A / 2 B / 3 C）/ bit 4-5 TFID（1 = 5M / 2 = 15M）/
+//   bit 0-1 format = 2（時刻修正版。旧 = 1）/ bit 2-3 SourceID（1 A / 2 B / 3 C）/ bit 4-5 TFID（1 = 5M / 2 = 15M）/
 //   bit 6-10 ロジック番号（1〜25。元版の Logic 番号）/ bit 11-13 状態（0 出力中 / 1 データ準備中 / 4 更新不整合 / 6 対象外）/
 //   bit 14 採用（1 = B の系統点へ採用中）/ bit 15-36 slot（= 通常 BUS と同じ。2020-01-01 00:05〜2059-11-23 頃の 5 分足）
 //   slot が範囲外の足、5 分足以外のチャートでは na。状態が 0 以外でも META は出す（DATA は na）。
@@ -440,7 +463,7 @@ f_study(int status, int tclose) =>
          4096.0 * f_cap6(array.get(V2_SINCE, j)) + 262144.0 * f_cap6(array.get(V2_SINCE, j + 1)) +
          16777216.0 * f_cap6(ageL) + 1073741824.0 * f_cap6(ageS) + (nb ? 68719476736.0 : 0) +
          137438953472.0 * (slot % 16384)
-    float meta = 1 + 4 * {sid} + 16 * (STUDY_TI + 1) + 64 * ({cfg['goff']} + STUDY_LI + 1) + 2048 * st + 16384 * (ad ? 1 : 0) + 32768.0 * slot
+    float meta = 2 + 4 * {sid} + 16 * (STUDY_TI + 1) + 64 * ({cfg['goff']} + STUDY_LI + 1) + 2048 * st + 16384 * (ad ? 1 : 0) + 32768.0 * slot
     [sOk and st == 0 ? data : na, sOk ? meta : na]
 
 var float studyData = na
@@ -504,7 +527,8 @@ def build(cfg):
 // =====================================================================================
 // 1 分足あり版 Source（PM-SRC-{cfg['id']}-V2）から 1 分足の取得・状態・準備確認・保持設定・BUS を取り除き、
 // 5 分足と 15 分足だけで、担当ロジックの検知・抑止前 PRE・V2 有効根拠（否定ライン / 価格否定 / 期限 / Fib 解除）・
-// 系統点・データ準備確認を行う版。5M / 15M の処理内容と取得方式（[1] + lookahead_on）は 1 分足あり版と同じ。
+// 系統点・データ準備確認を行う版（時刻修正版）。5M はチャート自身の Engine 結果をその足の確定時に適用し、
+// 15M は lookahead_off の現在値を 15M 区間の最後の 5M 足の確定時だけ受理する。根拠の計算内容は 1 分足あり版と同じ。
 // 検知モジュール（入力・PRM 束・ロジック関数・Engine 関数）は V2 版からそのまま移している（条件の変更なし）。
 // 取り除いたもの : 他 Source のロジック / 1H・4H・1D の取得 / ロジック名・Weight / 元版の ST_STATE・スコア・PRE スコア・
 //                  PHASE・VALID TP / 旧テーブル・旧アラート・LOT ADJUST / モード A / 判定（Decision が担当）
@@ -555,11 +579,11 @@ conflictMode = conflictStr == "LONG優先" ? CONF_LONG : conflictStr == "SHORT�
 
 
 XA = ['xC', 'xH', 'xL', 'xEa', 'xEb', 'xEc', 'xEd', 'x01L', 'x01S', 'x02L', 'x02S', 'x03L', 'x03S', 'x04L', 'x04S', 'xTc', 'xCp', 'xEaP', 'xAtr', 'xOn']
-XB = ['xC'] + [f'x{n}{d}' for n in range(13, 19) for d in 'LS'] + [f's{n}{d}' for n in range(13, 19) for d in 'LS']
-XC = ['xC', 'xH', 'xL', 'x19L', 'x19S', 'x20L', 'x20S']
+XB = ['xC'] + [f'x{n}{d}' for n in range(13, 19) for d in 'LS'] + [f's{n}{d}' for n in range(13, 19) for d in 'LS'] + ['xTc']
+XC = ['xC', 'xH', 'xL', 'x19L', 'x19S', 'x20L', 'x20S', 'xTc']
 
 CFG = [
-    dict(id='A', sid=1, n=12, naexpr='ti == 1 and li >= 4', trace=True, labels=['Logic01 FVG Abs', 'Logic02 FVG Reb', 'Logic03 Accum Reb', 'Logic04 Accum Brk', 'Logic05 EMA200 Reb', 'Logic06 EMA1000 Reb', 'Logic07 EMA2000 Reb', 'Logic08 EMA3000 Reb', 'Logic09 EMA200 Brk', 'Logic10 EMA1000 Brk', 'Logic11 EMA2000 Brk', 'Logic12 EMA3000 Brk'], goff=0, studyna='STUDY_TI == 1 and STUDY_LI >= 4', nums=list(range(1, 13)), ema=tuple(range(5, 13)), nx=20, xs=XA, tuple=4, eng='f_signalMasksA',
+    dict(id='A', sid=1, n=12, naexpr='ti == 1 and li >= 4', trace=True, labels=['Logic01 FVG Abs', 'Logic02 FVG Reb', 'Logic03 Accum Reb', 'Logic04 Accum Brk', 'Logic05 EMA200 Reb', 'Logic06 EMA1000 Reb', 'Logic07 EMA2000 Reb', 'Logic08 EMA3000 Reb', 'Logic09 EMA200 Brk', 'Logic10 EMA1000 Brk', 'Logic11 EMA2000 Brk', 'Logic12 EMA3000 Brk'], goff=0, studyna='STUDY_TI == 1 and STUDY_LI >= 4', nums=list(range(1, 13)), ema=tuple(range(5, 13)), nx=20, xs=XA, tuple=4, tcidx=15, eng='f_signalMasksA',
          title='POINT MASTER SOURCE A 5M15M', short='PM-A-515', desc='Logic01〜12 : FVG / Accum / EMA',
          map='0〜3 = Logic01〜04 / 4〜11 = Logic05〜12',
          layout='価格帯（Logic01〜04）= bit 3-6 / MA（Logic05〜12）= bit 7-10',
@@ -568,7 +592,7 @@ CFG = [
          pre='0.0', ltfpre='0.0, 0.0, 0.0, 0.0',
          payload='f_fam1(ti, 0, 3, 3) + f_fam1(ti, 4, 11, 7)',
          modules='\n'.join([MOD_A, PACKF, ENG_A, BITONF])),
-    dict(id='B', sid=2, n=6, naexpr='false', labels=['Logic13 TL Reb', 'Logic14 TL Brk', 'Logic15 H&S', 'Logic16 DT/DB', 'Logic17 Wedge', 'Logic18 Triangle'], goff=12, studyna='false', nums=list(range(13, 19)), nx=25, xs=XB, tuple=6, eng='f_signalMasksB',
+    dict(id='B', sid=2, n=6, naexpr='false', labels=['Logic13 TL Reb', 'Logic14 TL Brk', 'Logic15 H&S', 'Logic16 DT/DB', 'Logic17 Wedge', 'Logic18 Triangle'], goff=12, studyna='false', nums=list(range(13, 19)), nx=26, xs=XB, tuple=6, tcidx=25, eng='f_signalMasksB',
          title='POINT MASTER SOURCE B 5M15M', short='PM-B-515', desc='Logic13〜18 : TL / 三尊 / DTB / ウェッジ / 三角形',
          map='0〜5 = Logic13〜18',
          layout='形状（Logic13〜18）= bit 3-6',
@@ -578,7 +602,7 @@ CFG = [
          ltfpre='nz(array.get(LTF_PLM, _i)), nz(array.get(LTF_PSM, _i)), 0.0, 0.0',
          payload='f_fam1(ti, 0, 5, 3)',
          modules='\n'.join([MOD_B, PACKF, ENG_B, BITONF])),
-    dict(id='C', sid=3, n=7, naexpr='false', labels=['Logic19 Horiz Reb', 'Logic20 Horiz Brk', 'Logic21 Fib382', 'Logic22 Fib500', 'Logic23 Fib618', 'Logic24 SAT', 'Logic25 Stoch'], goff=18, studyna='false', nums=list(range(19, 26)), sat=(24,), nx=7, xs=XC, tuple=8, eng='f_signalMasksC',
+    dict(id='C', sid=3, n=7, naexpr='false', labels=['Logic19 Horiz Reb', 'Logic20 Horiz Brk', 'Logic21 Fib382', 'Logic22 Fib500', 'Logic23 Fib618', 'Logic24 SAT', 'Logic25 Stoch'], goff=18, studyna='false', nums=list(range(19, 26)), sat=(24,), nx=8, xs=XC, tuple=8, tcidx=7, eng='f_signalMasksC',
          title='POINT MASTER SOURCE C 5M15M', short='PM-C-515', desc='Logic19〜25 : 水平線 / Fib / SAT / ストキャス',
          map='0〜1 = Logic19〜20 / 2〜4 = Logic21〜23 / 5 = Logic24 / 6 = Logic25',
          layout='価格帯（Logic19〜20）= bit 3-6 / Fib = bit 7-10 / SAT = bit 11-16（LONG 確認 11・統合 12-13、SHORT 確認 14・統合 15-16）/ ストキャス = bit 17-20',
@@ -600,7 +624,7 @@ f_satBits(int ti) =>
 
 TRACE_CAP = """
     // ★時刻照合（Source A のみ）: f_v2ApplyTf(0) に渡したのと同じ 5M 元足の UDT と開始時刻を保持（判定には使わない）
-    TR_X5   := f_srcArr(ox5)
+    TR_X5   := x5
     trOpen5 := t5"""
 
 TRACE_NB = """    trNb := array.get(V2_NEWBAR, 0)      // ★時刻照合 : この 5 分足で 5M 元足を処理したか（リセット前に退避）
@@ -611,10 +635,11 @@ TRACE_SEC = open(f'{ROOT}/tests/pm_515_trace_a.pine', encoding='utf-8').read()
 for cfg in CFG:
     txt = build(cfg)
     if cfg.get('trace'):
-        a5 = '    f_v2ApplyTf(0, nz(lm5), nz(sm5), nz(plm5), nz(psm5), nz(im5), nz(sp5), f_srcArr(ox5))'
+        a5 = '    f_v2ApplyTf(0, lm5, sm5, plm5, psm5, im5, sp5, x5)'
         assert txt.count(a5) == 1
         txt = txt.replace(a5, a5 + TRACE_CAP)
-        txt = txt.replace('int t5  = nz(tt5)', 'var TR_X5   = array.new_float(20, na)   // ★時刻照合（Source A のみ）\nvar int trOpen5 = na\nvar bool trNb  = false\nint t5  = nz(tt5)', 1)
+        assert txt.count('int  t5  = time') == 1
+        txt = txt.replace('int  t5  = time', 'var TR_X5   = array.new_float(20, na)   // ★時刻照合（Source A のみ）\nvar int trOpen5 = na\nvar bool trNb  = false\nint  t5  = time', 1)
         nb0 = '    array.fill(V2_NEWBAR, false)'
         assert txt.count(nb0) == 1
         txt = txt.replace(nb0, TRACE_NB)
