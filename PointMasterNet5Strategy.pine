@@ -63,6 +63,21 @@
 //   決済注文を出した判定足・SL で決済された足では新規エントリーしない。NET 決済注文中も SL は約定まで有効。
 //   決済理由は 通常 SL / 建値移動後の SL / NET 決済 を区別して記録する（1 取引 1 回）。固定 TP・部分利確・トレーリングなし。
 //
+// 【エントリー判断時点の記録（NET5-3。売買ロジックは変更しない）】
+//   エントリー注文を出す確定 5 分足の値を固定形式の文字列にし、strategy.entry の comment に付ける
+//   （注文 ID "L" / "S" と決済側の comment「SL」「建値SL」「NET決済」は変えない）。約定後・決済時には作り直さない。
+//   形式 N5E1（区切り "|"、キーと並び順は固定。数値は小数にも対応 = str.tostring(x, "#.####")）:
+//     N5E1|D=<L|S>|T=<判断足の time_close・Unix ミリ秒 UTC>|LS=<LONG SCORE>|SS=<SHORT SCORE>|NET=<NET>
+//     |MA=<MA 系 LONG>/<SHORT>|WV=<波形系 LONG>/<SHORT>|SA=<SAT LONG>/<SHORT>        … 系統上限を適用した判定値
+//     |BUY=<買いで有効なロジック>|SEL=<売りで有効なロジック>                        … 05.09.16.15.24 の順を "." で連結、なし = "-"
+//     |NEW=<この判断足で新規成立したロジック+方向>                                  … 例 16L / 05S.24L、なし = "-"
+//     |S05=<状態>,<経過分>|S09=…|S16=…|S15=…|S24=…                                 … ロジックはこの順で必ず 5 個
+//   状態 : L 買い有効 / S 売り有効 / N なし / OFF 使用 OFF / X データ不備。上限で頭打ちのロジックも有効なら BUY / SEL に入る。
+//   経過分 : ⑤⑨⑯⑮ = 最後の新規成立（同方向の再成立で更新）の確定時刻から判断足の確定時刻まで（その足の成立 = 0）。
+//            ㉔ = 現在の方向状態が始まった確定足から（最初の受信・データ不備からの復帰で開始が分からない場合は NA）。
+//            なし・OFF・X は NA。残り保持時間ではない。NEW の SAT は状態の開始・方向転換だけ（継続は入らない）。
+//   例 : N5E1|D=L|T=1767573000000|LS=5|SS=1|NET=4|MA=2/0|WV=2/1|SA=1/0|BUY=05.16.24|SEL=15|NEW=16L|S05=L,10|S09=N,NA|S16=L,0|S15=S,10|S24=L,20
+//
 // 【注意】
 //   ・価格否定の通知は Source 側の有効根拠（Source の保持本数。既定 5M 6 本 = 30 分）が生きている間だけ出る。
 //     保持時間を Source の保持本数 × 5 分より長くすると、その差の期間は価格否定を受け取れない。
@@ -199,6 +214,7 @@ nf_num(float v, float lim) =>
 nf_bit(float v, int b) =>
     math.floor(v / math.pow(2, b)) % 2 > 0.5
 
+
 // 1 Source の受信状態（ST_TXT の番号）。DATA は META の状態 0 の足だけ値がある
 nf_status(float d, float m, int sid, int lg, bool needAdopt, float slotNow) =>
     bool  mNum  = nf_num(m, 137438953472.0)
@@ -244,6 +260,8 @@ var EV_DIR = array.new_int(4, 0)              // ⑤ ⑨ ⑯ ⑮ の有効方向
 var EV_T   = array.new_int(4, 0)              // 最後に成立した 5 分足の time_close
 var int    satDir    = 0                      // ㉔ SAT の有効な方向状態
 var bool   satKnown  = false                  // SAT の基準があるか（最初の受信・データ不備の後は false）
+var int    nSatT     = na                     // 記録用 : 現在の SAT 方向状態が始まった 5 分足の time_close（不明 = na）
+var string nEntryRec = ""                     // 記録用 : 直近のエントリー注文に付けた判断時点の記録（N5E1）
 var IN_ST  = array.new_int(5, 1)              // 入力の状態（ST_TXT の番号）
 var NEW_L  = array.new_bool(5, false)         // この足で新しく成立した買いイベント（SAT は 無し→買い / 売り→買い）
 var NEW_S  = array.new_bool(5, false)
@@ -288,6 +306,40 @@ var int    nBlockSame  = 0                    // SL 決済の足で新規条件�
 var int    nBothEnt    = 0                    // LONG / SHORT の新規条件が同じ足で両方成立して見送った件数（設定次第）
 // 成績（方向 d = 0 LONG / 1 SHORT。各 9 項目 : 件数 / 勝ち / 負け / 総利益 / 総損失 / 純損益 / 通常 SL / 建値 SL / NET 決済）
 var TS = array.new_float(18, 0.0)
+
+// ---- 判断時点の記録（N5E1。売買には使わない）----
+var RIDS = array.from("05", "09", "16", "15", "24")
+nf_n(float v) =>
+    str.tostring(v, "#.####")
+
+// エントリー判断足の記録文字列。この足の確定時点の値だけで作る（約定後・決済時には作り直さない）
+nf_rec(int dir) =>
+    string rBuy = ""
+    string rSel = ""
+    string rNew = ""
+    string rSt  = ""
+    for i = 0 to 4
+        string lid = array.get(RIDS, i)
+        int    st  = array.get(IN_ST, i)
+        bool   off = st == 11
+        bool   bad = st != 0 and not off
+        int    d   = i < 4 ? array.get(EV_DIR, i) : satDir
+        int    t0  = i < 4 ? array.get(EV_T, i) : nSatT
+        string cd  = off ? "OFF" : bad ? "X" : d == 1 ? "L" : d == -1 ? "S" : "N"
+        string el  = off or bad or d == 0 or na(t0) ? "NA" : str.tostring(int((time_close - t0) / 60000))
+        if not off and not bad and d == 1
+            rBuy += (rBuy == "" ? "" : ".") + lid
+        if not off and not bad and d == -1
+            rSel += (rSel == "" ? "" : ".") + lid
+        if array.get(USE, i) and array.get(NEW_L, i)
+            rNew += (rNew == "" ? "" : ".") + lid + "L"
+        if array.get(USE, i) and array.get(NEW_S, i)
+            rNew += (rNew == "" ? "" : ".") + lid + "S"
+        rSt += "|S" + lid + "=" + cd + "," + el
+    string rec = "N5E1|D=" + (dir == 1 ? "L" : "S") + "|T=" + str.tostring(time_close, "#") + "|LS=" + nf_n(nL) + "|SS=" + nf_n(nS) + "|NET=" + nf_n(nNet) +
+         "|MA=" + nf_n(nMaL) + "/" + nf_n(nMaS) + "|WV=" + nf_n(nWvL) + "/" + nf_n(nWvS) + "|SA=" + nf_n(nSaL) + "/" + nf_n(nSaS) +
+         "|BUY=" + (rBuy == "" ? "-" : rBuy) + "|SEL=" + (rSel == "" ? "-" : rSel) + "|NEW=" + (rNew == "" ? "-" : rNew) + rSt
+    rec
 
 // ---- この足の描画用（毎足リセット）----
 int    dSigDir     = 0
@@ -360,11 +412,15 @@ if nRun
             else if sNow == -1
                 array.set(NEW_S, 4, true)
             array.set(GONE, 4, satDir == 0 ? 0 : sNow == 0 ? 4 : 5)
+            nSatT := sNow != 0 ? time_close : na      // 記録用 : 新しい方向状態の開始（解除なら不明ではなく状態なし）
+        else if not satKnown
+            nSatT := na                               // 記録用 : 最初の受信・データ不備からの復帰は開始時刻が分からない
         satDir   := sNow
         satKnown := true
     else
         satDir   := 0
         satKnown := false
+        nSatT    := na
 
     // ---- 点数（系統内の合計に上限を掛けてから合算。使用 OFF は 0）----
     int e0 = array.get(EV_DIR, 0)
@@ -524,11 +580,12 @@ if nRun
         nBlockSame += 1
     if posDir == 0 and not exitNow and not slClosedNow and okOne
         nSlTicks := math.max(1, math.round(slUsd / syminfo.mintick))
+        nEntryRec := nf_rec(okL ? 1 : -1)
         if okL
-            strategy.entry("L", strategy.long, comment = "LONG")
+            strategy.entry("L", strategy.long, comment = nEntryRec)
             strategy.exit("L-SL", from_entry = "L", loss = nSlTicks, comment = "SL")
         else
-            strategy.entry("S", strategy.short, comment = "SHORT")
+            strategy.entry("S", strategy.short, comment = nEntryRec)
             strategy.exit("S-SL", from_entry = "S", loss = nSlTicks, comment = "SL")
         nEntryPend := true
         nEntrySigN += 1

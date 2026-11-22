@@ -8,6 +8,7 @@ strategy.exit の loss（tick）を足したもの。TradingView のコンパイ
 §1〜7 は NET5-1 の仕様（建値 OFF で実行）。§8 は tests/net5_v1_reference.pine（NET5-1 の凍結コピー）と
 現行版（建値 OFF・他は初期値）をランダム入力で走らせ、全足の状態・全注文・成績が一致することを確かめる。
 §9〜12 は NET5-2 の入力・建値移動・対称性。
+§13 は NET5-3 のエントリー判断時点の記録（N5E1）。tests/net5_v2_reference.pine（NET5-2 の凍結コピー）と売買の一致も照合する。
 
 実行 : python3 tests/net5_sim.py
 """
@@ -62,19 +63,30 @@ def data(slot, rawL=False, rawS=False, curL=False, curS=False, negL=False, negS=
 class Broker(ap.Broker):
     def __init__(self):
         super().__init__(pointvalue=1.0)
+        self.ent_cmt, self.close_cmt = {}, {}      # comment（注文ログには入れない = 旧版との照合はそのまま）
 
     def entry(self, id, direction, qty=None, comment=None):
         super().entry(id, direction, 1.0 if qty is None else qty)
+        self.ent_cmt[id] = (self.bar, comment)
 
     def exit(self, id, from_entry=None, stop=None, limit=None, loss=None, comment=None):
-        self.exits[id] = dict(from_id=from_entry, stop=stop, limit=limit, loss=loss)
+        self.exits[id] = dict(from_id=from_entry, stop=stop, limit=limit, loss=loss, comment=comment)
         self.log.append(("order_exit", self.bar, id, from_entry, stop, limit, loss))
 
     def close(self, id, comment=None):
         super().close(id)
+        self.close_cmt[id] = comment
+
+    def _close_trade(self, tr, price, exit_id):
+        xc = self.close_cmt.get(tr["id"]) if exit_id == "close" else self.exits.get(exit_id, {}).get("comment")
+        super()._close_trade(tr, price, exit_id)
+        self.closed[-1].update(entry_comment=tr.get("comment"), entry_order_bar=tr.get("order_bar"), exit_comment=xc)
 
     def _market(self, price):
         super()._market(price)
+        for tr in self.open_trades:              # Entry 行の comment = 注文を出した時点の文字列（約定時に作り直さない）
+            if "comment" not in tr:
+                tr["order_bar"], tr["comment"] = self.ent_cmt[tr["id"]]
         # loss（tick）は約定価格から計算する（TradingView の strategy.exit loss と同じ考え方）
         for tr in self.open_trades:
             for o in self.exits.values():
@@ -98,6 +110,11 @@ SRC_V1 = open(os.path.join(ROOT, "tests", "net5_v1_reference.pine"), encoding="u
 CODE_V1 = compile(ap.Translator().translate(ap.logical_lines(SRC_V1[SRC_V1.index("\n", SRC_V1.index(BEGIN)) + 1:SRC_V1.index(END)])),
                   "<PM-NET5 v1 logic>", "exec")
 INPUTS_V1 = ap.inputs(SRC_V1)
+# NET5-2（記録追加前）の凍結コピー。「記録の追加で売買が変わらない」の照合に使う
+SRC_V2 = open(os.path.join(ROOT, "tests", "net5_v2_reference.pine"), encoding="utf-8").read()
+CODE_V2 = compile(ap.Translator().translate(ap.logical_lines(SRC_V2[SRC_V2.index("\n", SRC_V2.index(BEGIN)) + 1:SRC_V2.index(END)])),
+                  "<PM-NET5 v2 logic>", "exec")
+INPUTS_V2 = ap.inputs(SRC_V2)
 BASE = {}          # 各 Run の既定上書き（§1〜7 は NET5-1 の仕様確認なので beUse=False）
 
 
@@ -148,7 +165,8 @@ class Run:
                                                  "GONE", "nHoldSt", "nHoldWhy", "nLastChg", "nPosDir", "nAllOk", "nBoth",
                                                  "nSlPrice", "nFillPrice", "dSigDir", "dExitSig", "dFillDir", "dCloseDir",
                                                  "dCloseTxt", "nBlockSame", "TS", "nEntryPend", "nExitPend")}
-        for k in ("nBeDone", "nBeTrigLine", "nBeClose", "dBeDir", "dBeStop", "nEntNg", "nExNg", "nMaxScore", "nBothEnt"):
+        for k in ("nBeDone", "nBeTrigLine", "nBeClose", "dBeDir", "dBeStop", "nEntNg", "nExNg", "nMaxScore", "nBothEnt",
+                  "nEntryRec", "nSatT", "NEW_L", "NEW_S", "EV_T"):
             snap[k] = copy.deepcopy(e.get(k))
         snap["i"] = self.i
         snap["exits"] = {k: (v["stop"], v.get("loss")) for k, v in self.b.exits.items()}     # この足の実行後に有効な保護注文
@@ -707,5 +725,168 @@ for seed in range(20):
         continue
     ok_r &= symmetric(ev_, sat_, pr, len(pr))[0]
 check("LONG / SHORT 対称（建値 ON の初期値・ランダム入力）", ok_r)
+
+# ### NET5-3 ###
+# ===========================================================================
+# 13. エントリー判断時点の記録（N5E1）
+# ===========================================================================
+REC_KEYS = ["D", "T", "LS", "SS", "NET", "MA", "WV", "SA", "BUY", "SEL", "NEW", "S05", "S09", "S16", "S15", "S24"]
+LIDS = ["05", "09", "16", "15", "24"]
+
+
+def num(x):
+    v = float(x)
+    return int(v) if v.is_integer() else v
+
+
+def fmt(v):
+    return str(int(v)) if float(v).is_integer() else ("%.4f" % v).rstrip("0").rstrip(".")
+
+
+def parse_rec(c):
+    """N5E1 の文字列 → dict（形式違反は例外）"""
+    parts = c.split("|")
+    assert parts[0] == "N5E1", "version"
+    kv = [p.split("=", 1) for p in parts[1:]]
+    assert [k for k, _ in kv] == REC_KEYS, "keys / order"
+    g = dict(kv)
+    assert g["D"] in ("L", "S")
+    out = dict(D=g["D"], T=int(g["T"]), LS=num(g["LS"]), SS=num(g["SS"]), NET=num(g["NET"]))
+    for k in ("MA", "WV", "SA"):
+        a, b = g[k].split("/")
+        out[k] = (num(a), num(b))
+    for k in ("BUY", "SEL"):
+        out[k] = [] if g[k] == "-" else g[k].split(".")
+        assert all(x in LIDS for x in out[k]) and out[k] == sorted(out[k], key=LIDS.index)
+    out["NEW"] = [] if g["NEW"] == "-" else [(x[:2], x[2]) for x in g["NEW"].split(".")]
+    assert all(l in LIDS and d in "LS" and len(l) == 2 for l, d in out["NEW"])
+    for l in LIDS:
+        st, el = g["S" + l].split(",")
+        assert st in ("L", "S", "N", "OFF", "X")
+        assert el == "NA" or (el.isdigit() and st in ("L", "S")), "elapsed"
+        out["S" + l] = (st, None if el == "NA" else int(el))
+    return out
+
+
+def build_rec(p):
+    s_ = ["N5E1", "D=" + p["D"], "T=" + str(p["T"])] + [k + "=" + fmt(p[k]) for k in ("LS", "SS", "NET")]
+    s_ += [k + "=" + fmt(p[k][0]) + "/" + fmt(p[k][1]) for k in ("MA", "WV", "SA")]
+    s_ += [k + "=" + (".".join(p[k]) or "-") for k in ("BUY", "SEL")]
+    s_ += ["NEW=" + (".".join(l + d for l, d in p["NEW"]) or "-")]
+    s_ += ["S" + l + "=" + p["S" + l][0] + "," + ("NA" if p["S" + l][1] is None else str(p["S" + l][1])) for l in LIDS]
+    return "|".join(s_)
+
+
+def entries(r):
+    """[(判断足 row, 約定・決済の取引 dict or None)]"""
+    out = []
+    for e in r.orders("order_entry"):
+        row = r.rows[e[1]]
+        tr = next((dict(c, comment=c["entry_comment"], order_bar=c["entry_order_bar"]) for c in r.b.closed if c["entry_order_bar"] == e[1]), None)
+        if tr is None:
+            tr = next((t for t in r.b.open_trades if t.get("order_bar") == e[1]), None)
+        out.append((row, e, tr))
+    return out
+
+
+# 例（買い ⑤⑯㉔・売り ⑮・LONG 5 / SHORT 1 / NET 4・新規成立は ⑯・⑤ は 10 分）
+EVX, SATX = {3: {"05": "L", "15": "S"}, 5: {"16": "L"}}, {0: 0, 1: 1}
+r = play(Feed(EVX, sat=SATX), 8)
+(row, e, tr), = entries(r)
+WANT_L = "N5E1|D=L|T=1767573000000|LS=5|SS=1|NET=4|MA=2/0|WV=2/1|SA=1/0|BUY=05.16.24|SEL=15|NEW=16L|S05=L,10|S09=N,NA|S16=L,0|S15=S,10|S24=L,20"
+EX_LONG = row["nEntryRec"]
+check("例の LONG : 判断足 5 の記録が期待どおり（" + EX_LONG + "）", e[1] == 5 and EX_LONG == WANT_L)
+check("Entry 行の comment = 判断足の記録（約定足 6・その後の足で作り直さない）",
+      tr["comment"] == WANT_L and tr["order_bar"] == 5 and all(x["nEntryRec"] == WANT_L for x in r.rows[5:]))
+p = parse_rec(EX_LONG)
+check("解析して復元 : 買い ⑤⑯㉔ / 売り ⑮ / 5・1・4 / 新規 ⑯L / ⑤ 10 分・⑯ 0 分・⑨ なし NA",
+      p["BUY"] == ["05", "16", "24"] and p["SEL"] == ["15"] and (p["LS"], p["SS"], p["NET"]) == (5, 1, 4) and p["NEW"] == [("16", "L")]
+      and p["S05"] == ("L", 10) and p["S16"] == ("L", 0) and p["S09"] == ("N", None) and p["T"] == T0 + 6 * M5 and build_rec(p) == EX_LONG)
+check("保持中の根拠（⑤⑮㉔）と新規成立（⑯）を区別・SAT の継続は NEW に入らない", [l for l, _ in p["NEW"]] == ["16"] and "24" in p["BUY"])
+ev2_, sat2_ = mirror_feed(EVX, SATX)
+r2 = play(Feed(ev2_, sat=sat2_), 8)
+EX_SHORT = entries(r2)[0][0]["nEntryRec"]
+WANT_S = "N5E1|D=S|T=1767573000000|LS=1|SS=5|NET=-4|MA=0/2|WV=1/2|SA=0/1|BUY=15|SEL=05.16.24|NEW=16S|S05=S,10|S09=N,NA|S16=S,0|S15=L,10|S24=S,20"
+check("例の SHORT : 同じ形式で左右反転（" + EX_SHORT + "）", EX_SHORT == WANT_S and build_rec(parse_rec(EX_SHORT)) == EX_SHORT)
+
+# 上限で頭打ちのロジックも記録・点数は上限後の判定値
+r = play(Feed({3: {"05": "L", "09": "L"}}, sat={0: 1}), 5)
+p = parse_rec(entries(r)[0][0]["nEntryRec"])
+check("⑤＋⑨（MA 上限 2 で頭打ち）も両方 BUY・NEW に記録、MA=2・LS=3（判定値）・SAT 開始不明は NA",
+      p["BUY"] == ["05", "09", "24"] and p["MA"] == (2, 0) and p["LS"] == 3 == r.rows[3]["nL"] and p["NEW"] == [("05", "L"), ("09", "L")]
+      and p["S24"] == ("L", None))
+# 同方向の再成立は経過時間の基準を更新（残り保持時間ではない）
+r = play(Feed({1: {"05": "L"}, 2: {"05": "L"}, 3: {"16": "L"}}, sat={0: 0}), 5)
+p = parse_rec(entries(r)[0][0]["nEntryRec"])
+check("⑤ 1・2 で再成立、3 で判断 → ⑤ は 5 分（最初の成立から 10 分・残り 10 分ではない）", p["S05"] == ("L", 5) and p["S16"] == ("L", 0))
+# 使用 OFF
+r = play(Feed({3: {"05": "L", "16": "L"}}, sat={0: 1}), 5, use09=False)
+p = parse_rec(entries(r)[0][0]["nEntryRec"])
+check("使用 OFF は OFF,NA（なし N,NA・新規 0 分と区別）", p["S09"] == ("OFF", None) and p["S16"] == ("L", 0) and p["S15"] == ("N", None))
+# SAT : データ不備からの復帰は NA、状態の開始が分かれば経過分
+r = Run()
+f = Feed({8: {"05": "L", "16": "L"}}, sat={0: 0, 1: 1})
+for i in range(10):
+    ins = f.ins(i)
+    if i == 5:
+        ins["m24"] = None
+    r.bar(ins=ins)
+p = parse_rec(entries(r)[0][0]["nEntryRec"])
+check("SAT : 1 で有効化しても 5 のデータ不備の後（6 で復帰）は開始不明 = NA（0 分にしない）", p["S24"] == ("L", None) and r.rows[4]["nSatT"] is not None)
+r.bar(ins=dict(f.ins(10), m24=None))
+check("データ不備の足で記録関数を呼ぶと S24=X,NA（データ不備の足ではエントリー自体をしない）",
+      "|S24=X,NA" in r.env["nf_rec"](1) and not r.rows[-1]["nAllOk"] and parse_rec(r.env["nf_rec"](1))["S24"] == ("X", None))
+check("小数の点数も解析できる（形式の確認）", parse_rec(WANT_L.replace("LS=5", "LS=4.5").replace("NET=4", "NET=3.5"))["LS"] == 4.5)
+
+# 記録追加前（NET5-2）と売買が同じ・全エントリーの記録が判断足の値と一致
+SETS = [dict(), dict(beUse=False), dict(pt05=3, capMa=3, entNet=2, exNeedNew=False, beOff=2.0, hold16=25),
+        dict(use09=False, entFam=1, exUse=False), dict(entNeedNew=False, hdWarn=1, beTrig=6.0)]
+mism, nent, bad, xc, dirs = 0, 0, [], set(), set()
+for si, over in enumerate(SETS):
+    for seed in range(30 if si == 0 else 12):
+        case = rand_case(200 + seed * 7 + si)
+        a = play_case(case, code=CODE_V2, inputs=INPUTS_V2, **over)
+        b = play_case(case, **over)
+        mism += a.b.log != b.b.log
+        ka = [(c["id"], c["side"], c["qty"], c["price"], c["exit_id"], c["exit_price"], c["bar_in"], c["bar_out"]) for c in a.b.closed]
+        kb = [(c["id"], c["side"], c["qty"], c["price"], c["exit_id"], c["exit_price"], c["bar_in"], c["bar_out"]) for c in b.b.closed]
+        mism += ka != kb
+        mism += [a.b.ct_profit(i) for i in range(len(a.b.closed))] != [b.b.ct_profit(i) for i in range(len(b.b.closed))]
+        for x, y in zip(a.rows, b.rows):
+            mism += any(x[k] != y[k] for k in KEYS + ("TS", "nBeDone", "dBeDir"))
+        for row, e, tr in entries(b):
+            nent += 1
+            c = row["nEntryRec"]
+            q = parse_rec(c)
+            want_buy = [l for i, l in enumerate(LIDS) if (row["EV_DIR"][i] if i < 4 else row["satDir"]) == 1 and row["IN_ST"][i] == 0]
+            want_sel = [l for i, l in enumerate(LIDS) if (row["EV_DIR"][i] if i < 4 else row["satDir"]) == -1 and row["IN_ST"][i] == 0]
+            want_new = [(l, d) for i, l in enumerate(LIDS) for d, arr in (("L", "NEW_L"), ("S", "NEW_S")) if row[arr][i] and row["IN_ST"][i] != 11]
+            okc = (q["D"] == ("L" if e[3] == 1 else "S") and q["T"] == T0 + (e[1] + 1) * M5 and build_rec(q) == c
+                   and (q["LS"], q["SS"], q["NET"]) == (row["nL"], row["nS"], row["nNet"])
+                   and q["MA"] == (row["nMaL"], row["nMaS"]) and q["WV"] == (row["nWvL"], row["nWvS"]) and q["SA"] == (row["nSaL"], row["nSaS"])
+                   and q["BUY"] == want_buy and q["SEL"] == want_sel and q["NEW"] == want_new)
+            for i, l in enumerate(LIDS):
+                st, el = q["S" + l]
+                d = row["EV_DIR"][i] if i < 4 else row["satDir"]
+                t0 = row["EV_T"][i] if i < 4 else row["nSatT"]
+                wst = "OFF" if row["IN_ST"][i] == 11 else "X" if row["IN_ST"][i] != 0 else {1: "L", -1: "S", 0: "N"}[d]
+                wel = None if wst not in ("L", "S") or t0 is None else (T0 + (e[1] + 1) * M5 - t0) // 60000
+                okc &= (st, el) == (wst, wel) and (el is None or el >= 0)
+                if i < 4 and wst in ("L", "S"):
+                    okc &= el < [over.get("hold05", 15), over.get("hold09", 15), over.get("hold16", 15), over.get("hold15", 15)][i]
+            if e[1] == len(b.rows) - 1 and tr is None:
+                continue                              # 最終足で出した注文（約定はデータの外）
+            okc &= tr is not None and tr["comment"] == c and tr["order_bar"] == e[1]
+            okc &= tr is not None and tr.get("exit_comment") in (None, "SL", "建値SL", "NET決済")
+            xc.add(tr.get("exit_comment"))
+            dirs.add(q["D"])
+            if not okc:
+                bad.append((si, seed, c))
+check(f"記録追加の前後（NET5-2 凍結コピー）で 注文時刻・方向・数量・約定・決済・損益・全足の状態が一致（5 設定・78 ケース）", mism == 0)
+check(f"全エントリー {nent} 件 : 記録を解析・再構成でき、方向・判断足時刻・上限後の点数・BUY/SEL/NEW・状態・経過分が判断足の値と一致、"
+      "Entry comment = 判断足の記録、Exit comment は SL / 建値SL / NET決済 のまま", nent > 100 and not bad
+      and {"SL", "建値SL", "NET決済"} <= xc and dirs == {"L", "S"})
+lens = [len(row["nEntryRec"]) for case_seed in range(5) for row, _, _ in entries(play_case(rand_case(300 + case_seed)))]
+check(f"記録文字列の長さ（最大 {max(lens)} 文字）", max(lens) < 200)
 
 print(f"\n{ok} checks passed")
