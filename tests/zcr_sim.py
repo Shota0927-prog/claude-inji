@@ -44,7 +44,7 @@ FEEDS = ([f"f{k}{x}" for k in (1, 2, 3) for x in "ulia"] + [f"s{k}{x}" for k in 
          + [f"zd{x}{k}" for k in (1, 2, 3, 4) for x in "LUT"] + [f"g{k}{x}" for k in (1, 2, 3, 4) for x in ("k", "kc", "c", "d", "t", "b")]
          + ["zgPk1", "zgPk4", "zgPkD"] + ZE_KEYS)
 GN = ["ZA-1H", "ZA-4H", "ZA-D", "ZB-1m", "ZB-5m", "ZC-1H", "ZC-4H", "ZC-D", "ZC-W", "ZD-1H", "ZD-4H", "ZD-D", "ZD-W",
-      "ZE-4H", "ZE-D", "ZF-1H", "ZF-4H", "ZF-D", "ZF-W", "ZG-1H", "ZG-4H", "ZG-D"]
+      "ZE-4H", "ZE-D", "ZF-FVG-1H", "ZF-FVG-4H", "ZF-FVG-D", "ZF-FVG-W", "ZG-1H", "ZG-4H", "ZG-D", "ZF-iFVG-1H", "ZF-iFVG-4H", "ZF-iFVG-D", "ZF-iFVG-W"]
 G = {n: 1 << i for i, n in enumerate(GN)}
 RATIOS = (0.236, 0.382, 0.5, 0.618)
 EPS = 1e-7
@@ -82,7 +82,8 @@ def tonum(s):
 
 ALL_ON = {"zaUse1": True, "zcUse1": True, "zcUse2": True, "zdUse1": True, "zfUse1": True, "zfUse2": True, "zfUse3": True, "zfUse4": True}
 OFF = {"zaUse2": False, "zaUse3": False, "zbUse1": False, "zbUse2": False, "zcUse3": False, "zcUse4": False, "zdUse2": False, "zdUse3": False,
-       "zdUse4": False, "zeUse": False, "zgUse1": False, "zgUse4": False, "zgUseD": False}
+       "zdUse4": False, "zeUse": False, "zgUse1": False, "zgUse4": False, "zgUseD": False,
+       "zfUse1": False, "zfUse2": False, "zfUse3": False, "zfUse4": False}
 ONLY_ZC = dict(OFF, zcUse1=True, zcUse2=True, zcUse3=True, zcUse4=True)
 
 
@@ -171,6 +172,12 @@ class Runner:
     def sums2(self):
         return [(list(r.c2), list(r.hist2), list(r.ev2)) for r in self.env["zrSum"]]
 
+    def sysrows(self, k):
+        """system k (1 all / 2 had an evidence in contact / 3 one place on the bar / 4 both) of every set row and of the 4 summary rows"""
+        f = {1: lambda r: (r.c, r.hist, r.ev), 2: lambda r: (r.c2, r.hist2, r.ev2), 3: lambda r: (r.c3, r.hist3, r.ev3), 4: lambda r: (r.c4, r.hist4, r.ev4)}[k]
+        e = self.env
+        return ({m: tuple(list(x) for x in f(r)) for m, r in zip(e["zrMask"], e["zrRow"])}, [tuple(list(x) for x in f(r)) for r in e["zrSum"]])
+
     def zones(self):
         return sorted((q.gid, q.sub, q.tb, q.tt, q.inv) for q in self.env["zxZ"])
 
@@ -184,7 +191,7 @@ class Runner:
                     zeStat=list(e["lbZeStat"]), zdStat=list(e["lbZdStat"]))
 
     def snapshot(self):
-        return copy.deepcopy(dict(rec=self.records(), pend=self.pending(), rows=self.rows(), sums=self.sums(), rows2=self.rows2(), sums2=self.sums2(), st=self.state(),
+        return copy.deepcopy(dict(rec=self.records(), pend=self.pending(), rows=self.rows(), sums=self.sums(), rows2=self.rows2(), sums2=self.sums2(), sys3=self.sysrows(3), sys4=self.sysrows(4), st=self.state(),
                                   out=[(i, r) for i, r in self.out], created=list(self.created)))
 
 
@@ -321,7 +328,7 @@ def oracle(bars, prm):
         z.update(kw)
         return z
     ma = [mk(3, 0, None, None, ma=True, ok=False), mk(4, 0, None, None, ma=True, ok=False)]
-    n_zone = [0] * 22
+    n_zone = [0] * 26
 
     def add(z, old=None):
         """old = the zone it replaces: the contact state carries over only if that zone was in contact and the bands overlap"""
@@ -489,7 +496,7 @@ def oracle(bars, prm):
                             zg_used.add((zid, k))
                             if zg_use[k]:
                                 z = add(mk(19 + k, 1 if side == -1 else -1, zp - P["zgHalf"], zp + P["zgHalf"], ctr=zp, bi=int(cbi)))
-                                z["aux"] |= (1 << (16 + k)) if cnt == 3 else 0
+                                z["aux"] |= (1 << (8 + k)) if cnt == 3 else 0
         body_hi, body_lo = max(b["o"], b["c"]), min(b["o"], b["c"])
         for z in [z for z in zones if 19 <= z["gid"] <= 21]:
             if (body_hi > z["ctr"] + P["zgRev"] + EPS) if z["sub"] == 1 else (body_lo < z["ctr"] - P["zgRev"] - EPS):
@@ -538,8 +545,11 @@ def oracle(bars, prm):
         pl = [(mem, c_lo, c_hi, direction(mem, c_lo, c_hi)) for mem, c_lo, c_hi in places_of(touched, l, h)]
         n_pl = 0
         new = []
+        def egid(z):
+            """evidence ID at the touch: a ZF zone is an FVG (15..18) or, once inverted, an iFVG (22..25) — never both"""
+            return z["gid"] + 7 if 15 <= z["gid"] <= 18 and z["inv"] else z["gid"]
         for mem, c_lo, c_hi, d in pl:                 # by price, low to high; no order of contact inside the bar
-            gids = sorted(set(z["gid"] for z in mem))
+            gids = sorted(set(egid(z) for z in mem))
             mask = sum(1 << g for g in gids)
             if d != 0:
                 n_pl += 1
@@ -555,10 +565,10 @@ def oracle(bars, prm):
                 continue
             aux = 0
             for z in mem:
-                aux |= (1 << ((8 if z["inv"] else 12) + z["gid"] - 15)) if 15 <= z["gid"] <= 18 else z["aux"]
+                aux |= z["aux"]
             on_mask = side = 0
             for z in mem:
-                on_mask |= (1 << z["gid"]) if z["on"] else 0
+                on_mask |= (1 << egid(z)) if z["on"] else 0
                 side |= z["side"]
             by_pc = c_lo <= o <= c_hi
             u1, u5 = zb_use[0] and not ma[0]["ok"], zb_use[1] and not ma[1]["ok"]
@@ -775,6 +785,17 @@ def compare(r, orc, label=""):
     all_o[2][2] += orc["unk"]
     if sums_i and tuple(sums_i[3]) != tuple(all_o):
         det.append("summary row all differs")
+    # systems 3 / 4: the events of bars with exactly one place, and those of them that had an evidence already in contact
+    for k, sel in ((3, [e for e in ev if e["nPl"] == 1]), (4, [e for e in ev if e["nPl"] == 1 and e["onMask"]])):
+        gr, gs = r.sysrows(k)
+        if {m: v for m, v in gr.items() if any(v[0]) or any(v[1]) or any(v[2])} != {m: tuple(v) for m, v in rows_of(sel).items()}:
+            det.append(f"system {k} rows differ")
+        so = rows_of(sel, key=lambda e: min(e["nEv"], 3))
+        for g in (1, 2, 3):
+            if gs and tuple(gs[g - 1]) != tuple(so.get(g, empty)):
+                det.append(f"system {k} summary row {g} differs")
+        if gs and tuple(gs[3]) != tuple(rows_of(sel, key=lambda e: 0).get(0, empty)):
+            det.append(f"system {k} summary row all differs")
     # second system: the same aggregation over the events that had an evidence already in contact
     ev2 = [e for e in ev if e["onMask"]]
     rows2_o = rows_of(ev2)
@@ -944,20 +965,26 @@ def random_vs_oracle(seeds):
                        ("pend", len(r["zcPend"])), ("queue", len(r["zcQ"])), ("sell", sum(1 for e in ev if e["d"] == -1)),
                        ("second", sum(1 for e in ev if e["nPl"] > 1)), ("maunk", sum(1 for e in ev if e["flags"] & 1536)), ("evon", sum(1 for e in ev if e["onMask"])), ("npre", orc["nPre"]),
                        ("side", sum(1 for e in ev if e["side"])), ("bypc", sum(1 for e in ev if e["flags"] & 8192)),
-                       ("zeunk", sum(1 for e in ev if e["flags"] & 2048)), ("ifvg", sum(1 for e in ev if e["aux"] & 0xF00)),
-                       ("triple", sum(1 for e in ev if e["aux"] & 0x70000)), ("why0", orc["why"][0]), ("why1", orc["why"][1]),
+                       ("zeunk", sum(1 for e in ev if e["flags"] & 2048)), ("ifvg", sum(1 for e in ev if e["mask"] >> 22)), ("one", sum(1 for e in ev if e["nPl"] == 1)),
+                       ("triple", sum(1 for e in ev if e["aux"] & 0x700)), ("why0", orc["why"][0]), ("why1", orc["why"][1]),
                        ("pos0", sum(1 for e in ev if e["cPos"] == 0)), ("pos2", sum(1 for e in ev if e["cPos"] == 2))) \
-                + tuple((n[:2], sum(1 for e in ev if e["mask"] & G[n])) for n in ("ZA-4H", "ZB-1m", "ZC-D", "ZD-4H", "ZE-4H", "ZF-4H", "ZG-4H")):
+                + tuple((n[:2], sum(1 for e in ev if e["mask"] & G[n])) for n in ("ZA-4H", "ZB-1m", "ZC-D", "ZD-4H", "ZE-4H", "ZF-FVG-4H", "ZG-4H")) + (("ZI", sum(1 for e in ev if e["mask"] & G["ZF-iFVG-4H"])),):
             COVER[k_] = COVER.get(k_, 0) + v_
         rich = len(ev) > 20 and len(set(e["mask"] for e in ev)) > 3
         check(f"C random seed {seed} == oracle ({ov})", ok and rich,
               f"events={len(ev)} sets={len(set(e['mask'] for e in ev))} unk={orc['unk']} cont={orc['cont']} bad={orc['nBad']} out={len(r.out)} "
               f"queue={len(r['zcQ'])} pend={len(r['zcPend'])} | {det}")
         inv = True
-        both = list(zip(list(r.rows().values()) + r.sums()[:4], list(r.rows2().values()) + r.sums2()[:4]))
-        diff = [([a - b for a, b in zip(x[0], y[0])], [a - b for a, b in zip(x[1], y[1])], [a - b for a, b in zip(x[2][:2], y[2][:2])] + [x[2][2]]) for x, y in both]
-        inv &= all(min(d[0][i] for i in range(len(d[0])) if i % NS not in (8, 9, 10, 11, 12, 13, 14, 15)) >= 0 and min(d[1]) >= 0 and min(d[2]) >= 0 for d in diff)
-        for c, hist, evn in [x for x, _ in both] + [y for _, y in both] + diff:
+        sysv = {k: list(r.sysrows(k)[0].values()) + r.sysrows(k)[1][:4] for k in (1, 2, 3, 4)}
+
+        def minus(x, y):
+            return ([a - b for a, b in zip(x[0], y[0])], [a - b for a, b in zip(x[1], y[1])], [a - b for a, b in zip(x[2][:2], y[2][:2])] + [x[2][2]])
+        # the 2 x 3 display combinations: places {all, one} x {include = base, only = with-contact, exclude = base - with-contact}
+        combos = [sysv[1], sysv[2], [minus(x, y) for x, y in zip(sysv[1], sysv[2])], sysv[3], sysv[4], [minus(x, y) for x, y in zip(sysv[3], sysv[4])]]
+        nonneg = lambda d: min(d[0][i] for i in range(len(d[0])) if i % NS not in (8, 9, 10, 11, 12, 13, 14, 15)) >= 0 and min(d[1]) >= 0 and min(d[2]) >= 0   # noqa: E731
+        inv &= all(nonneg(d) for cmb in combos for d in cmb)
+        inv &= all(nonneg(minus(x, y)) for x, y in zip(sysv[1], sysv[3])) and all(nonneg(minus(x, y)) for x, y in zip(sysv[2], sysv[4]))
+        for c, hist, evn in [d for cmb in combos for d in cmb]:
             for di in range(2):
                 for h in range(3):
                     base = (di * 3 + h) * NS
@@ -968,9 +995,9 @@ def random_vs_oracle(seeds):
                     inv &= c[base + 2] >= c[base + 3] >= c[base + 4]
         tot = r.sums()[3]
         inv &= sum(v[2][0] + v[2][1] for v in r.rows().values()) == tot[2][0] + tot[2][1] == len(ev)
-        check(f"B seed {seed}: 3 系統 (含める / のみ / 除く) の行ごとに イベント = 計測可能 + 計測不能 + 待ち、本数不足 <= 計測可能、到達 <= 計測可能、$5 >= $10 >= $15、度数の合計 = 到達、集合行の合計 = 全体", inv)
+        check(f"B seed {seed}: 表示の全組合せ 2 × 3 (場所数 全件 / 1 のみ × 含める / のみ / 除く) の行ごとに イベント = 計測可能 + 計測不能 + 待ち、本数不足 <= 計測可能、到達 <= 計測可能、$5 >= $10 >= $15、度数の合計 = 到達、集合行の合計 = 全体", inv)
         last = (bars, ov)
-    need = dict(evon=200, npre=50, side=500, bypc=20, ev=3000, multi=500, unmeas=20, short=20, amb=100, unk=20, cont=2000, r15=100, bad=50, pend=1, queue=1, sell=1000, second=20, maunk=1,
+    need = dict(one=500, ZI=5, evon=200, npre=50, side=500, bypc=20, ev=3000, multi=500, unmeas=20, short=20, amb=100, unk=20, cont=2000, r15=100, bad=50, pend=1, queue=1, sell=1000, second=20, maunk=1,
                 zeunk=1, ifvg=5, triple=5, why0=10, why1=10, pos0=200, pos2=200, ZA=50, ZB=200, ZC=200, ZD=50, ZE=50, ZF=50, ZG=20)
     check("C 乱数系列の合計で各機能・全 7 種類が使われている (複数根拠・本数不足・計測不能・順序不明・方向不明・同じ足の 2 か所目・未出力 ほか)",
           all(COVER.get(k, 0) >= v for k, v in need.items()), str({k: (COVER.get(k, 0), v) for k, v in need.items() if COVER.get(k, 0) < v}) + str(COVER))
@@ -1126,7 +1153,7 @@ def fixed_cases():
           and [(e["rBot"], e["rTop"]) for e in oa["events"]] == [(430400, 430500), (430700, 430800), (431000, 431100)], f"{sa} {sb}")
     fw = merge(zf(1, T0 - 3_600_000, 4350.0, 1, 4320.0, 4280.0), zc(2, 1, 4290.0), zc(3, 1, 4310.0))
     case("A F1b 広い帯 (FVG 4280..4320) の中に離れた 2 本の線: {広+線1} と {広+線2}。{広+線1+線2} にはしない", [(4330, 4330, 4270, 4275)], fw,
-         lambda r, ev, o: [e["mask"] for e in ev] == [G["ZF-4H"] + ZCD, G["ZF-4H"] + ZCW] and sorted(r.rows()) == sorted([G["ZF-4H"] + ZCW, G["ZF-4H"] + ZCD])
+         lambda r, ev, o: [e["mask"] for e in ev] == [G["ZF-FVG-4H"] + ZCD, G["ZF-FVG-4H"] + ZCW] and sorted(r.rows()) == sorted([G["ZF-FVG-4H"] + ZCW, G["ZF-FVG-4H"] + ZCD])
          and [e["nPl"] for e in ev] == [2, 2] and r["st"].nMultiBar == 1, ov={"zfUse2": True})
     case("A F1c 上からの場所と下からの場所が同じ足にある: 場所ごとに方向を決め、全部をイベントにする (場所数 4)", [(4300, 4315, 4285, 4300)],
          merge(zc(0, 1, 4312.0), zc(1, 1, 4306.0), zc(2, 1, 4294.0), zc(3, 1, 4288.0)),
@@ -1164,8 +1191,17 @@ def fixed_cases():
     case("A F2b 広い FVG の中を動いて線へ初めて到達: 新規 (接触中だった根拠 = ZF)。FVG の中だけの足・同じ構成の足は増えない",
          [(4330, 4330, 4318, 4319), (4319, 4319, 4315, 4316), (4316, 4316, 4311, 4313), (4313, 4313, 4310, 4311.5), (4311.5, 4312, 4309, 4310)],
          merge(zf(1, T0 - 3_600_000, 4350.0, 1, 4320.0, 4280.0), zc(3, 1, 4310.0)),
-         lambda r, ev, o: [(e["bar"], e["mask"], e["onMask"]) for e in ev] == [(1, G["ZF-4H"], 0), (3, G["ZF-4H"] + ZCW, G["ZF-4H"])] and o["cont"] == 3,
+         lambda r, ev, o: [(e["bar"], e["mask"], e["onMask"]) for e in ev] == [(1, G["ZF-FVG-4H"], 0), (3, G["ZF-FVG-4H"] + ZCW, G["ZF-FVG-4H"])] and o["cont"] == 3,
          ov={"zfUse2": True})
+    # J3: the "one place on the bar" systems are filled after the bar's places are all judged; later sums go to the same systems
+    bj = bars_from_rows([(4310, 4310, 4279, 4290), (4290, 4290, 4270, 4272), (4272, 4272, 4265, 4266), (4266, 4279, 4266, 4278.5)] + flat(4278.5, 8), f10)
+    rj = Runner(dict(ONLY_ZC)).run(bj)
+    g3, s3 = rj.sysrows(3)
+    g1, s1 = rj.sysrows(1)
+    check("A J3 場所数 1 の系統: 2 か所に触れた足のイベント (場所数 2) は入らず、1 か所だけの足のイベントだけが入る。観察期間の集計も同じ系統へ入る",
+          g1[ZCD][2] == [1, 0, 0] and g1[ZCW][2] == [1, 1, 0] and g3[ZCD][2] == [0, 0, 0] and g3[ZCW][2] == [0, 1, 0] and sum(g3[ZCD][0]) == 0
+          and s3[3][2] == [0, 1, 0] and s1[3][2] == [2, 1, 0] and g3[ZCW][0][5 * NS] == 1 and g1[ZCW][0][5 * NS] == 1 and g1[ZCW][0][2 * NS] == 1 and g3[ZCW][0][2 * NS] == 0
+          and compare(rj, oracle(bj, params(rj)))[0], f"{g1[ZCD][2]} {g1[ZCW][2]} {g3[ZCD][2]} {g3[ZCW][2]} {compare(rj, oracle(bj, params(rj)))[1]}")
     # F3: start date / warm-up bars: zones and contact states are kept as usual, only the events are not made
     rows_w = [(4304, 4304, 4301, 4303), (4303, 4303, 4301, 4302.5), (4302.5, 4309, 4302.5, 4308), (4308, 4308, 4308, 4308), (4308, 4308, 4301, 4302)]
     case("A F3 助走本数 3: 先頭 3 本の間のタッチはイベントにしない (件数だけ)。接触中は立つので直後の足は継続中。離脱後の再接触からイベント", rows_w, D,
@@ -1281,18 +1317,28 @@ def kinds():
     # ZF: FVG with its own top / bottom (4296..4303), key = forming bar time
     k1 = T0 - 3_600_000
     one("ZF: FVG は本来の上下限 (4296..4303) の帯。共通幅は使わない", {"zfUse2": True}, zf(1, k1, 4350.0, 1, 4303.0, 4296.0),
-        lambda r, ev, o: len(ev) == 1 and (ev[0]["mask"], ev[0]["rTop"], ev[0]["rBot"], ev[0]["aux"]) == (G["ZF-4H"], 430300, 430100, 1 << 13))
-    one("ZF: 上昇 FVG の下端を確定終値が下抜け → iFVG (補助マスクに iFVG)。iFVG の上端を確定終値が上抜け → 無効", {"zfUse2": True}, zf(1, k1, 4350.0, 1, 4303.0, 4296.0),
-        lambda r, ev, o: [(e["bar"], e["aux"]) for e in ev] == [(3, 1 << 9)] and r["st"].nIfvg == 1 and r["st"].nFvgDead == 1 and r.zones() == [],
+        lambda r, ev, o: len(ev) == 1 and (ev[0]["mask"], ev[0]["rTop"], ev[0]["rBot"], ev[0]["aux"]) == (G["ZF-FVG-4H"], 430300, 430100, 0))
+    one("ZF: 上昇 FVG の下端を確定終値が下抜け → iFVG (根拠 ID が ZF-iFVG-4H になる)。iFVG の上端を確定終値が上抜け → 無効", {"zfUse2": True}, zf(1, k1, 4350.0, 1, 4303.0, 4296.0),
+        lambda r, ev, o: [(e["bar"], e["mask"], e["aux"]) for e in ev] == [(3, G["ZF-iFVG-4H"], 0)] and r["st"].nIfvg == 1 and r["st"].nFvgDead == 1 and r.zones() == [],
         start=4290.0, rows=[(4290, 4290, 4290, 4290), (4290, 4290, 4290, 4290), (4290, 4297, 4290, 4291), (4291, 4291, 4291, 4291), (4291, 4291, 4291, 4291)],
         feeds={1: zf(1, k1 + 1, 4295.0), 4: zf(1, k1 + 2, 4304.0)})
+    # J1: the same zone object keeps its contact state through FVG -> iFVG; the change of state alone is not a new event
+    one("ZF: 接触中の FVG が iFVG に転換しても同じ Zone (接触中を引き継ぐ)。転換した次の足で触れても 0 件。1 つの Zone は FVG か iFVG のどちらか 1 つの根拠だけ",
+        {"zfUse2": True}, zf(1, k1, 4350.0, 1, 4303.0, 4296.0),
+        lambda r, ev, o: [(e["bar"], e["mask"], e["nEv"], e["nRaw"]) for e in ev] == [(1, G["ZF-FVG-4H"], 1, 1)] and o["cont"] == 2 and r["st"].nIfvg == 1
+        and r.zones() == [(16, 1, 429600, 430300, True)] and sorted(r.rows()) == [G["ZF-FVG-4H"]],
+        rows=[(4310, 4310, 4301, 4302), (4302, 4302, 4294, 4295), (4295, 4297, 4294, 4296)], feeds={2: zf(1, k1 + 1, 4295.0)})
+    one("ZF: 離脱した後に iFVG へ再接触すると ZF-iFVG の集合で 1 件 (FVG の集合とは別の行。同じ場所で両方に数えない)",
+        {"zfUse2": True}, zf(1, k1, 4350.0, 1, 4303.0, 4296.0),
+        lambda r, ev, o: [(e["bar"], e["mask"], e["nEv"]) for e in ev] == [(1, G["ZF-FVG-4H"], 1), (4, G["ZF-iFVG-4H"], 1)] and sorted(r.rows()) == sorted([G["ZF-FVG-4H"], G["ZF-iFVG-4H"]]),
+        rows=[(4310, 4310, 4301, 4302), (4302, 4302, 4289, 4290), (4290, 4290, 4289, 4290), (4290, 4297, 4290, 4296.5)], feeds={2: zf(1, k1 + 1, 4290.0)})
     # ZG: a detection (base 7, top, double, zone base price 4300) in the block of target bar 100
     blk = zg_blk(T0 - 7200_000, T0 - 3600_000, 100, [(7, -1, 2, 4300.0)])
     one("ZG: 検知イベントで発動 (トップ・基準価格 4300 ± ZG 幅)。同じ基準の再検知では作らない", {"zgUse1": True}, zg(0, blk),
         lambda r, ev, o: len(ev) == 1 and (ev[0]["mask"], ev[0]["aux"], ev[0]["d"]) == (G["ZG-1H"], 0, -1) and ev[0]["side"] == 1 << 14 and r["zcNZone"][19] == 1,
         start=4296.0, rows=[(4296, 4299, 4296, 4297)], feeds={1: zg(0, blk, zg_blk(T0 - 3600_000, T0, 101, [(7, -1, 3, 4310.0)]))})
     one("ZG: トリプルは補助マスクに残る。期限 (検知足から 24 本目の 1 時間足の確定) で消える", {"zgUse1": True}, zg(0, zg_blk(T0 - 7200_000, T0 - 3600_000, 100, [(8, 1, 3, 4300.0)])),
-        lambda r, ev, o: len(ev) == 1 and ev[0]["aux"] == 1 << 16 and ev[0]["side"] == 1 << 17 and r.zones() == [],
+        lambda r, ev, o: len(ev) == 1 and ev[0]["aux"] == 1 << 8 and ev[0]["side"] == 1 << 17 and r.zones() == [],
         start=4296.0, rows=[(4296, 4299, 4296, 4297)] + flat(4297, 2), feeds={2: zg(0, zg_blk(T0 - 3600_000, T0, 123)), 3: zg(0, zg_blk(T0, T0 + 3 * M5, 124))})
     one("ZG: 逆行 (トップ: 実体上端 > 基準価格 + $5) の足で消える。その足のタッチ判定は消える前の Zone で行う (次の足から無い)", {"zgUse1": True}, zg(0, blk),
         lambda r, ev, o: [e["bar"] for e in ev] == [1] and r.zones() == [] and o["cont"] == 0,
@@ -1303,7 +1349,7 @@ def kinds():
     b = bars_from_rows([(4306, 4306, 4301, 4305)], allf, start=4340.0)
     b[1]["p1"], b[1]["p5"] = 4300.2, 4299.8
     r, o, ok, det = run_case(b, None, {"zaUse2": True, "zbUse1": True, "zbUse2": True, "zcUse3": True, "zdUse2": True, "zeUse": True, "zeUseD": False, "zfUse2": True, "zgUse4": True}, base=OFF)
-    want = sum(G[n] for n in ("ZA-4H", "ZB-1m", "ZB-5m", "ZC-D", "ZD-4H", "ZE-4H", "ZF-4H", "ZG-4H"))
+    want = sum(G[n] for n in ("ZA-4H", "ZB-1m", "ZB-5m", "ZC-D", "ZD-4H", "ZE-4H", "ZF-FVG-4H", "ZG-4H"))
     check("T 全 7 種類が同じ場所に重なる: 1 イベント・根拠数 8 (ZA ZB×2 ZC ZD ZE ZF ZG)", ok and len(o["events"]) == 1 and o["events"][0]["mask"] == want
           and o["events"][0]["nEv"] == 8, f"{o['events']} | {det}")
 
@@ -1325,17 +1371,20 @@ def before_after(seeds=(1, 2, 3, 4)):
     for seed in seeds:
         ov = RANDOM_PRM[seed % len(RANDOM_PRM)]
         bars = random_bars(seed, 1500)
+        ov = dict(ov, zfUse1=False, zfUse2=False, zfUse3=False, zfUse4=False)      # ZF evidence IDs differ since ZCR-5 (FVG / iFVG split)
         a = Runner(ov, source=old).run(bars)
         b = Runner(ov).run(bars)
-        ra = sorted(key([x for i, x in enumerate(v) if i not in (0, 7, 13)]) for v in a.records())
+        oaux = lambda x: (x & 0xFF) + (((x >> 16) & 7) << 8)        # noqa: E731   ZCR-3 aux -> current (ZG triple bits 16-18 -> 8-10)
+        ra = sorted(key([oaux(int(x)) if i == 15 else x for i, x in enumerate(v) if i not in (0, 7, 13)]) for v in a.records())
         rb = sorted(key(v[1:]) for v in b.records())
-        pa = sorted((p["t0"], p["mask"], p["d"], p["rTop"], p["rBot"], p["edge"], p["nPl"], p["aux"], p["flags"], p["onMask"], p["side"], tuple(p["wst"])) for p in a.pending())
+        pa = sorted((p["t0"], p["mask"], p["d"], p["rTop"], p["rBot"], p["edge"], p["nPl"], oaux(p["aux"]), p["flags"], p["onMask"], p["side"], tuple(p["wst"])) for p in a.pending())
         pb = sorted((p["t0"], p["mask"], p["d"], p["rTop"], p["rBot"], p["edge"], p["nPl"], p["aux"], p["flags"], p["onMask"], p["side"], tuple(p["wst"])) for p in b.pending())
         sa, sb = a.state(), b.state()
+        sa["nZone"] = sa["nZone"] + [0] * 4
         same_st = all(sa[k] == sb[k] for k in sb)
         multi = sum(1 for v in b.records() if v[12] > 1)
         check(f"H 変更前後 (ZCR-3 79be329 → 現在) で記録が一致 (ID・順番・接触端側メンバーの列を除く全列。seed {seed})",
-              ra == rb and pa == pb and same_st and a.rows() == b.rows() and a.sums() == b.sums() and a.rows2() == b.rows2() and len(rb) > 100 and multi > 20,
+              ra == rb and pa == pb and same_st and a.rows() == b.rows() and a.sums() == b.sums() and a.rows2() == b.rows2() and len(rb) > 60 and multi > 10,
               f"records {len(ra)} / {len(rb)} pending {len(pa)} / {len(pb)} state={same_st} multi-place records={multi} "
               f"first diff={next(((x, y) for x, y in zip(ra, rb) if x != y), None)}")
 
@@ -1375,7 +1424,7 @@ def causality(bars, ov):
     disp = dict(ov, zcView="件数内訳", zcKind="根拠数別", zcDirMode="LONGのみ", zcHzMode="5分", zcTopN=1, zcShowBox=False, zcShowLbl=True, zcDrawMax=1)
     check("B 表示の設定を変えても集計・記録は同じ", Runner(disp).run(bars).snapshot() == full.snapshot())
     off = Runner(dict(ov, zcUse3=False, zbUse1=False, zgUse1=False, zfUse2=False, zeUse4=False)).run(bars)
-    bits = G["ZC-D"] + G["ZB-1m"] + G["ZG-1H"] + G["ZF-4H"] + G["ZE-4H"]
+    bits = G["ZC-D"] + G["ZB-1m"] + G["ZG-1H"] + G["ZF-FVG-4H"] + G["ZE-4H"]
     check("B 根拠 ID を OFF にするとその根拠は登録も集合にも現れない", [off["zcNZone"][g] for g in (7, 19, 16, 13)] == [0, 0, 0, 0]
           and all(not (m & bits) for m in off.rows()) and len(off.rows()) > 2)
 
@@ -1399,6 +1448,10 @@ MUTATIONS = [
     ("始値で到達済みでも足の逆行を上限に入れる", "int hi = oFav >= w ? ob.mae : math.max(lo, adv)", "int hi = math.max(oFav >= w ? ob.mae : lo, adv)"),
     ("置き換わった POC / フィボが接触中を引き継がない", "            if z.tt >= array.get(zcInhB, sl) and z.tb <= array.get(zcInhT, sl)\n", "            if false\n"),
     ("離れた価格へ移った後継も接触中を引き継ぐ", "            if z.tt >= array.get(zcInhB, sl) and z.tb <= array.get(zcInhT, sl)\n", "            if true\n"),
+    ("iFVG を FVG と同じ根拠 ID にする (分けない)", "    z.typ == 4 and z.inv ? 22 + z.tf : z.gid\n", "    z.gid\n"),
+    ("場所数 1 の系統へ、場所数によらず発生を入れる", "            if nPl == 1\n", "            if true\n"),
+    ("場所数 1 の系統へ、場所数によらず観察期間の集計を入れる", "    if ob.nPl == 1\n        f_zcAgg(r.c3, r.hist3, ob, h, ok)\n", "    if true\n        f_zcAgg(r.c3, r.hist3, ob, h, ok)\n"),
+    ("場所数 1 かつ接触中の系統へ、接触中でないイベントも入れる", "        if ob.onMask > 0\n            f_zcAgg(r.c4, r.hist4, ob, h, ok)\n", "        if true\n            f_zcAgg(r.c4, r.hist4, ob, h, ok)\n"),
     ("根拠数を Zone 本数にする", "        ZcRow row = f_zcRow(mask, nG)\n        st.oSeq += 1", "        ZcRow row = f_zcRow(mask, nRaw)\n        st.oSeq += 1"),
     ("助走中もイベントにする", "    else if not live\n        st.nPre += 1\n", "    else if false\n        st.nPre += 1\n"),
 ]
@@ -1466,8 +1519,8 @@ def static():
         b = t[t.index("f_feed(bool enabled, int lookback, int bins) =>"):]
         return a, b[:b.index("\n\n")]
     check("S 写し: ZD f_pocCore / f_feed は MtfPocFeedXAU.pine と同一 (off = 1)", pocblk(s) == pocblk(feed))
-    check("S 写し: ZE / ZF の入力と ZG 検知の入力 33 個は Lab と同一",
-          between(lab, 'var string G_ZE = ', '\nvar string G_ZG = ', False) in s and between(lab, 'var string G_ZG1 = ', '\nvar string G_TA = ', False).rstrip("\n") in s)
+    check("S 写し: ZE / ZF の入力と ZG 検知の入力 33 個は Lab と同一 (例外: ZF の 4 つの ON / OFF の初期値だけ ON。Lab は OFF)",
+          between(lab, 'var string G_ZE = ', '\nvar string G_ZG = ', False) in re.sub(r'(zfUse\d = input\.bool\()true,', r'\1false,', s) and len(re.findall(r'zfUse\d = input\.bool\(true,', s)) == 4 and between(lab, 'var string G_ZG1 = ', '\nvar string G_TA = ', False).rstrip("\n") in s)
     acc_req = re.findall(r'\[f(\d)u, f\1l, f\1i, f\1a\] = request\.security\(syminfo\.tickerid, "(\w+)", f_acConfirmed\(accumRangeLen, accumBaseLen, accumAtrLen,\s+'
                          r'accumMinUpperCloses, accumMinLowerCloses, accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax\),\s+lookahead = barmerge\.lookahead_on\)', code)
     piv_req = re.findall(r'\[s(\d)h, s\1ht, s\1l, s\1lt\] = request\.security\(syminfo\.tickerid, "(\w+)",\s+f_lbPivotConfirmed\(zcPiv\1\), lookahead = barmerge\.lookahead_on\)', code)
@@ -1493,20 +1546,26 @@ def static():
           not re.search(r"\brequest\.|\bta\.", lg) and not re.search(r"\w\[", lg) and "zcBase" not in s and "本数不足) の間は" not in s and "ZcObs.new(st.oSeq, time_close, c, dp," in lg)
     plots = re.findall(r'^plot\((.+?),\s+"([^"]+)"', code, re.M)
     ev = [p for p in plots if p[1].startswith("EV ")]
-    check("S plot 40 本 (上限 64)。EV 記録 35 本が zcOut の 0..34 の順 (順番・接触端側メンバーの列なし)。マスク (根拠 22 ビット・補助 19 ビット・辺 20 ビット) はどれも 2^24 未満",
-          "f_zcAux" in code and "z.typ == 6 ? (z.sub == 1 ? 14 : 17) + z.tf : -1" in code and "array.get(zcPow, 16 + z.tf)" in code and code.count("2097152)") == 1
+    check("S plot 40 本 (上限 64)。EV 記録 35 本が zcOut の 0..34 の順 (順番・接触端側メンバーの列なし)。マスク: 根拠 26 ビット (< 2^26)・補助 11 ビット・辺 20 ビット",
+          "f_zcAux" in code and "z.typ == 6 ? (z.sub == 1 ? 14 : 17) + z.tf : -1" in code and "array.get(zcPow, 8 + z.tf)" in code and code.count("33554432)") == 1 and "int   ZC_NG     = 26" in code and "z.typ == 4 and z.inv ? 22 + z.tf : z.gid" in code
           and len(plots) == 40 and len(re.findall(r"\bplot\(", code)) == 40 and "ob.ord" not in code and "nEv2" not in code and "場所の順番" not in code
           and [p[0] for p in ev] == [f"array.get(zcOut, {i})" for i in range(NF)] and f"int   ZC_NF     = {NF}" in code, f"{len(plots)} {len(ev)}")
     li, mi = ap.inputs(lab), ap.inputs(s)
     shared = [k for k in mi if k in li and re.match(r"(zHalf|zaUse|zaKeep|accum|zbUse|zbLen|zcUse|zcPiv|zdUse|zeUse|zfUse|zfMinW|zgUse|zgExp|zgHalf|zgRev|zg(Piv|Wave|Buf|Dist|Gap|Body|Ratio|Wait|Max|Dir|Sep))", k)]
-    check("S Zone の入力の初期値は ZoneComboLabXAU と同じ (共通幅 2・ZA 4H/D・ZB 両方・ZC D/W・ZD 4H/D/W・ZE 4H/D・ZF 全 OFF・ZG 1H/4H/D ほか 84 個)",
-          len(shared) == 84 and all(mi[k] == li[k] for k in shared) and mi["zcMax"] == 0 and mi["zcDepW"] == 5.0 and mi["zcDepMin"] == 30
+    check("S Zone の入力の初期値は ZoneComboLabXAU と同じ (共通幅 2・ZA 4H/D・ZB 両方・ZC D/W・ZD 4H/D/W・ZE 4H/D・ZG 1H/4H/D ほか 84 個。例外は ZF だけ: ここは全 ON、Lab は全 OFF)",
+          len(shared) == 84 and all(mi[k] == li[k] for k in shared if not k.startswith("zfUse")) and all(mi[f"zfUse{k}"] is True and li[f"zfUse{k}"] is False for k in (1, 2, 3, 4))
+          and mi["zcPlMode"] == "全件" and mi["zcMax"] == 0 and mi["zcDepW"] == 5.0 and mi["zcDepMin"] == 30
           and mi["vpBins"] == 75 and mi["zcWarm"] == 6000 and mi["zbWarm1"] == 1800 and mi["zcOnMode"] == "含める"
           and 'zcStart = input.time(timestamp("01 Jan 2020 00:00 +0000"), "集計開始日時 (タッチ足の確定時刻)"' in code
           and 'input.time(timestamp("01 Jan 2020 00:00 +0000"), "集計開始日時 (判定足の確定時刻)"' in read(os.path.join(ROOT, "PointMasterVerifierV2.pine")) and all(mi[f"zdLen{k}"] == 120 for k in (1, 2, 3, 4)), f"{len(shared)} {[k for k in shared if mi[k] != li[k]]}")
-    check("S ZE は LongFibWave の接続出力 13 系列を input.source で受信 (名前は LongFibWave の plot と同じ)",
-          all(f'input.source(close, "{n}"' in code and f'"{n}"' in read(os.path.join(ROOT, "LongFibWave.pine"))
-              for n in ["FIB protocol"] + [f"FIB {k} {x}" for k in ("4H", "日足") for x in ("起点", "終点", "方向", "波ID", "状態", "更新確定時刻")]))
+    lfw = read(os.path.join(ROOT, "LongFibWave.pine"))
+    lfw_titles = re.findall(r'^plot\(.+?, "(FIB [^"]+)", display = display\.none\)', lfw, re.M)        # the connection outputs, in order
+    src_titles = re.findall(r'^ze\w+ = input\.source\(close, "([^"]+)"', code, re.M)
+    doc = read(os.path.join(ROOT, "ZONE_CONFLUENCE_REACTION_XAU_ja.md"))
+    doc_rows = re.findall(r'^\| \d+ \| `([^`]+)` \| `([^`]+)` \|', doc, re.M)
+    check("S ZE は LongFibWave の接続出力 13 系列を input.source で受信。入力名 = LongFibWave の plot タイトル (LongFibWave.pine から取り出して照合、並びも同じ)。仕様書の対応表も同じ 13 行",
+          len(lfw_titles) == 13 and src_titles == lfw_titles and doc_rows == [(t, t) for t in lfw_titles]
+          and 'plot(lfwIs5m ? 20001 : na, "FIB protocol", display = display.none)' in lfw, f"{lfw_titles} {src_titles} {doc_rows}")
     check("S 方向・観察期間の選択肢は PointMasterVerifierV2 と同じ",
           'options = ["LONG / SHORT 別", "LONG＋SHORT合算", "LONGのみ", "SHORTのみ"]' in code and 'options = ["全期間", "5分", "15分", "30分"]' in code
           and all(x in read(os.path.join(ROOT, "PointMasterVerifierV2.pine")) for x in ('options = ["LONG / SHORT 別", "LONG＋SHORT合算", "LONGのみ", "SHORTのみ"]', 'options = ["全期間", "5分", "15分", "30分"]')))
