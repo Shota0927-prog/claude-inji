@@ -45,6 +45,9 @@ accumDriftMax        = input.float(0.30, "Accum ドリフト上限",          mi
 var string G_ZB = "02b · ZB MA (EMA)"
 zbUse1 = input.bool(true, "1分足 EMA", group = G_ZB)
 zbLen1 = input.int(3000, "1分足 EMA 本数", minval = 1, group = G_ZB)
+zbWarm1 = input.int(1800, "ZB-1m の助走本数 (5分足。0 = 無効)", minval = 0, group = G_ZB,
+     tooltip = "1分 EMA の有効値を受け取り始めてからこの本数 (5分足) の間は、未収束として ZB-1m を「不明」にする (Zone を作らず、不明の件数に数える)。\n" +
+     "初期値 1800 本 = 1分足 9000 本相当。ZB-5m は下の「先頭から集計しない助走本数」で扱う。")
 zbUse2 = input.bool(true, "5分足 EMA", group = G_ZB)
 zbLen2 = input.int(3000, "5分足 EMA 本数", minval = 1, group = G_ZB,
      tooltip = "帯 = EMA ± 共通幅。5分足 k の判定には足 k-1 が確定した時点の値を使う。ta.ema は先頭の足から値を返すので、読み込んだ履歴の先頭側は\n" +
@@ -179,6 +182,9 @@ zcHzMode  = input.string("全期間", "表示する観察期間", options = ["�
 zcTopN    = input.int(6, "根拠集合の表示行数 (件数の多い順。残りは「その他」)", minval = 1, maxval = 20, group = G_DS)
 zcShowBox = input.bool(true, "タッチした場所を描く (直近だけ)", group = G_DS)
 zcShowLbl = input.bool(false, "タッチ印 (方向と根拠数)", group = G_DS)
+zcOnMode  = input.string("含める", "接触中だった根拠を含むイベント", options = ["含める", "除く", "のみ"], group = G_DS,
+     tooltip = "タッチの前から接触中だった根拠を含むイベント (記録の状態フラグ 4096) を、表のすべての表示で 含める / 除く / それだけにする。\n" +
+     "価格が場所を離れていなくても、時間で離脱したメンバーへ再び触れるとこの種のイベントが周期的に出るため、分けて見られるようにしてある。")
 zcDrawMax = input.int(50, "描画を残す件数", minval = 1, maxval = 150, group = G_DS)
 
 // ---- ZA: Accum 検出 (ZoneComboLabXAU.pine の写し。tests/zcr_sim.py が元ファイルと照合) ---------------------------------
@@ -726,12 +732,13 @@ type ZcObs
     int og             // 接触端側のメンバー (上からなら上端が最も低い Zone、下からなら下端が最も高い Zone) の根拠 ID
     int rTop           // 場所の共通区間 C の上端 (ティック)
     int rBot
-    int edge           // 接触端 = C の、接近してきた側の端 (上からなら上端、下からなら下端)
+    int edge           // 接触端 = 始値で方向が決まった場合は C の接近側の端、直前終値で決まった場合 (始値が既に C の中) は始値
     int cPos           // タッチ足の終値の位置 0 C の手前 / 1 C の中 / 2 C の向こう側へ抜けた
     int ord            // 同じ足の中の場所の順番 (1, 2, …)
     int aux            // 補助マスク
-    int flags          // 512 / 1024 タッチ時に ZB-1m / ZB-5m が不明、2048 ZE が受信不正、4096 接触中だった根拠を含む
+    int flags          // 512 / 1024 タッチ時に ZB-1m / ZB-5m が不明、2048 ZE が受信不正、4096 接触中だった根拠を含む、8192 方向を直前終値で決めた
     int onMask         // タッチの前から接触中だったメンバーの根拠マスク
+    int side           // 辺マスク (ZA 上辺 / 下辺、ZC 高値線 / 安値線、ZG トップ / ボトム)
     array<int> rMin    // 反発幅ごとの初回到達分 (na = 未到達)
     array<int> aLo     // 到達前の最大逆行幅 下限 (ティック)
     array<int> aHi     // 同 上限
@@ -751,6 +758,9 @@ type ZcRow
     array<int> c       // (方向 [LONG 0 / SHORT 1] * 3 + 期間) * ZC_NS + 項目
     array<int> hist    // ((方向 * 3 + 期間) * 3 + 反発幅) * 30 + (初回到達分 - 1)
     array<int> ev      // 0 LONG イベント / 1 SHORT イベント / 2 方向不明
+    array<int> c2      // c / hist / ev と同じ並びで、「タッチの前から接触中だった根拠を含むイベント」だけの集計
+    array<int> hist2
+    array<int> ev2
 
 type ZcRec
     array<float> v
@@ -775,6 +785,7 @@ type ZcSt
     int   nMultiBar = 0      // 方向のある場所が 2 つ以上あった足 (集計対象の足)
     int   nPre     = 0       // 集計開始前・助走中のタッチ (継続中でない場所の数。イベントにしない)
     int   nMa1Ev   = 0       // タッチ時に ZB-1m が不明だったイベント
+    int   ma1N     = 0       // 1分 EMA の有効値を受け取った有効足の本数 (ZB-1m の助走)
     int   nMa5Ev   = 0       // タッチ時に ZB-5m が不明だったイベント
     int   nZeEv    = 0       // タッチ時に ZE が受信不正だったイベント
     int   rowOver  = 0
@@ -785,7 +796,7 @@ type ZcSt
 int   ZC_NG     = 22
 int   ZC_NS     = 21         // 0 計測可能 / 1 計測不能 / 2-4 到達 / 5-7 到達分の合計 / 8 MFE 合計 / 9 MAE 合計 /
                              // 10-12 到達前逆行 下限の合計 / 13-15 上限の合計 / 16-18 順序不明 / 19 評価待ち / 20 計測可能のうち本数不足
-int   ZC_NF     = 36         // イベント記録の項目数
+int   ZC_NF     = 37         // イベント記録の項目数
 int   ZC_MAXROW = 300        // 根拠集合の行数上限
 int   ZC_M1     = 60000
 float EPS       = 1e-7
@@ -830,6 +841,8 @@ var array<int>    zcWhy   = array.new_int(3, 0)         // 計測不能にした
 var array<LbZone> zcT     = array.new<LbZone>()         // 作業用: この足でタッチした Zone
 var array<int>    zcPL    = array.new_int(0)            // 作業用: この足の場所の共通区間 C の下端・上端 (価格の低い順)
 var array<int>    zcPH    = array.new_int(0)
+var array<int>    zcUL    = array.new_int(0)            // 作業用: 場所のメンバーの帯そのものの共通区間 U (切り詰めない) の下端・上端
+var array<int>    zcUH    = array.new_int(0)
 
 // この足の出力 (毎足作り直す)
 array<float> zcOut   = array.new_float(ZC_NF, na)       // この足で出力するイベント記録 (なければ全部 na)
@@ -839,7 +852,7 @@ array<int>   zcEvBot = array.new_int(0)
 array<int>   zcEvD   = array.new_int(0)
 array<int>   zcEvN   = array.new_int(0)
 
-array<int> zcPow = array.from(1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152, 4194304, 8388608, 16777216, 33554432, 67108864, 134217728, 268435456, 536870912, 1073741824, 2147483648, 4294967296, 8589934592, 17179869184, 34359738368, 68719476736, 137438953472, 274877906944)
+array<int> zcPow = array.from(1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152)
 array<int> zcWin = array.from(5, 15, 30)
 array<int> zcNrm = array.from(1, 3, 6)                  // 観察期間の通常の本数
 
@@ -1156,7 +1169,7 @@ f_swAdd(int k, int sub, float pv, int pt) =>
     true
 
 f_zcRowNew(int mask, int cnt) =>
-    ZcRow.new(mask, cnt, array.new_int(6 * ZC_NS, 0), array.new_int(540, 0), array.new_int(3, 0))
+    ZcRow.new(mask, cnt, array.new_int(6 * ZC_NS, 0), array.new_int(540, 0), array.new_int(3, 0), array.new_int(6 * ZC_NS, 0), array.new_int(540, 0), array.new_int(3, 0))
 
 // 根拠集合の行 (なければ作る。行数上限を超えたら「上限超過」行)
 f_zcRow(int mask, int cnt) =>
@@ -1173,30 +1186,48 @@ f_zcRow(int mask, int cnt) =>
     r
 
 // 観察期間 h の結果を 1 行へ集計 (ok = 計測可能 / false = 計測不能)
-f_zcAggRow(ZcRow r, ZcObs ob, int h, bool ok) =>
+f_zcAgg(array<int> rc, array<int> rh, ZcObs ob, int h, bool ok) =>
     int dh   = (ob.d == 1 ? 0 : 1) * 3 + h
     int base = dh * ZC_NS
-    f_inc(r.c, base + 19, -1)
+    f_inc(rc, base + 19, -1)
     if not ok
-        f_inc(r.c, base + 1, 1)
+        f_inc(rc, base + 1, 1)
     else
-        f_inc(r.c, base, 1)
+        f_inc(rc, base, 1)
         if ob.nb < array.get(zcNrm, h)
-            f_inc(r.c, base + 20, 1)
-        f_inc(r.c, base + 8, ob.mfe)
-        f_inc(r.c, base + 9, ob.mae)
+            f_inc(rc, base + 20, 1)
+        f_inc(rc, base + 8, ob.mfe)
+        f_inc(rc, base + 9, ob.mae)
         for j = 0 to 2
             int rm = array.get(ob.rMin, j)
             if not na(rm)
                 int al = array.get(ob.aLo, j)
                 int ah = array.get(ob.aHi, j)
-                f_inc(r.c, base + 2 + j, 1)
-                f_inc(r.c, base + 5 + j, rm)
-                f_inc(r.c, base + 10 + j, al)
-                f_inc(r.c, base + 13 + j, ah)
+                f_inc(rc, base + 2 + j, 1)
+                f_inc(rc, base + 5 + j, rm)
+                f_inc(rc, base + 10 + j, al)
+                f_inc(rc, base + 13 + j, ah)
                 if al != ah
-                    f_inc(r.c, base + 16 + j, 1)
-                f_inc(r.hist, (dh * 3 + j) * 30 + rm - 1, 1)
+                    f_inc(rc, base + 16 + j, 1)
+                f_inc(rh, (dh * 3 + j) * 30 + rm - 1, 1)
+    true
+
+// 行への集計は 2 系統: 全イベント (c / hist) と、接触中だった根拠を含むイベントだけ (c2 / hist2)
+f_zcAggRow(ZcRow r, ZcObs ob, int h, bool ok) =>
+    f_zcAgg(r.c, r.hist, ob, h, ok)
+    if ob.onMask > 0
+        f_zcAgg(r.c2, r.hist2, ob, h, ok)
+    true
+
+// イベントの発生を行へ入れる (イベント数と、3 つの観察期間の評価待ち)
+f_zcRowNewEv(ZcRow r, int di, bool hadOn) =>
+    f_inc(r.ev, di, 1)
+    if hadOn
+        f_inc(r.ev2, di, 1)
+    for hh = 0 to 2
+        f_inc(r.c, (di * 3 + hh) * ZC_NS + 19, 1)
+        if hadOn
+            f_inc(r.c2, (di * 3 + hh) * ZC_NS + 19, 1)
     true
 
 // 観察期間 h を確定 (計測可能 / 計測不能)。集合の行・根拠数別の行・全体の行へ入れる
@@ -1251,6 +1282,7 @@ f_zcFinal(ZcObs ob) =>
                 fl += array.get(zcPow, 3 + hh)
     array.set(v, 34, fl)
     array.set(v, 35, ob.onMask)
+    array.set(v, 36, ob.side)
     array.push(zcQ, ZcRec.new(v))
     st.nDone += 1
     true
@@ -1325,26 +1357,33 @@ f_zcMaSet(int k, bool use, float v) =>
             f_inc(zcMaUnk, k, 1)
     true
 
-// 補助マスクのビット番号 (-1 = なし): ZE 水準 0-7 (4H 0.236 / 0.382 / 0.5 / 0.618、D 同)、iFVG 8-11 (1H 4H D W)、FVG 12-15、
-//  ZA 上辺 19-21 (1H 4H D) / 下辺 22-24、ZC 高値線 25-28 (1H 4H D W) / 安値線 29-32、ZG トップ 33-35 (1H 4H D) / ボトム 36-38。
+// 補助マスクのビット番号 (-1 = なし): ZE 水準 0-7 (4H 0.236 / 0.382 / 0.5 / 0.618、D 同)、iFVG 8-11 (1H 4H D W)、FVG 12-15。
 //  ZG トリプルは別に 16-18 (f_zcPlace で足す)
 f_zcAux(LbZone z) =>
-    z.typ == 5 ? z.tf * 4 + z.lv : z.typ == 4 ? (z.inv ? 8 : 12) + z.tf : z.typ == 0 ? (z.sub == 1 ? 19 : 22) + z.tf : z.typ == 2 ? (z.sub == 1 ? 25 : 29) + z.tf : z.typ == 6 ? (z.sub == 1 ? 33 : 36) + z.tf : -1
+    z.typ == 5 ? z.tf * 4 + z.lv : z.typ == 4 ? (z.inv ? 8 : 12) + z.tf : -1
 
-// 場所の接近方向 (C = [pLo, pHi])。始値が C の上 = 上から (1) / 下 = 下から (-1) / C の中 = 直前の有効な足の終値の位置 / それも C の中・不明 = 0
-f_zcDir(int pLo, int pHi, int o) =>
-    o > pHi ? 1 : o < pLo ? -1 : not st.pcOk ? 0 : st.pC > pHi ? 1 : st.pC < pLo ? -1 : 0
+// 辺マスクのビット番号 (-1 = なし): ZA 上辺 0-2 (1H 4H D) / 下辺 3-5、ZC 高値線 6-9 (1H 4H D W) / 安値線 10-13、ZG トップ 14-16 (1H 4H D) / ボトム 17-19
+f_zcSide(LbZone z) =>
+    z.typ == 0 ? (z.sub == 1 ? 0 : 3) + z.tf : z.typ == 2 ? (z.sub == 1 ? 6 : 10) + z.tf : z.typ == 6 ? (z.sub == 1 ? 14 : 17) + z.tf : -1
+
+// 場所の接近方向。C = [pLo, pHi] (足の高安で切り詰めた共通区間)、U = [uLo, uHi] (メンバーの帯そのものの共通区間)。
+//  始値が C の上 = 上から (1) / 下 = 下から (-1)。始値が C の中のときは直前の有効な足の終値を U と比べる:
+//  U の上 = 上から / U の下 = 下から / U の中・不明 = 方向不明 (0)。足の高安で切り詰めた C とは比べない
+//  (帯の中に居続けた価格の小さなギャップを「上から / 下から」にしないため)。
+f_zcDir(int pLo, int pHi, int uLo, int uHi, int o) =>
+    o > pHi ? 1 : o < pLo ? -1 : not st.pcOk ? 0 : st.pC > uHi ? 1 : st.pC < uLo ? -1 : 0
 
 // 場所 1 つ (共通区間 C = [pLo, pHi]、接近方向 dp)。メンバー = この足でタッチした Zone のうち帯が pLo を含むもの (全員が C 全体を含む)。
 //  メンバー全員が (この足の前から) 接触中なら継続中 (イベントにしない)。そうでなければ、集計開始前・助走中は件数だけ、
 //  dp = 0 は方向不明として別計上、それ以外はイベント (接触中だったメンバーの根拠は onMask に残す)。
-f_zcPlace(int pLo, int pHi, int dp, int c, int ord, bool live) =>
+f_zcPlace(int pLo, int pHi, int dp, int o, int c, int ord, bool live) =>
     bool allOn  = true
     int  nRaw   = 0
     int  mask   = 0
     int  nG     = 0
     int  aux    = 0
     int  onMask = 0
+    int  side   = 0
     LbZone ze0  = na
     for q = 0 to array.size(zcT) - 1
         LbZone z = array.get(zcT, q)
@@ -1365,6 +1404,10 @@ f_zcPlace(int pLo, int pHi, int dp, int c, int ord, bool live) =>
             if z.typ == 6 and z.infoA == 3
                 if not f_has(aux, array.get(zcPow, 16 + z.tf))
                     aux += array.get(zcPow, 16 + z.tf)
+            int si = f_zcSide(z)
+            if si >= 0
+                if not f_has(side, array.get(zcPow, si))
+                    side += array.get(zcPow, si)
             if na(ze0)
                 ze0 := z
             else if dp == -1 ? (z.tb > ze0.tb or (z.tb == ze0.tb and z.id < ze0.id)) : (z.tt < ze0.tt or (z.tt == ze0.tt and z.id < ze0.id))
@@ -1398,20 +1441,18 @@ f_zcPlace(int pLo, int pHi, int dp, int c, int ord, bool live) =>
             st.nEvOn += 1
         if array.indexof(zrMask, mask) < 0
             st.rowOver += 1
-        int edge = dp == 1 ? pHi : pLo
+        // 接触端: 始値で方向が決まった (始値が C の外) なら C の接近側の端。直前終値で決まった (始値が既に C の中) なら始値
+        bool byPc = o <= pHi and o >= pLo
+        int  edge = byPc ? o : dp == 1 ? pHi : pLo
         int cPos = dp == 1 ? (c > pHi ? 0 : c >= pLo ? 1 : 2) : (c < pLo ? 0 : c <= pHi ? 1 : 2)
         ZcObs ob = ZcObs.new(st.oSeq, time_close, c, dp, mask, nG, nRaw, ze0.gid, pHi, pLo, edge, cPos, ord, aux,
-             (u1 ? 512 : 0) + (u5 ? 1024 : 0) + (ue ? 2048 : 0) + (onMask > 0 ? 4096 : 0), onMask,
+             (u1 ? 512 : 0) + (u5 ? 1024 : 0) + (ue ? 2048 : 0) + (onMask > 0 ? 4096 : 0) + (byPc ? 8192 : 0), onMask, side,
              array.new_int(3, na), array.new_int(3, na), array.new_int(3, na), array.new_int(3, 0), array.new_int(3, na), array.new_int(3, na), array.new_int(3, 0))
         array.push(zcPend, ob)
         int di = dp == 1 ? 0 : 1
-        f_inc(row.ev, di, 1)
-        f_inc(rs.ev, di, 1)
-        f_inc(ra.ev, di, 1)
-        for hh = 0 to 2
-            f_inc(row.c, (di * 3 + hh) * ZC_NS + 19, 1)
-            f_inc(rs.c, (di * 3 + hh) * ZC_NS + 19, 1)
-            f_inc(ra.c, (di * 3 + hh) * ZC_NS + 19, 1)
+        f_zcRowNewEv(row, di, onMask > 0)
+        f_zcRowNewEv(rs, di, onMask > 0)
+        f_zcRowNewEv(ra, di, onMask > 0)
         array.push(zcEvT, time_close)
         array.push(zcEvTop, pHi)
         array.push(zcEvBot, pLo)
@@ -1424,13 +1465,15 @@ f_zcPlace(int pLo, int pHi, int dp, int c, int ord, bool live) =>
 //  (2) 場所 = 共通の価格点を持つ Zone の極大集合 (区間グラフの極大クリーク)。切り詰めた区間の下端 p を低い順に見て、
 //      S(p) = p を含む Zone の集合、その上端の最小 mh とすると、次に高い下端 p2 が無い、または mh < p2 のとき S(p) は極大
 //      (mh >= p2 なら S(p) は S(p2) に含まれる)。共通区間 C = [p, mh]。接する (端点一致) は重なり。C は価格の低い順に並ぶ。
-//  (3) 場所の接近方向は C で決める (f_zcDir)。順番: 上からの場所を C の上端が高い順 → 下からの場所を C の下端が低い順 →
+//  (3) 場所の接近方向は始値と C、始値が C の中なら直前終値と U (メンバーの帯そのものの共通区間) で決める (f_zcDir)。順番: 上からの場所を C の上端が高い順 → 下からの場所を C の下端が低い順 →
 //      方向不明の場所を C の上端が高い順。ord は方向のある場所だけに付ける。
 //  (4) 接触中の印はこの足の全部の場所を判定した後に付ける (判定はこの足の前の状態で行う)。
 f_zcTouch(int o, int h, int l, int c, bool live) =>
     array.clear(zcT)
     array.clear(zcPL)
     array.clear(zcPH)
+    array.clear(zcUL)
+    array.clear(zcUH)
     int n = array.size(zxBot)
     int i = f_zcLower(l - st.maxW)
     while i < n and array.get(zxBot, i) <= h
@@ -1464,6 +1507,9 @@ f_zcTouch(int o, int h, int l, int c, bool live) =>
                 bool fn2 = false
                 int  p2  = 0
                 int  mh  = h
+                bool fu  = false
+                int  uL  = 0
+                int  uH  = 0
                 for q = 0 to nT - 1
                     LbZone z = array.get(zcT, q)
                     int lo = math.max(z.tb, l)
@@ -1472,9 +1518,14 @@ f_zcTouch(int o, int h, int l, int c, bool live) =>
                         fn2 := true
                     if z.tb <= p and z.tt >= p
                         mh := math.min(mh, z.tt)
+                        uL := fu ? math.max(uL, z.tb) : z.tb
+                        uH := fu ? math.min(uH, z.tt) : z.tt
+                        fu := true
                 if not fn2 or mh < p2
                     array.push(zcPL, p)
                     array.push(zcPH, mh)
+                    array.push(zcUL, uL)
+                    array.push(zcUH, uH)
                 cur := p
         int nP = array.size(zcPL)
         for ps = 0 to 2
@@ -1483,10 +1534,10 @@ f_zcTouch(int o, int h, int l, int c, bool live) =>
                 int q   = dp == -1 ? k : nP - 1 - k
                 int pLo = array.get(zcPL, q)
                 int pHi = array.get(zcPH, q)
-                if f_zcDir(pLo, pHi, o) == dp
+                if f_zcDir(pLo, pHi, array.get(zcUL, q), array.get(zcUH, q), o) == dp
                     if dp != 0
                         nPl += 1
-                    f_zcPlace(pLo, pHi, dp, c, nPl, live)
+                    f_zcPlace(pLo, pHi, dp, o, c, nPl, live)
         for q = 0 to nT - 1
             f_zcSetOn(array.get(zcT, q))
     int pend1 = array.size(zcPend)
@@ -1562,7 +1613,13 @@ if hlRun and barstate.isconfirmed
     else
         // ---- (2) タッチ → 離脱。Zone は足 k-1 の処理が終わった時点のもの。ZB の帯は足 k-1 確定時点の EMA。
         //      集計開始日時より前・先頭の助走本数の間はイベントを作らない (Zone と接触中の状態は通常どおり更新) ------------
-        f_zcMaSet(0, zbUse1, zbP1)
+        // ZB-1m の助走: 1分 EMA の有効値を受け取り始めてから「ZB-1m の助走本数」本の間は未収束として不明にする
+        float v1 = na
+        if not na(zbP1)
+            st.ma1N += 1
+            if st.ma1N > zbWarm1
+                v1 := zbP1
+        f_zcMaSet(0, zbUse1, v1)
         f_zcMaSet(1, zbUse2, zbP5)
         f_zcTouch(oT, hT, lT, cT, time_close >= zcStart and st.nBars >= zcWarm)
         f_zcDep(hT, lT)
@@ -1860,22 +1917,30 @@ f_setName(int mask) =>
 f_gUse(int g) =>
     g < 3 ? f_zaUse(g) : g < 5 ? f_zbUse(g - 3) : g < 9 ? f_zcUse(g - 5) : g < 13 ? f_zdUse(g - 9) : g < 15 ? f_zeUse(g - 13) : g < 19 ? f_zfUse(g - 15) : f_zgUse(g - 19)
 
+// 「接触中だった根拠を含むイベント」の選択 (含める = 全イベント / のみ = 2 系統目 / 除く = 全イベント − 2 系統目)
+f_pick(array<int> a, array<int> a2, int ix) =>
+    zcOnMode == "のみ" ? array.get(a2, ix) : zcOnMode == "除く" ? array.get(a, ix) - array.get(a2, ix) : array.get(a, ix)
+
 // 行 r の集計項目 s を方向の選択 dm で合算
 f_v(ZcRow r, string dm, int h, int s) =>
     int v = 0
     if dm != "SHORTのみ"
-        v += array.get(r.c, h * ZC_NS + s)
+        v += f_pick(r.c, r.c2, h * ZC_NS + s)
     if dm != "LONGのみ"
-        v += array.get(r.c, (3 + h) * ZC_NS + s)
+        v += f_pick(r.c, r.c2, (3 + h) * ZC_NS + s)
     v
 
 f_hv(ZcRow r, string dm, int h, int j, int m) =>
     int v = 0
     if dm != "SHORTのみ"
-        v += array.get(r.hist, (h * 3 + j) * 30 + m - 1)
+        v += f_pick(r.hist, r.hist2, (h * 3 + j) * 30 + m - 1)
     if dm != "LONGのみ"
-        v += array.get(r.hist, ((3 + h) * 3 + j) * 30 + m - 1)
+        v += f_pick(r.hist, r.hist2, ((3 + h) * 3 + j) * 30 + m - 1)
     v
+
+// 行 r のイベント数 (di 0 LONG / 1 SHORT。選択を適用)
+f_ev(ZcRow r, int di) =>
+    f_pick(r.ev, r.ev2, di)
 
 // 初回到達分の中央値 (到達した件数が偶数なら中央 2 件の平均)
 f_med(ZcRow r, string dm, int h, int j) =>
@@ -1903,6 +1968,11 @@ f_rowMerge(ZcRow dst, ZcRow src) =>
         array.set(dst.hist, i, array.get(dst.hist, i) + array.get(src.hist, i))
     for i = 0 to array.size(src.ev) - 1
         array.set(dst.ev, i, array.get(dst.ev, i) + array.get(src.ev, i))
+        array.set(dst.ev2, i, array.get(dst.ev2, i) + array.get(src.ev2, i))
+    for i = 0 to array.size(src.c2) - 1
+        array.set(dst.c2, i, array.get(dst.c2, i) + array.get(src.c2, i))
+    for i = 0 to array.size(src.hist2) - 1
+        array.set(dst.hist2, i, array.get(dst.hist2, i) + array.get(src.hist2, i))
     true
 
 f_pct(int a, int n) =>
@@ -1988,7 +2058,7 @@ if barstate.islast
                 array<int> keyv = array.new_int(nSet, 0)
                 for i = 0 to nSet - 1
                     ZcRow r0 = array.get(zrRow, i)
-                    array.set(keyv, i, (array.get(r0.ev, 0) + array.get(r0.ev, 1)) * (ZC_MAXROW + 1) + (ZC_MAXROW - i))
+                    array.set(keyv, i, (f_ev(r0, 0) + f_ev(r0, 1)) * (ZC_MAXROW + 1) + (ZC_MAXROW - i))
                 array<int> ord = array.sort_indices(keyv, order.descending)
                 for q = 0 to nSet - 1
                     ZcRow r1 = array.get(zrRow, array.get(ord, q))
@@ -2027,21 +2097,22 @@ if barstate.islast
              (array.get(lbZeStat, 0) == 9 or array.get(lbZeStat, 1) == 9 ? "  ← 設定の「FIB …」13 項目に LongFibWave の同じ名前の系列を選んでください (使わないなら「ZE フィボを検知」を OFF)" : "") +
              "   ZD POC: 1H " + f_zdName(array.get(lbZdStat, 0)) + " / 4H " + f_zdName(array.get(lbZdStat, 1)) + " / D " + f_zdName(array.get(lbZdStat, 2)) + " / W " + f_zdName(array.get(lbZdStat, 3)) +
              "   FVG → iFVG " + str.tostring(st.nIfvg) + " / iFVG 無効 " + str.tostring(st.nFvgDead))
-        array.push(notes, "集計開始前・助走中のタッチ (イベントにしない) " + str.tostring(st.nPre) + " 回 (助走 " + str.tostring(zcWarm) + " 本・開始 " + f_tm(zcStart) + ")   不正足 " + str.tostring(st.nBad) + " 本   計測不能にした観察期間: 足 0 本 " + str.tostring(array.get(zcWhy, 0)) + " / 不正足 " + str.tostring(array.get(zcWhy, 1)) +
+        array.push(notes, "集計開始前・助走中のタッチ (イベントにしない) " + str.tostring(st.nPre) + " 回 (助走 " + str.tostring(zcWarm) + " 本・開始 " + f_tm(zcStart) + "・ZB-1m の助走 " + str.tostring(zbWarm1) + " 本)   不正足 " + str.tostring(st.nBad) + " 本   計測不能にした観察期間: 足 0 本 " + str.tostring(array.get(zcWhy, 0)) + " / 不正足 " + str.tostring(array.get(zcWhy, 1)) +
              "   イベント記録 (EV plot): 出力済み " + str.tostring(st.nOut) + " 件・未出力 " + str.tostring(array.size(zcQ)) + " 件 (1 足 1 件ずつ)" + (st.rowOver > 0 ? "   行数上限超過 " + str.tostring(st.rowOver) + " 件" : ""))
         array.push(notes, "銘柄 " + syminfo.tickerid + "  確定 5分足 " + str.tostring(st.nBars) + " 本  " + f_tm(st.firstT) + " ～ " + f_tm(st.lastT) + " (Asia/Tokyo)   共通幅 ±$" + str.tostring(zHalf) +
              "  離脱 $" + str.tostring(zcDepT * syminfo.mintick, format.mintick) + " / " + str.tostring(zcDepMin) + " 分。履歴上の頻度で将来を保証しない")
         int nNote = array.size(notes)
 
         if zcView == "件数内訳"
-            zcTbl := table.new(position.top_right, 10, 2 + math.max(nD, 1) + nNote, border_width = 1)
-            f_note(zcTbl, 0, 10, "ZCR-XAU 件数内訳 (タッチ足確定後の反応。LONG = 上からのタッチ / SHORT = 下からのタッチ)")
-            array<string> hd = array.from("根拠集合", "根拠数", "LONG イベント", "SHORT イベント", "方向不明", "計測可能 5 / 15 / 30 分", "うち本数不足 5 / 15 / 30 分", "計測不能 5 / 15 / 30 分", "待ち 5 / 15 / 30 分", "到達前逆行の順序不明 $5 / $10 / $15 (30 分)")
-            for c = 0 to 9
+            zcTbl := table.new(position.top_right, 11, 2 + math.max(nD, 1) + nNote, border_width = 1)
+            f_note(zcTbl, 0, 11, "ZCR-XAU 件数内訳 (タッチ足確定後の反応。LONG = 上からのタッチ / SHORT = 下からのタッチ。接触中だった根拠を含むイベント: " + zcOnMode + ")")
+            array<string> hd = array.from("根拠集合", "根拠数", "LONG イベント", "SHORT イベント", "方向不明", "計測可能 5 / 15 / 30 分", "うち本数不足 5 / 15 / 30 分", "計測不能 5 / 15 / 30 分", "待ち 5 / 15 / 30 分", "到達前逆行の順序不明 $5 / $10 / $15 (30 分)",
+                 "うち接触中だった根拠を含む (LONG / SHORT。表示の選択によらない)")
+            for c = 0 to 10
                 f_cell(zcTbl, c, 1, array.get(hd, c), ZC_HEAD)
             int row = 2
             if nD == 0
-                f_note(zcTbl, row, 10, "イベントはまだありません")
+                f_note(zcTbl, row, 11, "イベントはまだありません")
                 row += 1
             else
                 for i = 0 to nD - 1
@@ -2049,8 +2120,9 @@ if barstate.islast
                     string dm = "LONG＋SHORT合算"
                     f_cell(zcTbl, 0, row, array.get(dName, i), ZC_BG)
                     f_cell(zcTbl, 1, row, r.cnt > 0 and zcKind != "根拠数別" ? str.tostring(r.cnt) : "", ZC_BG)
-                    f_cell(zcTbl, 2, row, str.tostring(array.get(r.ev, 0)), ZC_BG)
-                    f_cell(zcTbl, 3, row, str.tostring(array.get(r.ev, 1)), ZC_BG)
+                    f_cell(zcTbl, 2, row, str.tostring(f_ev(r, 0)), ZC_BG)
+                    f_cell(zcTbl, 3, row, str.tostring(f_ev(r, 1)), ZC_BG)
+                    f_cell(zcTbl, 10, row, str.tostring(array.get(r.ev2, 0)) + " / " + str.tostring(array.get(r.ev2, 1)), ZC_BG)
                     f_cell(zcTbl, 4, row, str.tostring(array.get(r.ev, 2)), ZC_BG)
                     f_cell(zcTbl, 5, row, str.tostring(f_v(r, dm, 0, 0)) + " / " + str.tostring(f_v(r, dm, 1, 0)) + " / " + str.tostring(f_v(r, dm, 2, 0)), ZC_BG)
                     f_cell(zcTbl, 6, row, str.tostring(f_v(r, dm, 0, 20)) + " / " + str.tostring(f_v(r, dm, 1, 20)) + " / " + str.tostring(f_v(r, dm, 2, 20)), ZC_BG)
@@ -2059,13 +2131,13 @@ if barstate.islast
                     f_cell(zcTbl, 9, row, str.tostring(f_v(r, dm, 2, 16)) + " / " + str.tostring(f_v(r, dm, 2, 17)) + " / " + str.tostring(f_v(r, dm, 2, 18)), ZC_BG)
                     row += 1
             for m = 0 to nNote - 1
-                f_note(zcTbl, row + m, 10, array.get(notes, m))
+                f_note(zcTbl, row + m, 11, array.get(notes, m))
         else
             bool split = zcDirMode == "LONG / SHORT 別"
             int  nDir  = split ? 2 : 1
             int  nHz   = zcHzMode == "全期間" ? 3 : 1
             zcTbl := table.new(position.top_right, 10, 2 + math.max(nD * nDir * nHz, 1) + nNote, border_width = 1)
-            f_note(zcTbl, 0, 10, "ZCR-XAU " + zcView + " (タッチ足確定後の反応。タッチ足の中の反発は含まない。LONG = 上からのタッチ / SHORT = 下からのタッチ)")
+            f_note(zcTbl, 0, 10, "ZCR-XAU " + zcView + " (タッチ足確定後の反応。タッチ足の中の反発は含まない。LONG = 上からのタッチ / SHORT = 下からのタッチ。接触中だった根拠を含むイベント: " + zcOnMode + ")")
             array<string> hd = array.from("根拠集合", "方向", "期間", "計測可能", "うち本数不足", "計測不能", "待ち", "", "", "")
             if zcView == "到達率"
                 array.set(hd, 7, "$5 到達 件数 (率)")
@@ -2143,6 +2215,7 @@ plot(array.get(zcOut, 32), "EV 期間内の足 15分",        display = display.
 plot(array.get(zcOut, 33), "EV 期間内の足 30分",        display = display.data_window)
 plot(array.get(zcOut, 34), "EV 状態フラグ",            display = display.data_window)
 plot(array.get(zcOut, 35), "EV 接触中だった根拠マスク",   display = display.data_window)
+plot(array.get(zcOut, 36), "EV 辺マスク",              display = display.data_window)
 plot(array.size(zcQ),      "未出力のイベント記録",       display = display.data_window)
 plot(st.nEv,               "イベント数 (方向あり・累計)", display = display.data_window)
 plot(array.size(zcPend),   "追跡中の観測",             display = display.data_window)
