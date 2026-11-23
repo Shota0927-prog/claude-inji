@@ -15,6 +15,8 @@ the previous bar (zbP1 / zbP5), the higher-TF feeds of ZA (f{k}u/l/i/a), ZC (s{k
      pending windows, exact-match rows, summary rows, FIFO output
   K. causality: a run on the first half == the first half of the full run, also when the second half is replaced
   X. mutations of the logic that the oracle comparison must catch
+  D. the table numbers / texts of the "ZCR Display calc" section == the old table calculation of 47ebe23 (taken from git, same translator)
+  R. the table drawing code itself run on a mock table API (bounds, vertical merges only, rows, columns, short cells)
 
 Evidence class: PINE_NOT_VERIFIED (no TradingView compiler / replay here; request.* semantics are not reproduced).
 """
@@ -1421,12 +1423,339 @@ def causality(bars, ov):
     late = all(tcs[i] > rec[1] * 1000 for i, rec in full.out)
     check("K 記録の出力はタッチ足より後 (観察した足の確定後)", late and len(full.out) > 10)
     check("B 同じ系列の再実行で結果一致", Runner(ov).run(bars).snapshot() == full.snapshot())
-    disp = dict(ov, zcView="件数内訳", zcKind="根拠数別", zcDirMode="LONGのみ", zcHzMode="5分", zcTopN=1, zcShowBox=False, zcShowLbl=True, zcDrawMax=1)
+    disp = dict(ov, zcView="詳細: 件数内訳", zcKind="根拠数別", zcDirMode="LONGのみ", zcHzMode="5分", zcPerPage=1, zcPage=3, zcTxtSize="large", zcPos="bottom_left",
+                zcShowBox=False, zcShowLbl=True, zcDrawMax=1)
     check("B 表示の設定を変えても集計・記録は同じ", Runner(disp).run(bars).snapshot() == full.snapshot())
     off = Runner(dict(ov, zcUse3=False, zbUse1=False, zgUse1=False, zfUse2=False, zeUse4=False)).run(bars)
     bits = G["ZC-D"] + G["ZB-1m"] + G["ZG-1H"] + G["ZF-FVG-4H"] + G["ZE-4H"]
     check("B 根拠 ID を OFF にするとその根拠は登録も集合にも現れない", [off["zcNZone"][g] for g in (7, 19, 16, 13)] == [0, 0, 0, 0]
           and all(not (m & bits) for m in off.rows()) and len(off.rows()) > 2)
+
+
+DISP_REV = "47ebe23"         # ZCR-5: the last version with the old table (f_pick / f_v / f_med, top N + その他, merged note cells)
+DBEGIN, DEND = "// ==== ZCR Display calc (begin) ", "// ==== ZCR Display calc (end) "
+DMS = ["LONGのみ", "SHORTのみ", "LONG＋SHORT合算"]
+SEL = [(one, on) for one in (False, True) for on in ("含める", "のみ", "除く")]
+
+
+def pine_tostring(x, fmt=None):
+    """str.tostring with the "0.0" / "0.00" formats (half away from zero); the same function serves the old and the new code"""
+    if x is None:
+        return "NaN"
+    if fmt in ("0.0", "0.00"):
+        nd = len(fmt) - 2
+        v = math.floor(abs(x) * 10 ** nd + 0.5 + 1e-9) / 10 ** nd
+        return ("-" if x < 0 and v != 0 else "") + f"{v:.{nd}f}"
+    if isinstance(x, float) and x.is_integer():
+        return str(int(x))
+    return str(x)
+
+
+def display_ns(r, src):
+    """the new "ZCR Display calc" section translated and run in the environment of a finished run r"""
+    ns = r.env
+    ns.update(str__tostring=pine_tostring, order=type("order", (), {"descending": "desc", "ascending": "asc"}),
+              array__sort_indices=lambda a, o: sorted(range(len(a)), key=lambda i: a[i], reverse=(o == "desc")))
+    code = src[src.index("\n", src.index(DBEGIN)) + 1:src.index(DEND)]
+    exec(compile(ap.Translator(known_types={"ZcRow"}).translate(ap.logical_lines(code)), "<ZCR display calc>", "exec"), ns)
+    return ns
+
+
+def old_display_ns(r, old):
+    """the old (47ebe23) table calculation, translated from its own text: ZC_GN + f_setName, and f_arr .. f_avgUsd
+    (f_arr / f_pick / f_v / f_hv / f_ev / f_med / f_addArr / f_rowMerge / f_pct / f_avgUsd). f_pick reads the globals zcPlMode / zcOnMode."""
+    ns = dict(r.env)
+    a = old[old.index("array<string> ZC_GN = "):old.index("f_gUse(int g) =>")]
+    b = old[old.index("f_arr(ZcRow r, int kind, bool one, bool onOnly) =>"):old.index("f_tm(int t) =>")]
+    exec(compile(ap.Translator(known_types={"ZcRow"}).translate(ap.logical_lines(a + "\n" + b)), "<ZCR old display>", "exec"), ns)
+    return ns
+
+
+def old_rows(o, topn):
+    """the old row list of the set view (the block under barstate.islast in 47ebe23, re-stated): top N by events, the rest + the
+    over-cap row merged into "その他"."""
+    e = o
+    n = len(e["zrRow"])
+    keyv = [(e["f_ev"](rr, 0) + e["f_ev"](rr, 1)) * (e["ZC_MAXROW"] + 1) + (e["ZC_MAXROW"] - i) for i, rr in enumerate(e["zrRow"])]
+    ordv = sorted(range(n), key=lambda i: -keyv[i])
+    shown = [e["zrRow"][i] for i in ordv[:topn]]
+    rest = e["f_zcRowNew"](0, 0)
+    nrest = 0
+    for i in ordv[topn:]:
+        e["f_rowMerge"](rest, e["zrRow"][i])
+        nrest += 1
+    over = e["zrSum"][4]
+    if over.ev[0] + over.ev[1] + over.ev[2] > 0:
+        e["f_rowMerge"](rest, over)
+        nrest += 1
+    return shown, (rest if nrest > 0 else None), nrest
+
+
+def display_before_after(seeds=(1, 2, 3)):
+    """D: the numbers the new tables show == the numbers of the old table (47ebe23) for every row x direction x window x item x
+    selection (場所数 全件 / 1 のみ × 含める / のみ / 除く); the old cell texts re-formatted == the new cell texts; row order, names,
+    "その他" (= the rows of the later pages) and the pages."""
+    try:
+        old = subprocess.run(["git", "show", DISP_REV + ":ZoneConfluenceReactionStatsXAU.pine"], cwd=ROOT, capture_output=True, text=True, check=True).stdout
+    except Exception as ex:        # noqa: BLE001
+        check("D 変更前 (ZCR-5 47ebe23) の本体を git から取得", False, repr(ex))
+        return
+    src = read(PINE)
+    for k, seed in enumerate(seeds):
+        ov = RANDOM_PRM[seed % len(RANDOM_PRM)]
+        bars = random_bars(seed, 1500)
+        r = Runner(ov, maxrow=(1_000_000 if k == 0 else 6)).run(bars)        # later seeds: a low row cap so the over-cap row has events
+        ns = display_ns(r, src)
+        o = old_display_ns(r, old)
+        rows = list(ns["zrRow"]) + list(ns["zrSum"])
+        nval = nstr = nbad = 0
+        first_bad = None
+        for one, on in SEL:
+            o["zcPlMode"] = "場所数 1 のみ" if one else "全件"
+            o["zcOnMode"] = on
+            for rr in rows:
+                for dm in DMS:
+                    a = (ns["f_dsEv"](rr, dm, one, on), ns["f_dsRaw"](rr.ev2, dm), ns["f_dsRaw"](rr.ev3, dm))
+                    b = (sum(o["f_ev"](rr, di) for di in (0, 1) if dm != ("SHORTのみ", "LONGのみ")[di]),
+                         sum(rr.ev2[di] for di in (0, 1) if dm != ("SHORTのみ", "LONGのみ")[di]), sum(rr.ev3[di] for di in (0, 1) if dm != ("SHORTのみ", "LONGのみ")[di]))
+                    nval += 3
+                    if a != b:
+                        nbad += 1
+                        first_bad = first_bad or ("ev", dm, a, b)
+                    for h in range(3):
+                        vn = [ns["f_dsV"](rr, dm, h, x, one, on) for x in range(NS)]
+                        vo = [o["f_v"](rr, dm, h, x) for x in range(NS)]
+                        nval += NS
+                        if vn != vo:
+                            nbad += 1
+                            first_bad = first_bad or ("v", dm, h, vn, vo)
+                        n = vo[0]
+                        for j in range(3):
+                            hn = [ns["f_dsHv"](rr, dm, h, j, m, one, on) for m in range(1, 31)]
+                            ho = [o["f_hv"](rr, dm, h, j, m) for m in range(1, 31)]
+                            mn, mo = ns["f_dsMed"](rr, dm, h, j, one, on), o["f_med"](rr, dm, h, j)
+                            rc = vo[2 + j]
+                            # the old cell texts (f_line of 47ebe23), re-formatted to the new layout
+                            old_rate = str(rc) + " (" + o["f_pct"](rc, n) + ")"
+                            exp_rate = "—" if n == 0 else old_rate
+                            exp_time = "—" if rc == 0 else pine_tostring(vo[5 + j] / (rc * 1.0), "0.0") + "/" + pine_tostring(mo, "0.0") + " (" + str(rc) + ")"
+                            old_adv = "—" if rc == 0 else o["f_avgUsd"](vo[10 + j], rc) + "～" + o["f_avgUsd"](vo[13 + j], rc) + " (順序不明 " + str(vo[16 + j]) + "/" + str(rc) + ")"
+                            new_adv = ns["f_dsAdv"](rr, dm, h, j, one, on)
+                            got = (hn, mn, ns["f_dsRate"](ns["f_dsV"](rr, dm, h, 2 + j, one, on), ns["f_dsV"](rr, dm, h, 0, one, on)),
+                                   ns["f_dsTime"](rr, dm, h, j, one, on), new_adv.replace("\n不明 ", " (順序不明 ") + ("" if rc == 0 else ")"))
+                            exp = (ho, mo, exp_rate, exp_time, old_adv)
+                            nval += 32
+                            nstr += 3
+                            if got != exp:
+                                nbad += 1
+                                first_bad = first_bad or ("h", dm, h, j, got[1:], exp[1:])
+                        for x, y in ((8, 8), (9, 9)):
+                            nstr += 1
+                            if ns["f_dsUsd"](ns["f_dsV"](rr, dm, h, x, one, on), n) != o["f_avgUsd"](vo[y], n):
+                                nbad += 1
+                                first_bad = first_bad or ("mfe", dm, h, x)
+            # rows: order and "その他"
+            new = ns["f_dsRows"](False, one, on)
+            allr, rest, _ = old_rows(o, 10 ** 9)
+            over_on = rest is not None
+            ok_order = [x.mask for x in new] == [x.mask for x in allr] + ([0] if over_on else []) and (not over_on or new[-1] is ns["zrSum"][4])
+            top, rest6, nrest6 = old_rows(o, 6)
+            ok_rest = [x.mask for x in new[:6]] == [x.mask for x in top] and nrest6 == max(0, len(new) - 6)
+            if rest6 is not None:
+                for dm in DMS:
+                    for h in range(3):
+                        ok_rest &= [o["f_v"](rest6, dm, h, x) for x in range(NS)] == [sum(ns["f_dsV"](q, dm, h, x, one, on) for q in new[6:]) for x in range(NS)]
+            ok_cnt = ns["f_dsRows"](True, one, on) == ns["zrSum"][:4]
+            if not (ok_order and ok_rest and ok_cnt):
+                nbad += 1
+                first_bad = first_bad or ("rows", one, on, ok_order, ok_rest, ok_cnt)
+        names_ok = all(ns["f_dsName"](m, sp).replace("\n", "") == o["f_setName"](m) for m in ns["zrMask"] for sp in range(1, 7))
+        lines_ok = all(len(ln.split("+")) - (1 if ln.startswith("+") else 0) <= (1 if bin(m).count("1") <= sp else 2)
+                       for m in ns["zrMask"] for sp in (1, 3, 6) for ln in ns["f_dsName"](m, sp).split("\n"))
+        nsets = len(ns["zrRow"])
+        over_rows = sum(1 for x in ns["f_dsRows"](False, False, "含める") if x.mask == 0)
+        check(f"D seed {seed}: 表の数値 (対象件数・到達件数・計測不能・待ち・本数不足・到達分・MFE/MAE・逆行・順序不明・発生・初回到達分の度数と中央値) と表示文字列は変更前 (47ebe23 の f_pick / f_v / f_hv / f_med / f_ev / f_pct / f_avgUsd) と一致。"
+              "全行 × 方向 3 × 期間 3 × 項目 × 絞り込み 6 通り。行の並びも一致し、旧「その他」= 7 行目以降の合計",
+              nbad == 0 and nval > 50_000 and nsets >= 6 and (k == 0 or over_rows == 1),
+              f"values={nval} strings={nstr} sets={nsets} over-row={over_rows} mismatches={nbad} first={first_bad}")
+        check(f"D seed {seed}: 組合せ名は旧集合名と同じ (改行を除く)。1 行は 根拠数 <= 縦の行数なら 1 根拠、超えれば 2 根拠まで", names_ok and lines_ok and len(ns["zrMask"]) >= 6)
+        cells = []
+        for one, on in SEL:
+            for rr in rows:
+                for dm in DMS:
+                    for h in range(3):
+                        n = ns["f_dsV"](rr, dm, h, 0, one, on)
+                        for j in range(3):
+                            cells += [ns["f_dsRate"](ns["f_dsV"](rr, dm, h, 2 + j, one, on), n), ns["f_dsTime"](rr, dm, h, j, one, on), ns["f_dsAdv"](rr, dm, h, j, one, on)]
+                        cells += [ns["f_dsUsd"](ns["f_dsV"](rr, dm, h, 8, one, on), n), ns["f_dsUsd"](ns["f_dsV"](rr, dm, h, 9, one, on), n)]
+        longest = max((ln for c in cells for ln in c.split("\n")), key=dwidth)
+        check(f"D seed {seed}: 数値セルの 1 行は半角 24 桁 (全角 12 文字) 以内 (最長 {longest!r})", dwidth(longest) <= 24)
+    pg = display_ns(Runner(RANDOM_PRM[0]).run(random_bars(1, 50)), src)
+    ok = all(pg["f_dsPages"](n, per) == max(1, -(-n // per)) for n in range(0, 80) for per in range(1, 11))
+    ok &= [pg["f_dsPage"](w, 4) for w in (-1, 0, 1, 3, 4, 5, 99)] == [1, 1, 1, 3, 4, 4, 4]
+    ok &= all(sorted(i for p in range(1, pg["f_dsPages"](n, per) + 1) for i in range((p - 1) * per, min(n, (p - 1) * per + per))) == list(range(n))
+              for n in range(0, 40) for per in range(1, 11))
+    check("D ページ: 総ページ = ceil(件数 / 1 ページの数) (最低 1)、指定ページは 1..総ページに丸める、全ページで各行がちょうど 1 回", ok)
+
+
+def dwidth(t):
+    """display width in half-width columns (full-width / wide characters = 2)"""
+    import unicodedata
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F", "A") else 1 for ch in t)
+
+
+class MockTable:
+    """table.* as far as the drawing code uses it; out-of-range cells / merges and overlapping merges raise (TradingView: runtime error)"""
+    def __init__(self, pos, cols, rows, **kw):
+        if cols < 1 or rows < 1:
+            raise ap.PineRuntimeError("table.new with no cells")
+        self.pos, self.cols, self.rows, self.cells, self.merges, self.deleted = pos, cols, rows, {}, [], False
+
+    def _in(self, c, r):
+        if not (0 <= c < self.cols and 0 <= r < self.rows):
+            raise ap.PineRuntimeError(f"cell ({c}, {r}) outside the table {self.cols} x {self.rows}")
+
+    def cell(self, c, r, text="", **kw):
+        self._in(c, r)
+        self.cells[(c, r)] = dict(kw, text=text)
+
+    def merge(self, c0, r0, c1, r1):
+        self._in(c0, r0)
+        self._in(c1, r1)
+        for m in self.merges:
+            if not (c1 < m[0] or c0 > m[2] or r1 < m[1] or r0 > m[3]):
+                raise ap.PineRuntimeError(f"merge {(c0, r0, c1, r1)} overlaps {m}")
+        self.merges.append((c0, r0, c1, r1))
+
+    def covered(self, c, r):
+        return any(m[0] <= c <= m[2] and m[1] <= r <= m[3] and (c, r) != (m[0], m[1]) for m in self.merges)
+
+
+def render(r, src, **sel):
+    """run the drawing code of the table (everything between "// ---- 表" and the record output, the Display calc included) on the
+    last bar of the finished run r, with the display inputs sel; returns the table made"""
+    from types import SimpleNamespace as NS_
+    ns = r.env
+    tbls = []
+
+    def tnew(pos, c, rws, **kw):
+        t = MockTable(pos, c, rws, **kw)
+        tbls.append(t)
+        return t
+    pos = {k: k for k in ("top_left", "top_center", "top_right", "middle_left", "middle_center", "middle_right", "bottom_left", "bottom_center", "bottom_right")}
+    ns["position"] = NS_(**pos)
+    ns.update({f"size__{k}": k for k in ("tiny", "small", "normal", "large")})
+
+    def tostr(x, fmt=None):
+        return pine_tostring(x, "0.00" if fmt == "mintick" else fmt)
+    ns.update(str__tostring=tostr, str__replace_all=lambda a, b, c: a.replace(b, c), color__black="black", barstate__islast=True,
+              array__new_string=lambda n=0, v=None: [v] * n,
+              order=NS_(descending="desc", ascending="asc"), array__sort_indices=lambda a, o: sorted(range(len(a)), key=lambda i: a[i], reverse=(o == "desc")),
+              table=NS_(new=tnew, cell=lambda t, c, rr, s="", **kw: t.cell(c, rr, s, **kw), merge_cells=lambda t, *a: t.merge(*a),
+                        delete=lambda t: setattr(t, "deleted", True)), text=NS_(align_left="left"), format=NS_(mintick="mintick"),
+              syminfo__tickerid="OANDA:XAUUSD", timeframe__period="5", chart=NS_(is_standard=True), zcTbl=None)
+    inp = dict(zcView="主表", zcKind="根拠集合 (完全一致)", zcDirMode="LONG / SHORT 別", zcHzMode="全期間", zcOnMode="含める", zcPlMode="全件",
+               zcPerPage=5, zcPage=1, zcTxtSize="small", zcPos="top_right")
+    inp.update(sel)
+    ns.update(inp)
+    code = src[src.index("// ---- 表 (集計値には影響しない"):src.index("// ---- イベント記録の出力")]
+    assert code.count("var table zcTbl = na") == 1
+    code = code.replace("var table zcTbl = na", "zcTbl = na")
+    exec(compile(ap.Translator(known_types={"ZcRow"}).translate(ap.logical_lines(code)), "<ZCR table>", "exec"), ns)
+    assert len(tbls) == 1
+    return tbls[0]
+
+
+def table_text(t):
+    """the table as text (merged cells: the text in the top-left cell, the covered cells blank)"""
+    out = []
+    for rr in range(t.rows):
+        out.append(" | ".join("" if t.covered(c, rr) else t.cells.get((c, rr), {}).get("text", "").replace("\n", " / ") for c in range(t.cols)))
+    return "\n".join(out)
+
+
+def table_render_checks(seed=1):
+    """R: the drawing code itself run on a finished run (mock table API) for every view × direction × window × row kind × selection
+    and several pages: no cell / merge outside the table, merges only vertical and not overlapping, every row of the table used, the
+    main table has 7 columns and 3 rows (5 / 15 / 30 分) per combination × direction, the text of every cell short (the combination name:
+    at most 2 evidences per line), size / position from the inputs, and the main table's numbers == the Display calc functions."""
+    src = read(PINE)
+    bars = random_bars(seed, 1500)
+    r = Runner(RANDOM_PRM[seed % len(RANDOM_PRM)]).run(bars)
+    views = ["主表", "詳細: 件数内訳", "詳細: 初回到達時間", "詳細: MFE・MAE", "詳細: 到達前逆行", "詳細: 状態・注記"]
+    ncols = {"主表": 7, "詳細: 件数内訳": 11, "詳細: 状態・注記": 2}
+    bad, n_tab, longest = [], 0, ("", "")
+    for v in views:
+        for dmode in ("LONG / SHORT 別", "LONG＋SHORT合算", "LONGのみ", "SHORTのみ"):
+            for hz in ("全期間", "5分", "30分"):
+                for kind in ("根拠集合 (完全一致)", "根拠数別"):
+                    for one, on in (SEL if v == "主表" and dmode == "LONG / SHORT 別" and hz == "全期間" else SEL[:1]):
+                        for per, page in ((5, 1), (5, 2), (3, 999), (10, 1)):
+                            sel = dict(zcView=v, zcDirMode=dmode, zcHzMode=hz, zcKind=kind, zcPlMode="場所数 1 のみ" if one else "全件", zcOnMode=on,
+                                       zcPerPage=per, zcPage=page, zcTxtSize=("tiny", "small", "normal", "large")[n_tab % 4], zcPos="bottom_left" if n_tab % 2 else "top_right")
+                            try:
+                                t = render(r, src, **sel)
+                            except Exception as ex:        # noqa: BLE001
+                                bad.append((sel, repr(ex)))
+                                continue
+                            n_tab += 1
+                            nDir = 2 if dmode == "LONG / SHORT 別" else 1
+                            nHz = 3 if hz == "全期間" else 1
+                            err = []
+                            if any(m[0] != m[2] for m in t.merges):
+                                err.append("horizontal merge")
+                            if any(not any((c, rr) in t.cells for c in range(t.cols)) and not any(t.covered(c, rr) for c in range(t.cols)) for rr in range(t.rows)):
+                                err.append("unused row")
+                            if t.cols != ncols.get(v, 6) or t.pos != sel["zcPos"] or any(x.get("text_size") != sel["zcTxtSize"] for x in t.cells.values()):
+                                err.append(("cols / pos / size", t.cols, t.pos))
+                            if v != "詳細: 状態・注記":
+                                ns = r.env
+                                rows = ns["f_dsRows"](kind == "根拠数別", one, on)
+                                pages = max(1, -(-len(rows) // per))
+                                pg = min(max(page, 1), pages)
+                                shown = rows[(pg - 1) * per:pg * per]
+                                if t.rows != 2 + len(shown) * nDir * nHz or t.cells[(1, 0)]["text"] != f"{pg}/{pages}頁":
+                                    err.append(("rows / page", t.rows, len(shown), t.cells[(1, 0)]["text"]))
+                                if v != "主表" and any(m for m in t.merges if m[2] == 0 and m[3] - m[1] + 1 != nDir * nHz):
+                                    err.append("combination merge")
+                                if v == "主表":
+                                    rr = 2
+                                    for q in shown:
+                                        if nDir * nHz > 1 and (0, rr, 0, rr + nDir * nHz - 1) not in t.merges:
+                                            err.append(("name merge", rr))
+                                        for dm in (["LONGのみ", "SHORTのみ"] if nDir == 2 else [dmode]):
+                                            for h in ([0, 1, 2] if nHz == 3 else [{"5分": 0, "30分": 2}[hz]]):
+                                                n = ns["f_dsV"](q, dm, h, 0, one, on)
+                                                exp = [str(n)] + [ns["f_dsRate"](ns["f_dsV"](q, dm, h, 2 + j, one, on), n) for j in range(3)]
+                                                got = [t.cells[(c, rr)]["text"] for c in range(3, 7)]
+                                                if got != exp or t.cells[(2, rr)]["text"] != ("5分", "15分", "30分")[h]:
+                                                    err.append(("values", rr, got, exp))
+                                                rr += 1
+                            for (c, rr), x in t.cells.items():
+                                for ln in x["text"].split("\n"):
+                                    is_name = c == 0 and rr >= 2 and v != "詳細: 状態・注記"
+                                    lim_ok = dwidth(ln) <= 24 and (not is_name or ln.lstrip("+").count("+") <= 1)
+                                    if not lim_ok:
+                                        err.append(("long", c, rr, ln))
+                                    if not is_name and dwidth(ln) > dwidth(longest[1]):
+                                        longest = (v, ln)
+                            if err:
+                                bad.append((sel, err[:3]))
+    try:
+        r0 = Runner(RANDOM_PRM[0]).run(bars[:3])
+        r0.env["zrSum"] = []              # the state before the first confirmed 5m bar
+        t0 = render(r0, src)
+        t1 = render(Runner(RANDOM_PRM[0], run=False).run(bars[:3]), src)
+        ok0 = (t0.cols, t0.rows, t0.cells[(0, 0)]["text"]) == (1, 1, "ZCR-XAU: 確定足なし") and (t1.cols, t1.rows, t1.cells[(0, 0)]["text"]) == (1, 3, "ZCR-XAU: 集計停止")
+    except Exception as ex:        # noqa: BLE001
+        ok0 = False
+        bad.append(("empty / stopped", repr(ex)))
+    check("R 確定足なし・集計停止 (5分の標準チャート以外) の表も範囲内で描ける", ok0)
+    check(f"R 表の描画コードそのものを模擬 table で実行 ({n_tab} 表: 表示切替 6 × 方向 4 × 観察期間 3 × 表の行 2 × ページ 4、主表は絞り込み 6 通り): 範囲外のセル・結合なし、結合は縦だけで重ならない、"
+          "全行使用、主表 7 列・1 組合せ × 1 方向 = 3 行・組合せ名は縦結合、行数とページ表示、主表の数値 = Display calc、文字サイズ・位置は入力どおり、"
+          "セルの 1 行は半角 24 桁 (全角 12 文字) 以内 (組合せ名は 1 行 2 根拠まで)",
+          not bad and n_tab > 500, f"bad={len(bad)} first={bad[:2]} longest(組合せ名以外)={longest}")
+    return r
 
 
 MUTATIONS = [
@@ -1575,6 +1904,38 @@ def static():
     check("S 継続行以外のインデントは 4 の倍数、タブなし", not bad and "\t" not in s, str(bad[:3]))
     check("S 冒頭と仕様書に未検証 (PINE_NOT_VERIFIED) の明記", "PINE_NOT_VERIFIED" in s.split("indicator(")[0]
           and "PINE_NOT_VERIFIED" in read(os.path.join(ROOT, "ZONE_CONFLUENCE_REACTION_XAU_ja.md")))
+    try:
+        o = subprocess.run(["git", "show", DISP_REV + ":ZoneConfluenceReactionStatsXAU.pine"], cwd=ROOT, capture_output=True, text=True, check=True).stdout
+    except Exception as ex:        # noqa: BLE001
+        o = ""
+        check("S 変更前 (47ebe23) の本体を git から取得", False, repr(ex))
+    if o:
+        def parts(t):
+            g = t.index("var string G_DS = ")
+            za = t.index("\n// ---- ZA: Accum 検出")
+            dr = t.index("// ---- 描画 (集計値には影響しない)")
+            tb = t.index("// ---- 表 (集計値には影響しない")
+            ev = t.index("// ---- イベント記録の出力")
+            return dict(head=t[:g], body=t[za:t.index("\n", t.index(END))], draw=t[dr:tb], out=t[ev:])
+        po, pn = parts(o), parts(s)
+        same_parts = {k: po[k] == pn[k] for k in po}
+        check("S 表示以外は変更前 (47ebe23) と byte 一致: 冒頭〜表示の入力の前 / Zone 検知・登録・ZCR Logic 区間 (begin〜end) / 描画 (枠・印) / イベント記録の出力 (plot 40 本) 〜末尾",
+              all(same_parts.values()) and logic(o) == logic(s) and len(pn["out"]) > 2000 and pn["out"].count("plot(") == 40, str(same_parts))
+        gd_o = o[o.index("var string G_DS = "):o.index("\n// ---- ZA: Accum 検出")].split("\n")
+        gd_n = s[s.index("var string G_DS = "):s.index("\n// ---- ZA: Accum 検出")].split("\n")
+        kept = [ln for ln in gd_o if not ln.startswith(("zcView ", "zcTopN "))]
+        check("S 表示の入力: 表示切替を 主表 / 詳細 5 種にし、zcTopN を外して 1 ページの組合せ数 (5)・ページ (1)・文字サイズ (small)・表示位置 (top_right) を追加。他の表示の入力は同じ行のまま",
+              all(ln in gd_n for ln in kept) and "zcTopN" not in s and mi["zcView"] == "主表" and mi["zcPerPage"] == 5 and mi["zcPage"] == 1 and mi["zcTxtSize"] == "small" and mi["zcPos"] == "top_right")
+    disp = s[s.index("// ---- 表 (集計値には影響しない"):s.index("// ---- イベント記録の出力")]
+    dcode = "\n".join(ap.strip_comment(x) for x in disp.split("\n"))
+    merges = re.findall(r"table\.merge_cells\(([^)]*)\)", dcode)
+    vert = all((lambda a: a[1] == a[3])([x.strip() for x in m.split(",")]) for m in merges)
+    check("S 表: 結合は縦だけ (table.merge_cells の開始列 = 終了列)。表の位置・文字サイズは入力から (全表で同じ ZC_POS / ZC_TS)",
+          merges and vert and dcode.count("table.new(ZC_POS,") == 4 and "table.new(position." not in dcode and "text_size = ZC_TS" in dcode and "text_size = size." not in dcode, str(merges))
+    items = re.findall(r'f_item\(ks, vs, ts, ws, "([^"]+)", ', dcode)
+    check("S 詳細: 状態・注記 は 1 項目 1 行 (項目名 12 文字以内)。旧欄外注記の項目 (登録数・イベント内訳・方向不明・抑制・MA / ZE / ZD 不明・接続状態・FVG→iFVG・助走・不正足・計測不能・EV 出力・上限超過・銘柄・期間・共通幅・離脱) を含む",
+          len(items) >= 40 and all(len(x) <= 12 for x in items) and all(any(k in x for x in items) for k in ("登録 ZA", "登録 ZF", "方向不明", "継続中", "MA 不明", "ZE 受信不正", "ZD 正常でない", "ZE 接続 4H", "ZD POC", "FVG → iFVG", "iFVG 無効", "助走", "不正足", "計測不能", "EV 出力済み", "EV 未出力", "行数上限超過", "銘柄", "期間", "共通幅", "離脱", "注意")),
+          str([x for x in items if len(x) > 12]))
     mine = {"ZoneConfluenceReactionStatsXAU.pine", "tests/zcr_sim.py", "ZONE_CONFLUENCE_REACTION_XAU_ja.md"}
     try:
         stt = subprocess.run(["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True, check=True).stdout
@@ -1592,6 +1953,8 @@ def main():
     kinds()
     bars, ov = random_vs_oracle(seeds)
     before_after()
+    display_before_after()
+    table_render_checks()
     causality(bars, ov)
     mutations(random_bars(10), dict(RANDOM_PRM[10 % len(RANDOM_PRM)], zbWarm1=300))
     bad = 0
