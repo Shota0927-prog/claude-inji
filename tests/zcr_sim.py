@@ -39,7 +39,8 @@ BEGIN, END = "// ==== ZCR Logic (begin) ", "// ==== ZCR Logic (end) "
 M1, M5 = 60_000, 300_000
 T0 = 1_767_574_800_000          # 2026-01-05 01:00 UTC
 MT = 0.01
-NS, NF = 21, 35
+NS, NF, NFT = 21, 44, 6
+EDGE, CLOSE = "接触側の帯端", "タッチ足終値"
 START0 = 1_577_836_800_000      # 2020-01-01 00:00 UTC (the default of the start input)
 ZE_KEYS = ["zeProto"] + [f"ze{k}{x}" for k in ("4", "D") for x in "OEDIST"]
 FEEDS = ([f"f{k}{x}" for k in (1, 2, 3) for x in "ulia"] + [f"s{k}{x}" for k in (1, 2, 3, 4) for x in ("h", "ht", "l", "lt")]
@@ -83,7 +84,7 @@ def tonum(s):
 
 
 ALL_ON = {"zaUse1": True, "zcUse1": True, "zcUse2": True, "zdUse1": True, "zfUse1": True, "zfUse2": True, "zfUse3": True, "zfUse4": True}
-OFF = {"zaUse2": False, "zaUse3": False, "zbUse1": False, "zbUse2": False, "zcUse3": False, "zcUse4": False, "zdUse2": False, "zdUse3": False,
+OFF = {"zcP0Mode": CLOSE, "zaUse2": False, "zaUse3": False, "zbUse1": False, "zbUse2": False, "zcUse3": False, "zcUse4": False, "zdUse2": False, "zdUse3": False,
        "zdUse4": False, "zeUse": False, "zgUse1": False, "zgUse4": False, "zgUseD": False,
        "zfUse1": False, "zfUse2": False, "zfUse3": False, "zfUse4": False}
 ONLY_ZC = dict(OFF, zcUse1=True, zcUse2=True, zcUse3=True, zcUse4=True)
@@ -93,11 +94,18 @@ class Runner:
     """bars: dicts t (5m open time), tc (default t + 5m), o, h, l, c, p1 / p5 (EMA of the previous confirmed bar), feeds by name
     (missing = na), conf (False = an unconfirmed realtime update)."""
 
-    def __init__(self, overrides=None, source=None, run=True, maxrow=1_000_000):
+    def __init__(self, overrides=None, source=None, run=True, maxrow=1_000_000, maxpend=1_000_000_000):
         s = source if source is not None else read(PINE)
         cap = "int   ZC_MAXROW = 300 "          # the row cap of the indicator; the tests lift it unless a case is about the cap
         assert s.count(cap) == 1, "ZC_MAXROW declaration changed"
         s = s.replace(cap, f"int   ZC_MAXROW = {maxrow} ")
+        cap2 = "int   ZC_MAXPEND = 2000 "       # ZCR-8: the cap of the tracked observations; lifted unless a case is about it
+        if cap2 in s:
+            s = s.replace(cap2, f"int   ZC_MAXPEND = {maxpend} ")
+        ov0 = dict(overrides or {})
+        if "zcP0Mode" in ov0 and "zcP0Mode = input" not in s:      # an older source (before ZCR-8): always the close
+            assert ov0.pop("zcP0Mode") == CLOSE
+        overrides = ov0
         self.code = compile(ap.Translator().translate(ap.logical_lines(logic(s))), "<ZCR logic>", "exec")
         inp = ap.inputs(s)
         inp.setdefault("zcStart", START0)        # input.time is not parsed by ap.inputs
@@ -152,12 +160,33 @@ class Runner:
         return self.env[k]
 
     def records(self):
-        return [r for _, r in self.out] + [list(q.v) for q in self.env["zcQ"]]
+        """output + queue, and (ZCR-8) the records of the events whose 30-minute windows are done but whose first-touch is still open
+        (not output by the indicator; made here by the indicator's own f_zcFinal on a scratch queue / state, nothing changed)"""
+        e = self.env
+        extra = []
+        pend = [o for o in e["zcPend"] if all(w != 0 for w in o.wSt)]
+        if pend:
+            q0, st0 = e["zcQ"], e["st"]
+            e["zcQ"], e["st"] = [], copy.copy(st0)
+            try:
+                for o in pend:
+                    e["f_zcFinal"](o)
+                extra = [list(q.v) for q in e["zcQ"]]
+            finally:
+                e["zcQ"], e["st"] = q0, st0
+        return [r for _, r in self.out] + [list(q.v) for q in e["zcQ"]] + extra
+
+    def fsys(self, k):
+        """ZCR-8 first-touch arrays of system k (1..4): {set mask: list} and the 5 summary rows"""
+        e = self.env
+        a = ("fc", "fc2", "fc3", "fc4")[k - 1]
+        return ({m: list(getattr(r, a)) for m, r in zip(e["zrMask"], e["zrRow"])}, [list(getattr(r, a)) for r in e["zrSum"]])
 
     def pending(self):
         return [dict(id=o.id, t0=o.t0, p0=o.p0, d=o.d, mask=o.mask, nEv=o.nEv, nRaw=o.nRaw, rTop=o.rTop, rBot=o.rBot, edge=o.edge,
                      cPos=o.cPos, nPl=o.nPl, aux=o.aux, flags=o.flags, onMask=o.onMask, side=o.side, rmin=list(o.rMin), alo=list(o.aLo), ahi=list(o.aHi),
-                     wst=list(o.wSt), wmfe=list(o.wMfe), wmae=list(o.wMae), wnb=list(o.wNb)) for o in self.env["zcPend"]]
+                     wst=list(o.wSt), wmfe=list(o.wMfe), wmae=list(o.wMae), wnb=list(o.wNb), p0c=getattr(o, "p0c", None), p0e=getattr(o, "p0e", None),
+                     fst=list(getattr(o, "fSt", None) or []), fmin=list(getattr(o, "fMin", None) or [])) for o in self.env["zcPend"]]
 
     def rows(self):
         e = self.env
@@ -188,13 +217,13 @@ class Runner:
         z = e["st"]
         return dict(nEv=z.nEv, nUnk=z.nUnk, nCont=z.nCont, nDone=z.nDone, nOut=z.nOut, nBad=z.nBad, nMa1Ev=z.nMa1Ev, nMa5Ev=z.nMa5Ev, nZeEv=z.nZeEv,
                     nEvOn=z.nEvOn, nMultiBar=z.nMultiBar, nPre=z.nPre,
-                    nIfvg=z.nIfvg, nFvgDead=z.nFvgDead, nFxK1=getattr(z, "nFxK1", 0), nFxK2=getattr(z, "nFxK2", 0), nFxEmpty=getattr(z, "nFxEmpty", 0), maUnk=list(e["zcMaUnk"]), nZone=list(e["zcNZone"]), why=list(e["zcWhy"][:2]),
+                    nIfvg=z.nIfvg, nFvgDead=z.nFvgDead, nFxK1=getattr(z, "nFxK1", 0), nFxK2=getattr(z, "nFxK2", 0), nFxEmpty=getattr(z, "nFxEmpty", 0), nFtCut=getattr(z, "nFtCut", 0), maUnk=list(e["zcMaUnk"]), nZone=list(e["zcNZone"]), why=list(e["zcWhy"][:2]),
                     on=sorted((q.gid, q.tb, q.tt) for q in e["zcOn"]), act=self.zones(), zeBad=list(e["zcZeBad"]), zdBad=list(e["zcZdBad"]),
                     zeStat=list(e["lbZeStat"]), zdStat=list(e["lbZdStat"]))
 
     def snapshot(self):
         return copy.deepcopy(dict(rec=self.records(), pend=self.pending(), rows=self.rows(), sums=self.sums(), rows2=self.rows2(), sums2=self.sums2(), sys3=self.sysrows(3), sys4=self.sysrows(4), st=self.state(),
-                                  out=[(i, r) for i, r in self.out], created=list(self.created)))
+                                  f=[self.fsys(k) for k in (1, 2, 3, 4)] if self.env["zrSum"] and "fc" in self.env["zrSum"][0]._fields else None, out=[(i, r) for i, r in self.out], created=list(self.created)))
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -505,6 +534,7 @@ def oracle(bars, prm):
                 drop(z)
 
     events, unk, unk_cnt, cont, n_pre, n_multi = [], 0, {}, 0, 0, 0
+    edge_mode = P["zcP0Mode"] == EDGE
     n_k1, n_k2, n_empty = 0, 0, 0
     fx_bars = set()                 # bars on which a ZF zone (FVG or iFVG) was touched: the only bars the direction condition can change
                                     # (directly, or through the contact state an FVG carries into its iFVG)
@@ -605,13 +635,17 @@ def oracle(bars, prm):
                 on_mask |= (1 << egid(z)) if z["on"] else 0
                 side |= z["side"]
             by_pc = c_lo <= o <= c_hi
+            # ZCR-8: the band edge = the touched side of UA, the common band of the adopted members themselves (not clipped)
+            ua_lo, ua_hi = max(z["lo"] for z in mem), min(z["hi"] for z in mem)
+            p0e = ua_hi if d == 1 else ua_lo
+            p0 = p0e if edge_mode else c
             u1, u5 = zb_use[0] and not ma[0]["ok"], zb_use[1] and not ma[1]["ok"]
             edge = o if by_pc else c_hi if d == 1 else c_lo
             if d == 1:
                 cpos = 0 if c > c_hi else 1 if c >= c_lo else 2
             else:
                 cpos = 0 if c < c_lo else 1 if c <= c_hi else 2
-            ev = dict(id=len(events) + 1, t0=tc, p0=c, d=d, mask=mask, nEv=len(gids), nRaw=len(mem), rTop=c_hi, rBot=c_lo,
+            ev = dict(id=len(events) + 1, t0=tc, p0=p0, p0c=c, p0e=p0e, mode=P["zcP0Mode"], d=d, mask=mask, nEv=len(gids), nRaw=len(mem), rTop=c_hi, rBot=c_lo,
                       edge=edge, cPos=cpos, aux=aux, bar=bi, onMask=on_mask, side=side,
                       flags=(512 if u1 else 0) + (1024 if u5 else 0) + (2048 if 9 in ze_stat else 0) + (4096 if on_mask else 0) + (8192 if by_pc else 0) + (16384 if xs else 0))
             events.append(ev)
@@ -683,8 +717,40 @@ def oracle(bars, prm):
                     why[0] += 1
             else:
                 wnb[hh] = 0 if last_tc is None else wnb[hh]
-        # a reach is recorded only while a window is still open
-        ev.update(rmin=rmin, alo=alo, ahi=ahi, wst=wst, wmfe=wmfe, wmae=wmae, wnb=wnb, fin=fin)
+        # ZCR-8 first-touch: every width alone, from the next bar, no time limit; the open first, then the bar's range
+        fst, fmin, fbar = [0] * 3, [None] * 3, [None] * 3
+        for i, (tc, bad, o, h, l) in later:
+            if all(fst):
+                break
+            for q in range(3):
+                if fst[q]:
+                    continue
+                if bad:
+                    res = 4
+                else:
+                    on_ = d * (o - p0)
+                    fav = h - p0 if d == 1 else p0 - l
+                    adv = p0 - l if d == 1 else h - p0
+                    w = W[q]
+                    if on_ >= w:
+                        res = 1
+                    elif -on_ >= w:
+                        res = 2
+                    elif fav >= w and adv >= w:
+                        res = 3
+                    elif fav >= w:
+                        res = 1
+                    elif adv >= w:
+                        res = 2
+                    else:
+                        res = 0
+                if res:
+                    fst[q], fbar[q] = res, i
+                    fmin[q] = math.floor((tc - t0) / M1 + 0.5) if res <= 3 else None
+        ffin = max(fbar) if all(fst) else None
+        # the record goes out when the 30-minute windows are done AND every width is decided
+        ev.update(rmin=rmin, alo=alo, ahi=ahi, wst=wst, wmfe=wmfe, wmae=wmae, wnb=wnb, wfin=fin, fst=fst, fmin=fmin,
+                  fin=None if fin is None or ffin is None else max(fin, ffin))
     return dict(events=events, unk=unk, unk_cnt=unk_cnt, cont=cont, nPre=n_pre, nMulti=n_multi, nBad=n_bad, maUnk=ma_unk, nZone=n_zone, why=why,
                 on=sorted((z["gid"], z["lo"], z["hi"]) for z in zones + ma if z["on"]),
                 act=sorted((z["gid"], z["sub"], z["lo"], z["hi"], z["inv"]) for z in zones), nbars=len(bars),
@@ -696,7 +762,8 @@ def record_of(ev):
     """the event record as the spec's table defines it (35 values)"""
     v = [None] * NF
     v[0:14] = [ev["id"], ev["t0"] / 1000.0, ev["p0"] * MT, ev["d"], ev["mask"], ev["nEv"], ev["nRaw"], ev["rTop"] * MT, ev["rBot"] * MT,
-               ev["edge"] * MT, ev["d"] * (ev["p0"] - ev["edge"]) * MT, ev["cPos"], ev["nPl"], ev["aux"]]
+               ev["edge"] * MT, ev["d"] * (ev["p0c"] - ev["edge"]) * MT, ev["cPos"], ev["nPl"], ev["aux"]]
+    v[35:44] = [1 if ev["mode"] == EDGE else 0, ev["p0c"] * MT, ev["p0e"] * MT] + list(ev["fst"]) + list(ev["fmin"])
     fl = ev["flags"]
     for j in range(3):
         if ev["rmin"][j] is None:
@@ -752,6 +819,18 @@ def rows_of(events, key=lambda ev: ev["mask"]):
     return out
 
 
+def frows_of(events, key=lambda ev: ev["mask"]):
+    """ZCR-8 first-touch arrays: ((direction * 3 + width) * NFT + result), result 0 rebound / 1 adverse / 2 unknown order / 3 tracking /
+    4 unmeasurable / 5 cut by the cap"""
+    out = {}
+    for ev in events:
+        f = out.setdefault(key(ev), [0] * (6 * NFT))
+        di = 0 if ev["d"] == 1 else 1
+        for j in range(3):
+            f[(di * 3 + j) * NFT + {0: 3, 1: 0, 2: 1, 3: 2, 4: 4, 5: 5}[ev["fst"][j]]] += 1
+    return out
+
+
 def near(a, b):
     if a is None or b is None:
         return a is None and b is None
@@ -799,7 +878,7 @@ def compare(r, orc, label=""):
     pend_o = [e for e in ev if e["fin"] is None]
     pend_i = r.pending()
     keys = ("id", "t0", "p0", "d", "mask", "nEv", "nRaw", "rTop", "rBot", "edge", "cPos", "nPl", "aux", "flags", "onMask", "side", "rmin", "alo", "ahi",
-            "wst", "wmfe", "wmae")
+            "wst", "wmfe", "wmae", "p0c", "p0e", "fst", "fmin")
     if [[p[k] for k in keys] for p in pend_i] != [[p[k] for k in keys] for p in pend_o]:
         bad = next((n for n, (a, b) in enumerate(zip(pend_i, pend_o)) if [a[k] for k in keys] != [b[k] for k in keys]), None)
         det.append(f"pending: {len(pend_i)} vs {len(pend_o)}" + ("" if bad is None else f" got {pend_i[bad]} want {pend_o[bad]}"))
@@ -847,6 +926,15 @@ def compare(r, orc, label=""):
             det.append(f"second-system summary row {g} differs")
     if s2i and tuple(s2i[3]) != tuple(rows_of(ev2, key=lambda e: 0).get(0, empty)):
         det.append("second-system summary row all differs")
+    # ZCR-8 first-touch: the 4 systems, set rows and summary rows (1 / 2 / 3+ evidences, all)
+    zf = [0] * (6 * NFT)
+    for k, sel in ((1, ev), (2, [e for e in ev if e["onMask"]]), (3, [e for e in ev if e["nPl"] == 1]), (4, [e for e in ev if e["nPl"] == 1 and e["onMask"]])):
+        gr, gs = r.fsys(k)
+        if {m: v for m, v in gr.items() if any(v)} != frows_of(sel):
+            det.append(f"first-touch system {k} rows differ")
+        so = frows_of(sel, key=lambda e: min(e["nEv"], 3))
+        if gs and ([gs[g - 1] for g in (1, 2, 3)] != [so.get(g, zf) for g in (1, 2, 3)] or gs[3] != frows_of(sel, key=lambda e: 0).get(0, zf)):
+            det.append(f"first-touch system {k} summary rows differ")
     if st["nDone"] != len(fins) or st["nOut"] != len(exp_out) or st["nDone"] != st["nOut"] + len(got_q):
         det.append(f"done/out: {st['nDone']} {st['nOut']} vs {len(fins)} {len(exp_out)}")
     return not det, "; ".join(det)
@@ -990,7 +1078,7 @@ RANDOM_PRM = [
 def random_vs_oracle(seeds):
     last = None
     for seed in seeds:
-        ov = RANDOM_PRM[seed % len(RANDOM_PRM)]
+        ov = dict(RANDOM_PRM[seed % len(RANDOM_PRM)], zcP0Mode=CLOSE if seed % 2 == 0 else EDGE)     # ZCR-8: both start points
         bars = random_bars(seed)
         r = Runner(ov).run(bars)
         orc = oracle(bars, params(r))
@@ -1006,7 +1094,11 @@ def random_vs_oracle(seeds):
                        ("zeunk", sum(1 for e in ev if e["flags"] & 2048)), ("ifvg", sum(1 for e in ev if e["mask"] >> 22)), ("one", sum(1 for e in ev if e["nPl"] == 1)),
                        ("triple", sum(1 for e in ev if e["aux"] & 0x700)), ("why0", orc["why"][0]), ("why1", orc["why"][1]),
                        ("pos0", sum(1 for e in ev if e["cPos"] == 0)), ("pos2", sum(1 for e in ev if e["cPos"] == 2)),
-                       ("fxk1", orc["nFxK1"]), ("fxk2", orc["nFxK2"]), ("fx16384", sum(1 for e in ev if e["flags"] & 16384))) \
+                       ("fxk1", orc["nFxK1"]), ("fxk2", orc["nFxK2"]), ("fx16384", sum(1 for e in ev if e["flags"] & 16384)),
+                       ("ft_reb", sum(1 for e in ev for j in range(3) if e["fst"][j] == 1)), ("ft_adv", sum(1 for e in ev for j in range(3) if e["fst"][j] == 2)),
+                       ("ft_unk", sum(1 for e in ev for j in range(3) if e["fst"][j] == 3)), ("ft_trk", sum(1 for e in ev for j in range(3) if e["fst"][j] == 0)),
+                       ("ft_bad", sum(1 for e in ev for j in range(3) if e["fst"][j] == 4)), ("ft_late", sum(1 for e in ev for j in range(3) if (e["fmin"][j] or 0) > 30)),
+                       ("edge_ne_close", sum(1 for e in ev if e["p0e"] != e["p0c"])), ("wait_ft", sum(1 for e in ev if e["wfin"] is not None and e["fin"] is None))) \
                 + tuple((n[:2], sum(1 for e in ev if e["mask"] & G[n])) for n in ("ZA-4H", "ZB-1m", "ZC-D", "ZD-4H", "ZE-4H", "ZF-FVG-4H", "ZG-4H")) + (("ZI", sum(1 for e in ev if e["mask"] & G["ZF-iFVG-4H"])),):
             COVER[k_] = COVER.get(k_, 0) + v_
         rich = len(ev) > 20 and len(set(e["mask"] for e in ev)) > 3
@@ -1032,12 +1124,22 @@ def random_vs_oracle(seeds):
                         inv &= c[base + 2 + j] <= c[base] and sum(hist[((di * 3 + h) * 3 + j) * 30:][:30]) == c[base + 2 + j]
                         inv &= c[base + 10 + j] <= c[base + 13 + j] and sum(hist[((di * 3 + h) * 3 + j) * 30 + (5, 15, 30)[h]:][:30 - (5, 15, 30)[h]]) == 0
                     inv &= c[base + 2] >= c[base + 3] >= c[base + 4]
+        # ZCR-8 first-touch: rebound + adverse + unknown order + tracking + unmeasurable + cut = events, in every system and the 2 "exclude" differences
+        fs = {k: list(r.fsys(k)[0].values()) + r.fsys(k)[1][:4] for k in (1, 2, 3, 4)}
+        evs = {k: [x[2] for x in sysv[k]] for k in (1, 2, 3, 4)}
+        for k in (1, 2, 3, 4):
+            for f, evn in zip(fs[k], evs[k]):
+                inv &= all(sum(f[(di * 3 + j) * NFT:(di * 3 + j + 1) * NFT]) == evn[di] and min(f) >= 0 for di in range(2) for j in range(3))
+        for a_, b_ in ((1, 2), (3, 4)):
+            for fa, fb, ea, eb in zip(fs[a_], fs[b_], evs[a_], evs[b_]):
+                inv &= all(sum(fa[(di * 3 + j) * NFT:(di * 3 + j + 1) * NFT]) - sum(fb[(di * 3 + j) * NFT:(di * 3 + j + 1) * NFT]) == ea[di] - eb[di]
+                           and min(x - y for x, y in zip(fa, fb)) >= 0 for di in range(2) for j in range(3))
         tot = r.sums()[3]
         inv &= sum(v[2][0] + v[2][1] for v in r.rows().values()) == tot[2][0] + tot[2][1] == len(ev)
         check(f"B seed {seed}: 表示の全組合せ 2 × 3 (場所数 全件 / 1 のみ × 含める / のみ / 除く) の行ごとに イベント = 計測可能 + 計測不能 + 待ち、本数不足 <= 計測可能、到達 <= 計測可能、$5 >= $10 >= $15、度数の合計 = 到達、集合行の合計 = 全体", inv)
         last = (bars, ov)
     need = dict(one=500, ZI=5, evon=200, npre=50, side=500, bypc=20, ev=3000, multi=500, unmeas=20, short=20, amb=100, unk=20, cont=2000, r15=100, bad=50, pend=1, queue=1, sell=1000, second=20, maunk=1,
-                zeunk=1, ifvg=5, triple=5, fxk1=100, fxk2=5, fx16384=3, why0=10, why1=10, pos0=200, pos2=200, ZA=50, ZB=200, ZC=200, ZD=50, ZE=50, ZF=50, ZG=20)
+                zeunk=1, ifvg=5, triple=5, fxk1=100, fxk2=5, fx16384=3, ft_reb=3000, ft_adv=3000, ft_unk=50, ft_trk=10, ft_bad=20, ft_late=500, edge_ne_close=1000, wait_ft=1, why0=10, why1=10, pos0=200, pos2=200, ZA=50, ZB=200, ZC=200, ZD=50, ZE=50, ZF=50, ZG=20)
     check("C 乱数系列の合計で各機能・全 7 種類が使われている (複数根拠・本数不足・計測不能・順序不明・方向不明・同じ足の 2 か所目・未出力 ほか)",
           all(COVER.get(k, 0) >= v for k, v in need.items()), str({k: (COVER.get(k, 0), v) for k, v in need.items() if COVER.get(k, 0) < v}) + str(COVER))
     return last
@@ -1275,9 +1377,10 @@ def fixed_cases():
     check("K 登録した 5 分足ではタッチにしない (次の 5 分足から。価格の位置に現れた Zone は方向不明)",
           ok and r["st"].nEv == 0 and r["st"].nUnk == 1 and r["st"].nCont == 1 and r["zcNZone"][7] == 1, f"{r.state()} | {det}")
     # 17 FIFO
-    r, ev, o = case("A 17 同じ 5 分足で 2 件確定 → 1 足 1 件ずつ出力 (FIFO)", [(4310, 4310, 4279, 4290)] + flat(4290, 9), f10,
+    # ZCR-8: the 30-minute bar also decides every first-touch (open $16 above P0), so the two events are finalized on that bar
+    r, ev, o = case("A 17 同じ 5 分足で 2 件確定 → 1 足 1 件ずつ出力 (FIFO)", [(4310, 4310, 4279, 4290)] + flat(4290, 5) + flat(4306, 4), f10,
                     lambda r, ev, o: len(r.out) == 2 and r.out[1][0] == r.out[0][0] + 1 and [x[1][0] for x in r.out] == [1, 2] and r["st"].nOut == 2)
-    r2 = Runner(ONLY_ZC).run(bars_from_rows([(4310, 4310, 4279, 4290)] + flat(4290, 6), f10))
+    r2 = Runner(ONLY_ZC).run(bars_from_rows([(4310, 4310, 4279, 4290)] + flat(4290, 5) + flat(4306, 1), f10))
     check("A 17b 出力し切れない分は未出力として残る", len(r2.out) == 1 and len(r2["zcQ"]) == 1 and r2["st"].nDone == 2)
     b18 = bars_from_rows([(4304, 4304, 4301, 4303)], D)
     b18[1]["conf"] = False
@@ -1413,20 +1516,173 @@ def before_after(seeds=(1, 2, 3, 4)):
         bars = random_bars(seed, 1500)
         ov = dict(ov, zfUse1=False, zfUse2=False, zfUse3=False, zfUse4=False)      # ZF evidence IDs differ since ZCR-5 (FVG / iFVG split)
         a = Runner(ov, source=old).run(bars)
-        b = Runner(ov).run(bars)
+        b = Runner(dict(ov, zcP0Mode=CLOSE)).run(bars)         # ZCR-8: the close as P0 = the old way
         oaux = lambda x: (x & 0xFF) + (((x >> 16) & 7) << 8)        # noqa: E731   ZCR-3 aux -> current (ZG triple bits 16-18 -> 8-10)
         ra = sorted(key([oaux(int(x)) if i == 15 else x for i, x in enumerate(v) if i not in (0, 7, 13)]) for v in a.records())
-        rb = sorted(key(v[1:]) for v in b.records())
+        rb = sorted(key(v[1:35]) for v in b.records())
         pa = sorted((p["t0"], p["mask"], p["d"], p["rTop"], p["rBot"], p["edge"], p["nPl"], oaux(p["aux"]), p["flags"], p["onMask"], p["side"], tuple(p["wst"])) for p in a.pending())
-        pb = sorted((p["t0"], p["mask"], p["d"], p["rTop"], p["rBot"], p["edge"], p["nPl"], p["aux"], p["flags"], p["onMask"], p["side"], tuple(p["wst"])) for p in b.pending())
+        pb = sorted((p["t0"], p["mask"], p["d"], p["rTop"], p["rBot"], p["edge"], p["nPl"], p["aux"], p["flags"], p["onMask"], p["side"], tuple(p["wst"])) for p in b.pending() if 0 in p["wst"])
         sa, sb = a.state(), b.state()
         sa["nZone"] = sa["nZone"] + [0] * 4
-        same_st = all(sa[k] == sb[k] for k in sb)
+        same_st = all(sa[k] == sb[k] for k in sb if k not in ("nDone", "nOut"))
         multi = sum(1 for v in b.records() if v[12] > 1)
         check(f"H 変更前後 (ZCR-3 79be329 → 現在) で記録が一致 (ID・順番・接触端側メンバーの列を除く全列。seed {seed})",
               ra == rb and pa == pb and same_st and a.rows() == b.rows() and a.sums() == b.sums() and a.rows2() == b.rows2() and len(rb) > 60 and multi > 10,
               f"records {len(ra)} / {len(rb)} pending {len(pa)} / {len(pb)} state={same_st} multi-place records={multi} "
               f"first diff={next(((x, y) for x, y in zip(ra, rb) if x != y), None)}")
+
+
+LEGACY_ST = ("nDone", "nOut", "nFxK1", "nFxK2", "nFxEmpty", "nFtCut")
+
+
+def legacy(r):
+    """the content an older version (before ZCR-8, the close as P0) can be compared on: every record by ID with its first 35 columns
+    (records() includes the events whose windows are done but whose first-touch is open: the old version had output them), the
+    pending observations whose windows are open, the time-window aggregation (4 systems), the counters (without nDone / nOut — the
+    output timing changed — and the newer counters), the creation info. The output order and the count of not-yet-output records are left out."""
+    key = lambda v: tuple(None if x is None else round(x, 6) for x in v)       # noqa: E731
+    lk = ("id", "t0", "p0", "d", "mask", "nEv", "nRaw", "rTop", "rBot", "edge", "cPos", "nPl", "aux", "flags", "onMask", "side", "rmin", "alo", "ahi", "wst", "wmfe", "wmae", "wnb")
+    st = {k: v for k, v in r.state().items() if k not in LEGACY_ST}
+    recs = r.records()
+    return copy.deepcopy(dict(rec={int(v[0]): key(v[:35]) for v in recs}, nrec=len(recs), pend=[{k: p[k] for k in lk} for p in r.pending() if 0 in p["wst"]],
+                              rows=r.rows(), sums=r.sums(), rows2=r.rows2(), sums2=r.sums2(), sys3=r.sysrows(3), sys4=r.sysrows(4), st=st, created=list(r.created),
+                              done=r.state()["nDone"] + sum(1 for p in r.pending() if 0 not in p["wst"])))
+
+
+def ft_cases():
+    """E: ZCR-8 fixed cases — the start point (band edge / close) and the first-touch (open first, unknown order, tracking, unmeasurable,
+    no time limit, widths alone). ZC-D 4300 = band 4298..4302, ZC-W 4301 = band 4299..4303."""
+    D, Wl = zc(2, 1, 4300.0), zc(3, 1, 4301.0)
+    ZCD, ZCW = G["ZC-D"], G["ZC-W"]
+
+    def ec(name, rows, feeds0, cond, ov=None, start=4310.0, base=ONLY_ZC, edit=None, **kw):
+        bars = bars_from_rows(rows, feeds0, start=start)
+        if edit:
+            edit(bars)
+        o = dict(base, zcP0Mode=EDGE)
+        o.update(ov or {})
+        FT_SCEN.append((bars, o))
+        r = Runner(o, **kw).run(bars)
+        orc = oracle(bars, params(r))
+        ok, det = compare(r, orc)
+        ev = orc["events"]
+        c = False
+        try:
+            c = cond(r, ev, orc)
+        except Exception as ex:        # noqa: BLE001
+            det += f" cond raised {ex!r}"
+        check("E " + name, ok and c, f"events={[(e['bar'], e['d'], e['mask'], e['p0'], e['p0c'], e['p0e'], e['fst'], e['fmin'], e['fin']) for e in ev]} "
+              f"out={len(r.out)} pend={len(r['zcPend'])} | {det}")
+        return r, ev, orc
+    ec("帯端 LONG = 採用根拠の帯 (UA) の上端 4302 (終値 4305 ではない)。記録に起点方式 1・P0 終値・P0 帯端", [(4310, 4310, 4301, 4305)] + flat(4320, 8), D,
+       lambda r, ev, o: [(e["d"], e["p0"], e["p0c"], e["p0e"]) for e in ev] == [(1, 430200, 430500, 430200)] and r.records()[0][35:38] == [1, 4305.0, 4302.0]
+       and near(r.records()[0][2], 4302.0) and near(r.records()[0][10], 3.0))
+    ec("帯端 SHORT = UA の下端 4298", [(4290, 4299, 4289, 4297)] + flat(4280, 2), D,
+       lambda r, ev, o: [(e["d"], e["p0"], e["p0c"]) for e in ev] == [(-1, 429800, 429700)], start=4290.0)
+    ec("複数根拠: 共通帯 UA = [4299, 4302] の端 (LONG 4302 / 次の SHORT 4299)", [(4310, 4310, 4301, 4305), (4305, 4320, 4305, 4320)] + flat(4320, 8) + [(4290, 4290, 4290, 4290)] + flat(4290, 7) + [(4290, 4300, 4289, 4295)],
+       merge(D, Wl), lambda r, ev, o: [(e["d"], e["mask"], e["p0"]) for e in ev] == [(1, ZCD + ZCW, 430200), (-1, ZCD + ZCW, 429900)])
+    ec("切り詰めない: 始値が帯の中で直前終値が上 (高安 4299〜4301 は帯の内側) → P0 = 帯の上端 4302 (C の上端 4301 ではない)", [(4300, 4301, 4299, 4300.5)], D,
+       lambda r, ev, o: [(e["d"], e["rTop"], e["p0"], e["flags"] & 8192) for e in ev] == [(1, 430100, 430200, 8192)])
+    k1 = T0 - 3_600_000
+    ec("K2 で外した FVG は帯端に使わない (場所 {上昇 FVG, 線 4302} が下から → 線の帯 4300〜4304 の下端 4300)", [(4298, 4302, 4297, 4301)],
+       merge(zf(1, k1, 4350.0, 1, 4303.0, 4296.0), zc(2, 1, 4302.0)),
+       lambda r, ev, o: [(e["d"], e["mask"], e["p0"], e["flags"] & 16384) for e in ev] == [(-1, ZCD, 430000, 16384)], ov={"zfUse2": True})
+
+    def ma_move(bars):
+        for i, b in enumerate(bars):
+            b["p5"] = 4300.0 if i <= 1 else 4330.0
+    ec("ZB の帯が後で動いても P0 は発生時の帯端のまま (ZB-5m 4300 → 4330)", [(4306, 4306, 4301, 4305)] + flat(4310, 3), {},
+       lambda r, ev, o: [(e["mask"], e["p0"]) for e in ev] == [(G["ZB-5m"], 430200)] and r.pending()[0]["p0"] == 430200,
+       base=OFF, ov={"zbUse2": True}, edit=ma_move)
+    ec("タッチ足の高安は先着に含めない (タッチ足の安値 4296 は逆行側目標 4297 を越えるが数えない。次の足以降で $5 反発先)",
+       [(4306, 4306, 4296, 4303)] + [(4303, 4307, 4303, 4306)], D, lambda r, ev, o: [e["fst"][0] for e in ev] == [1] and ev[0]["fmin"][0] == 5)
+    ec("始値優先: 始値が反発側目標以上なら、同じ足の安値が逆行側目標に届いても反発先", [(4310, 4310, 4301, 4305), (4308, 4308, 4296, 4300)], D,
+       lambda r, ev, o: ev[0]["fst"][0] == 1)
+    ec("始値優先: 始値が逆行側目標以下なら逆行先 (同じ足の高値が反発側目標に届いても)", [(4310, 4310, 4301, 4305), (4296, 4308, 4296, 4300)], D,
+       lambda r, ev, o: ev[0]["fst"][0] == 2)
+    ec("始値が両目標の間で高安が両方に届く → 順序不明", [(4310, 4310, 4301, 4305), (4302, 4308, 4296, 4300)], D,
+       lambda r, ev, o: ev[0]["fst"][0] == 3 and ev[0]["fst"][1:] == [0, 0])
+    ec("履歴末尾で未決着 → 追跡中。30 分の観察が終わっていても記録は出さない (先着待ちで未出力)", [(4310, 4310, 4301, 4305)] + flat(4303, 8), D,
+       lambda r, ev, o: ev[0]["fst"] == [0, 0, 0] and ev[0]["wst"] == [1, 1, 1] and r.out == [] and len(r["zcQ"]) == 0 and len(r["zcPend"]) == 1)
+
+    def bad_at(k):
+        def f(bars):
+            bars[k]["h"] = bars[k]["o"] - 1.0
+        return f
+    ec("不正足 → 未決着の幅は計測不能 (4)。決着済みの幅はそのまま", [(4310, 4310, 4301, 4305), (4305, 4307.5, 4304, 4306)] + flat(4306, 2), D,
+       lambda r, ev, o: ev[0]["fst"] == [1, 4, 4] and ev[0]["fmin"] == [5, None, None] and len(r.out) == 1, edit=bad_at(3))
+    ec("時間制限なし: 30 分を超えて決着 (55 分後に 3 幅とも反発先。記録は 30 分ではなく決着した足で確定し、その足で出る)",
+       [(4310, 4310, 4301, 4305)] + flat(4304, 10) + [(4304, 4317, 4304, 4316)] + flat(4316, 2), D,
+       lambda r, ev, o: ev[0]["fst"] == [1, 1, 1] and ev[0]["fmin"] == [55, 55, 55] and ev[0]["wfin"] == 7 and ev[0]["fin"] == 12 and [i for i, _ in r.out] == [12])
+    ec("幅ごとに独立: $5 は逆行先、$10・$15 は反発先", [(4310, 4310, 4301, 4305), (4300, 4300, 4296.5, 4299), (4299, 4318, 4299, 4317)], D,
+       lambda r, ev, o: ev[0]["fst"] == [2, 1, 1] and ev[0]["fmin"] == [5, 10, 10])
+    ec("閾値は ceil のティック (目標ちょうど 4307.00 は到達、4306.99 は未到達)", [(4310, 4310, 4301, 4305), (4305, 4306.99, 4305, 4306), (4306, 4307, 4306, 4306)], D,
+       lambda r, ev, o: ev[0]["fst"][0] == 1 and ev[0]["fmin"][0] == 10)
+    ec("起点 = タッチ足終値: P0 = 4305、記録の起点方式 0", [(4310, 4310, 4301, 4305), (4305, 4321, 4305, 4320)] + flat(4320, 6), D,
+       lambda r, ev, o: [(e["p0"], e["p0e"]) for e in ev] == [(430500, 430200)] and ev[0]["fst"][0] == 1 and r.records()[0][35] == 0, ov={"zcP0Mode": CLOSE})
+    # the cap of the tracked observations (2): touches of one line re-made by the time departure, the price never $5 away
+    rows = []
+    for _ in range(4):
+        rows += [(4304.5, 4304.5, 4301, 4304.5)] + flat(4304.5, 7)
+    bars = bars_from_rows(rows, D, start=4310.0)
+    r = Runner(dict(ONLY_ZC, zcP0Mode=EDGE), maxpend=2).run(bars)
+    ev_n = r["st"].nEv
+    recs = r.records()
+    cut = [v for v in recs if v[38:41] == [5, 5, 5]]
+    f = r.fsys(1)[1][3]
+    check("E 追跡中の上限 (テストでは 2): 超えたら古い順に先着の未決着を「打ち切り」(5) にして確定・出力。計測不能とは別に数え、集計の合計は崩れない",
+          ev_n == 4 and r["st"].nFtCut == 2 and len(r["zcPend"]) == 2 and len(cut) == 2 and f[5] == 2 and f[3] == 2 and f[4] == 0 and sum(f[:NFT]) == 4,
+          f"events={ev_n} cut={r['st'].nFtCut} pend={len(r['zcPend'])} f={f[:NFT]}")
+
+
+def ua_k2_equiv(seeds=(2, 4, 6)):
+    """E: the UA of the members before K2 gives the same touched-side edge (an FVG removed by K2 never sets that edge: for a SHORT place
+    the open is below the C low set by another member and inside the FVG, so the FVG bottom is lower; LONG the mirror). Checked by running
+    the source with UA over all members (K2 included) — the records must not change."""
+    s0 = read(PINE)
+    ua = ("            uaLo := na(uaLo) ? z.tb : math.max(uaLo, z.tb)\n            uaHi := na(uaHi) ? z.tt : math.min(uaHi, z.tt)\n")
+    assert s0.count(ua) == 1 and s0.count("        if xz\n            nX += 1\n") == 1
+    s1 = s0.replace(ua, "").replace("        if xz\n            nX += 1\n", "        if isM\n" + ua.replace("            ", "            ", 2) + "        if xz\n            nX += 1\n")
+    same, k2 = True, 0
+    for seed in seeds:
+        ov = dict(RANDOM_PRM[seed % len(RANDOM_PRM)], zcP0Mode=EDGE)
+        bars = random_bars(seed, 1500)
+        a, b = Runner(ov).run(bars), Runner(ov, source=s1).run(bars)
+        same &= a.snapshot() == b.snapshot()
+        k2 += a["st"].nFxK2
+    check("E K2 前のメンバーで UA を作っても接触側の帯端は変わらない (K2 で外す FVG は接触側の端を決めない。乱数 3 系列で記録・集計が同一)", same and k2 > 0, f"K2 {k2}")
+
+
+FT_SCEN = []                 # the bars of the E cases (the mutation check X also runs them)
+P_REV = "08c2410"            # ZCR-7 (+ doc): the last version with the close as the only P0 and no first-touch
+
+
+def p0_before_after(seeds=(1, 2, 3, 4)):
+    """P: with 計測起点 = タッチ足終値 every old record column (35), the time-window aggregation of the 4 systems and the counters ==
+    08c2410 (ZF on, the random parameters as they are). With the band edge the P0 column differs and nothing else of the event set."""
+    try:
+        old = subprocess.run(["git", "show", P_REV + ":ZoneConfluenceReactionStatsXAU.pine"], cwd=ROOT, capture_output=True, text=True, check=True).stdout
+    except Exception as ex:        # noqa: BLE001
+        check("P 変更前 (ZCR-7 08c2410) の本体を git から取得", False, repr(ex))
+        return
+    for seed in seeds:
+        ov = RANDOM_PRM[seed % len(RANDOM_PRM)]
+        bars = random_bars(seed, 1500)
+        a = Runner(ov, source=old).run(bars)
+        b = Runner(dict(ov, zcP0Mode=CLOSE)).run(bars)
+        la, lb = legacy(a), legacy(b)
+        diff = [k for k in la if la[k] != lb[k]]
+        wait = sum(1 for p in b.pending() if 0 not in p["wst"])
+        check(f"P seed {seed}: 計測起点 = タッチ足終値 のとき、記録の既存 35 列 (ID ごと)・観察期間の追跡中・時間内集計 (4 系統)・件数が 08c2410 と一致 "
+              "(出力の順番・未出力件数は比較外: 先着の決着を待つため)",
+              not diff and la["nrec"] > 300, f"differs: {diff}; records {la['nrec']}; waiting for the first-touch {wait}")
+        e = Runner(dict(ov, zcP0Mode=EDGE)).run(bars)
+        ea, eb = {v[0]: v for v in e.records()}, {v[0]: v for v in b.records()}
+        same_ev = sorted(ea) == sorted(eb) and all(ea[i][1] == eb[i][1] and ea[i][3:10] == eb[i][3:10] and ea[i][11:14] == eb[i][11:14] and near(ea[i][36], eb[i][36]) and near(ea[i][37], eb[i][37]) for i in ea)
+        moved = sum(1 for i in ea if not near(ea[i][2], eb[i][2]))
+        check(f"P seed {seed}: 計測起点 = 接触側の帯端 でもイベントの集合・時刻・方向・根拠・C・接触端・P0 終値 / 帯端の列は同じ。計測に使う P0 (列 2) だけが帯端になる",
+              same_ev and moved > 0 and all(near(ea[i][2], ea[i][37]) and ea[i][35] == 1 for i in ea) and all(near(eb[i][2], eb[i][36]) and eb[i][35] == 0 for i in eb),
+              f"events {len(ea)} / {len(eb)}; P0 moved {moved}")
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -1520,28 +1776,22 @@ def fvg_before_after(seeds=(1, 2, 3, 4)):
     for a, b in FX_OFF:
         assert off.count(a) == 1, a
         off = off.replace(a, b)
-    nf = ("nFxK1", "nFxK2", "nFxEmpty")
-
-    def snap(r):
-        sn = r.snapshot()
-        for k in nf:
-            sn["st"].pop(k, None)
-        return sn
+    snap = legacy
     tot_changed = tot_ev = tot_k = 0
     for seed in seeds:
         ov = RANDOM_PRM[seed % len(RANDOM_PRM)]
         bars = random_bars(seed, 1500)
-        ovo = dict(ov, zfUse1=False, zfUse2=False, zfUse3=False, zfUse4=False)
+        ovo = dict(ov, zfUse1=False, zfUse2=False, zfUse3=False, zfUse4=False, zcP0Mode=CLOSE)
         a, b = Runner(ovo, source=old).run(bars), Runner(ovo).run(bars)
-        check(f"V seed {seed}: ZF OFF では記録・追跡中・集計 (4 系統)・件数・出力が変更前 (d093c03) と完全一致 (ID 含む)",
+        check(f"V seed {seed}: ZF OFF では記録・追跡中・集計 (4 系統)・件数が変更前 (d093c03) と完全一致 (ID 含む。ZCR-8 以後は起点 = 終値で、出力の順番・未出力件数を除く)",
               snap(a) == snap(b) and len(b.records()) > 60 and b["st"].nFxK1 == 0)
-        ovn = dict(ov, zfUse1=True, zfUse2=True, zfUse3=True, zfUse4=True)
+        ovn = dict(ov, zfUse1=True, zfUse2=True, zfUse3=True, zfUse4=True, zcP0Mode=CLOSE)
         a = Runner(ovn, source=old).run(bars)
         c = Runner(ovn, source=off).run(bars)
         b = Runner(ovn).run(bars)
         orc = oracle(bars, params(b))
         tc_bar = {bb.get("tc", bb["t"] + M5): i for i, bb in enumerate(bars)}
-        key = lambda v: tuple(-1e18 if x is None else round(x, 6) for x in v[1:])     # noqa: E731
+        key = lambda v: tuple(-1e18 if x is None else round(x, 6) for x in v[1:35])     # noqa: E731
         fx = orc["fxBars"]
 
         def split(recs):
@@ -1552,7 +1802,7 @@ def fvg_before_after(seeds=(1, 2, 3, 4)):
         ai, ao = split(a.records())
         bi_, bo = split(b.records())
         pa = sorted((p["t0"], p["mask"], p["d"], p["rTop"], p["rBot"], p["flags"]) for p in a.pending() if tc_bar[p["t0"]] not in fx)
-        pb = sorted((p["t0"], p["mask"], p["d"], p["rTop"], p["rBot"], p["flags"]) for p in b.pending() if tc_bar[p["t0"]] not in fx)
+        pb = sorted((p["t0"], p["mask"], p["d"], p["rTop"], p["rBot"], p["flags"]) for p in b.pending() if tc_bar[p["t0"]] not in fx and 0 in p["wst"])
         changed = len(set(ai) ^ set(bi_))
         tot_changed += changed
         tot_ev += len(b.records())
@@ -1828,14 +2078,14 @@ def render(r, src, **sel):
               table=NS_(new=tnew, cell=lambda t, c, rr, s="", **kw: t.cell(c, rr, s, **kw), merge_cells=lambda t, *a: t.merge(*a),
                         delete=lambda t: setattr(t, "deleted", True)), text=NS_(align_left="left"), format=NS_(mintick="mintick"),
               syminfo__tickerid="OANDA:XAUUSD", timeframe__period="5", chart=NS_(is_standard=True), zcTbl=None)
-    inp = dict(zcView="主表", zcKind="根拠集合 (完全一致)", zcDirMode="LONG / SHORT 別", zcHzMode="全期間", zcOnMode="含める", zcPlMode="全件",
+    inp = dict(zcView="主表: 先着", zcKind="根拠集合 (完全一致)", zcDirMode="LONG / SHORT 別", zcHzMode="全期間", zcOnMode="含める", zcPlMode="全件",
                zcPerPage=5, zcPage=1, zcTxtSize="small", zcPos="top_right")
     inp.update(sel)
     ns.update(inp)
     code = src[src.index("// ---- 表 (集計値には影響しない"):src.index("// ---- イベント記録の出力")]
     assert code.count("var table zcTbl = na") == 1
     code = code.replace("var table zcTbl = na", "zcTbl = na")
-    exec(compile(ap.Translator(known_types={"ZcRow"}).translate(ap.logical_lines(code)), "<ZCR table>", "exec"), ns)
+    exec(compile(ap.Translator(known_types={"ZcRow", "ZcObs"}).translate(ap.logical_lines(code)), "<ZCR table>", "exec"), ns)
     assert len(tbls) == 1
     return tbls[0]
 
@@ -1856,14 +2106,14 @@ def table_render_checks(seed=1):
     src = read(PINE)
     bars = random_bars(seed, 1500)
     r = Runner(RANDOM_PRM[seed % len(RANDOM_PRM)]).run(bars)
-    views = ["主表", "詳細: 件数内訳", "詳細: 初回到達時間", "詳細: MFE・MAE", "詳細: 到達前逆行", "詳細: 状態・注記"]
-    ncols = {"主表": 7, "詳細: 件数内訳": 11, "詳細: 状態・注記": 2}
+    views = ["主表: 先着", "主表: 時間内到達", "詳細: 件数内訳", "詳細: 初回到達時間", "詳細: MFE・MAE", "詳細: 到達前逆行", "詳細: 状態・注記"]
+    ncols = {"主表: 先着": 9, "主表: 時間内到達": 7, "詳細: 件数内訳": 11, "詳細: 状態・注記": 2}
     bad, n_tab, longest = [], 0, ("", "")
     for v in views:
         for dmode in ("LONG / SHORT 別", "LONG＋SHORT合算", "LONGのみ", "SHORTのみ"):
             for hz in ("全期間", "5分", "30分"):
                 for kind in ("根拠集合 (完全一致)", "根拠数別"):
-                    for one, on in (SEL if v == "主表" and dmode == "LONG / SHORT 別" and hz == "全期間" else SEL[:1]):
+                    for one, on in (SEL if v.startswith("主表") and dmode == "LONG / SHORT 別" and hz == "全期間" else SEL[:1]):
                         for per, page in ((5, 1), (5, 2), (3, 999), (10, 1)):
                             sel = dict(zcView=v, zcDirMode=dmode, zcHzMode=hz, zcKind=kind, zcPlMode="場所数 1 のみ" if one else "全件", zcOnMode=on,
                                        zcPerPage=per, zcPage=page, zcTxtSize=("tiny", "small", "normal", "large")[n_tab % 4], zcPos="bottom_left" if n_tab % 2 else "top_right")
@@ -1874,7 +2124,7 @@ def table_render_checks(seed=1):
                                 continue
                             n_tab += 1
                             nDir = 2 if dmode == "LONG / SHORT 別" else 1
-                            nHz = 3 if hz == "全期間" else 1
+                            nHz = 3 if hz == "全期間" or v == "主表: 先着" else 1
                             err = []
                             if any(m[0] != m[2] for m in t.merges):
                                 err.append("horizontal merge")
@@ -1890,9 +2140,22 @@ def table_render_checks(seed=1):
                                 shown = rows[(pg - 1) * per:pg * per]
                                 if t.rows != 2 + len(shown) * nDir * nHz or t.cells[(1, 0)]["text"] != f"{pg}/{pages}頁":
                                     err.append(("rows / page", t.rows, len(shown), t.cells[(1, 0)]["text"]))
-                                if v != "主表" and any(m for m in t.merges if m[2] == 0 and m[3] - m[1] + 1 != nDir * nHz):
+                                if not v.startswith("主表") and any(m for m in t.merges if m[2] == 0 and m[3] - m[1] + 1 != nDir * nHz):
                                     err.append("combination merge")
-                                if v == "主表":
+                                if v == "主表: 先着":
+                                    rr = 2
+                                    for q in shown:
+                                        if (0, rr, 0, rr + nDir * 3 - 1) not in t.merges:
+                                            err.append(("name merge", rr))
+                                        for dm in (["LONGのみ", "SHORTのみ"] if nDir == 2 else [dmode]):
+                                            for j in range(3):
+                                                f = [ns["f_dsF"](q, dm, j, k, one, on) for k in range(NFT)]
+                                                exp = [str(f[0]), str(f[1]), ns["f_dsFRate"](f[0], f[1]), str(f[2]), str(f[3]), str(f[4]) + (f" (+{f[5]})" if f[5] else "")]
+                                                got = [t.cells[(c, rr)]["text"] for c in range(3, 9)]
+                                                if got != exp or t.cells[(2, rr)]["text"] != ("$5", "$10", "$15")[j] or sum(f) != ns["f_dsEv"](q, dm, one, on):
+                                                    err.append(("first-touch values", rr, got, exp))
+                                                rr += 1
+                                if v == "主表: 時間内到達":
                                     rr = 2
                                     for q in shown:
                                         if nDir * nHz > 1 and (0, rr, 0, rr + nDir * nHz - 1) not in t.merges:
@@ -1925,10 +2188,10 @@ def table_render_checks(seed=1):
         ok0 = False
         bad.append(("empty / stopped", repr(ex)))
     check("R 確定足なし・集計停止 (5分の標準チャート以外) の表も範囲内で描ける", ok0)
-    check(f"R 表の描画コードそのものを模擬 table で実行 ({n_tab} 表: 表示切替 6 × 方向 4 × 観察期間 3 × 表の行 2 × ページ 4、主表は絞り込み 6 通り): 範囲外のセル・結合なし、結合は縦だけで重ならない、"
-          "全行使用、主表 7 列・1 組合せ × 1 方向 = 3 行・組合せ名は縦結合、行数とページ表示、主表の数値 = Display calc、文字サイズ・位置は入力どおり、"
+    check(f"R 表の描画コードそのものを模擬 table で実行 ({n_tab} 表: 表示切替 7 × 方向 4 × 観察期間 3 × 表の行 2 × ページ 4、主表 2 種は絞り込み 6 通り): 範囲外のセル・結合なし、結合は縦だけで重ならない、"
+          "全行使用、主表: 先着 9 列・1 組合せ × 1 方向 = 幅 3 行 (反発先 + 逆行先 + 順序不明 + 追跡中 + 計測不能 + 打ち切り = 発生)、主表: 時間内到達 7 列・3 行・組合せ名は縦結合、行数とページ表示、主表の数値 = Display calc、文字サイズ・位置は入力どおり、"
           "セルの 1 行は半角 24 桁 (全角 12 文字) 以内 (組合せ名は 1 行 2 根拠まで)",
-          not bad and n_tab > 500, f"bad={len(bad)} first={bad[:2]} longest(組合せ名以外)={longest}")
+          not bad and n_tab > 600, f"bad={len(bad)} first={bad[:2]} longest(組合せ名以外)={longest}")
     return r
 
 
@@ -1967,6 +2230,14 @@ MUTATIONS = [
     ("iFVG にも方向条件を掛ける", "    not (z.typ == 4 and not z.inv) or f_zcFvgDir", "    not (z.typ == 4) or f_zcFvgDir"),
     ("方向不明の FVG を外さない", "f_zcFvgDir(z, o) == z.sub\n", "f_zcFvgDir(z, o) != -z.sub\n"),
     ("K2 のフラグ 16384 を付けない", " + (nX > 0 ? 16384 : 0)", ""),
+    # ZCR-8: start point and first-touch
+    ("先着: 始値優先を外す", "int res = fOn >= w ? 1 : -fOn >= w ? 2 : fFv >= w", "int res = fFv >= w"),
+    ("先着: 到達を「以上」から「超」へ (閾値の丸め)", "fFv >= w and fAd >= w ? 3 : fFv >= w ? 1 : fAd >= w ? 2 : 0", "fFv > w and fAd > w ? 3 : fFv > w ? 1 : fAd > w ? 2 : 0"),
+    ("帯端に足の高安で切り詰めた C を使う", "p0e = dp == 1 ? uaHi : uaLo", "p0e = dp == 1 ? pHi : pLo"),
+    ("先着に時間制限 (30 分) を残す", "            if array.get(ob.fSt, j) == 0\n                int w   =", "            if array.get(ob.fSt, j) == 0 and tc <= ob.t0 + 30 * ZC_M1\n                int w   ="),
+    ("帯端の起点を使わない (常に終値)", "        if zcEdgeP0\n            ob.p0 := ob.p0e\n", "        if false\n            ob.p0 := ob.p0e\n"),
+    ("先着の決着を待たずに記録を出す", "    bool done = left == 0 and not f_zcFtOpen(ob)\n", "    bool done = left == 0\n"),
+    ("不正足で未決着を計測不能にしない", "                f_zcFtSet(ob, j, 4, tc)\n", "                f_zcFtSet(ob, j, 3, tc)\n"),
 ]
 
 
@@ -1978,7 +2249,7 @@ def mutations(bars, ov):
             continue
         caught = False
         try:
-            for bb, oo in [(bars, ov)] + FX_SCEN:          # random bars, then the fixed FVG cases (F)
+            for bb, oo in [(bars, ov)] + FX_SCEN + FT_SCEN:          # random bars, then the fixed FVG cases (F) and first-touch cases (E)
                 r = Runner(oo, source=s.replace(old, new)).run(bb)
                 if not compare(r, oracle(bb, params(r)))[0]:
                     caught = True
@@ -2062,9 +2333,9 @@ def static():
           not re.search(r"\brequest\.|\bta\.", lg) and not re.search(r"\w\[", lg) and "zcBase" not in s and "本数不足) の間は" not in s and "ZcObs.new(st.oSeq, time_close, c, dp," in lg)
     plots = re.findall(r'^plot\((.+?),\s+"([^"]+)"', code, re.M)
     ev = [p for p in plots if p[1].startswith("EV ")]
-    check("S plot 40 本 (上限 64)。EV 記録 35 本が zcOut の 0..34 の順 (順番・接触端側メンバーの列なし)。マスク: 根拠 26 ビット (< 2^26)・補助 11 ビット・辺 20 ビット",
+    check("S plot 49 本 (上限 64)。EV 記録 44 本が zcOut の 0..43 の順 (順番・接触端側メンバーの列なし)。マスク: 根拠 26 ビット (< 2^26)・補助 11 ビット・辺 20 ビット",
           "f_zcAux" in code and "z.typ == 6 ? (z.sub == 1 ? 14 : 17) + z.tf : -1" in code and "array.get(zcPow, 8 + z.tf)" in code and code.count("33554432)") == 1 and "int   ZC_NG     = 26" in code and "z.typ == 4 and z.inv ? 22 + z.tf : z.gid" in code
-          and len(plots) == 40 and len(re.findall(r"\bplot\(", code)) == 40 and "ob.ord" not in code and "nEv2" not in code and "場所の順番" not in code
+          and len(plots) == 49 and len(re.findall(r"\bplot\(", code)) == 49 and "ob.ord" not in code and "nEv2" not in code and "場所の順番" not in code
           and [p[0] for p in ev] == [f"array.get(zcOut, {i})" for i in range(NF)] and f"int   ZC_NF     = {NF}" in code, f"{len(plots)} {len(ev)}")
     li, mi = ap.inputs(lab), ap.inputs(s)
     shared = [k for k in mi if k in li and re.match(r"(zHalf|zaUse|zaKeep|accum|zbUse|zbLen|zcUse|zcPiv|zdUse|zeUse|zfUse|zfMinW|zgUse|zgExp|zgHalf|zgRev|zg(Piv|Wave|Buf|Dist|Gap|Body|Ratio|Wait|Max|Dir|Sep))", k)]
@@ -2103,17 +2374,26 @@ def static():
             dr = t.index("// ---- 描画 (集計値には影響しない)")
             tb = t.index("// ---- 表 (集計値には影響しない")
             ev = t.index("// ---- イベント記録の出力")
-            return dict(head=t[:g], body=t[za:t.index(BEGIN)], draw=t[dr:tb], out=t[ev:])
+            head = "\n".join(ln for ln in t[:g].split("\n") if not ln.startswith("//"))
+            hl, skip = [], False
+            for ln in head.split("\n"):                   # ZCR-8: the new input (and the header comments) are left out
+                skip = ln.startswith("zcP0Mode = ") or (skip and ln.startswith("     "))
+                if not skip:
+                    hl.append(ln)
+            head = "\n".join(hl)
+            out = "\n".join(ln for ln in t[ev:].split("\n") if not re.search(r"zcOut, (2|3[5-9]|4[0-3])\)", ln))   # ZCR-8: the new columns and the P0 title
+            return dict(head=head, body=t[za:t.index(BEGIN)], draw=t[dr:tb], out=out)
         po, pn = parts(o), parts(s)
         same_parts = {k: po[k] == pn[k] for k in po}
-        check("S 表示以外は変更前 (47ebe23) と byte 一致: 冒頭〜表示の入力の前 / Zone 検知・登録 (ZCR Logic 区間の前まで) / 描画 (枠・印) / イベント記録の出力 (plot 40 本) 〜末尾。"
+        check("S 表示以外は変更前 (47ebe23) と byte 一致: 冒頭〜表示の入力の前 (ZCR-8: 冒頭のコメントと入力「計測起点」を除く) / Zone 検知・登録 (ZCR Logic 区間の前まで) / 描画 (枠・印) / "
+              "イベント記録の出力 (plot 40 本。ZCR-8: 追加 9 本と列 2 の名前を除く) 〜末尾。"
               "ZCR Logic 区間は ZCR-7 (通常 FVG の方向条件) だけ変更 (オラクル照合と変更前後比較 V で確認)",
-              all(same_parts.values()) and len(pn["out"]) > 2000 and pn["out"].count("plot(") == 40, str(same_parts))
+              all(same_parts.values()) and len(pn["out"]) > 2000 and pn["out"].count("plot(") == 39, str(same_parts))
         gd_o = o[o.index("var string G_DS = "):o.index("\n// ---- ZA: Accum 検出")].split("\n")
         gd_n = s[s.index("var string G_DS = "):s.index("\n// ---- ZA: Accum 検出")].split("\n")
         kept = [ln for ln in gd_o if not ln.startswith(("zcView ", "zcTopN "))]
         check("S 表示の入力: 表示切替を 主表 / 詳細 5 種にし、zcTopN を外して 1 ページの組合せ数 (5)・ページ (1)・文字サイズ (small)・表示位置 (top_right) を追加。他の表示の入力は同じ行のまま",
-              all(ln in gd_n for ln in kept) and "zcTopN" not in s and mi["zcView"] == "主表" and mi["zcPerPage"] == 5 and mi["zcPage"] == 1 and mi["zcTxtSize"] == "small" and mi["zcPos"] == "top_right")
+              all(ln in gd_n for ln in kept) and "zcTopN" not in s and mi["zcView"] == "主表: 先着" and mi["zcPerPage"] == 5 and mi["zcPage"] == 1 and mi["zcTxtSize"] == "small" and mi["zcPos"] == "top_right")
     disp = s[s.index("// ---- 表 (集計値には影響しない"):s.index("// ---- イベント記録の出力")]
     dcode = "\n".join(ap.strip_comment(x) for x in disp.split("\n"))
     merges = re.findall(r"table\.merge_cells\(([^)]*)\)", dcode)
@@ -2145,6 +2425,9 @@ def main():
     table_render_checks()
     fvg_cases()
     fvg_before_after()
+    ft_cases()
+    ua_k2_equiv()
+    p0_before_after()
     causality(bars, ov)
     mutations(random_bars(10), dict(RANDOM_PRM[10 % len(RANDOM_PRM)], zbWarm1=300))
     bad = 0
