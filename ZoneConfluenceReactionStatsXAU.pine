@@ -744,7 +744,7 @@ type ZcObs
     int edge           // 接触端 = 始値で方向が決まった場合は C の接近側の端、直前終値で決まった場合 (始値が既に C の中) は始値
     int cPos           // タッチ足の終値の位置 0 C の手前 / 1 C の中 / 2 C の向こう側へ抜けた
     int aux            // 補助マスク
-    int flags          // 512 / 1024 タッチ時に ZB-1m / ZB-5m が不明、2048 ZE が受信不正、4096 接触中だった根拠を含む、8192 方向を直前終値で決めた
+    int flags          // 512 / 1024 タッチ時に ZB-1m / ZB-5m が不明、2048 ZE が受信不正、4096 接触中だった根拠を含む、8192 方向を直前終値で決めた、16384 場所の方向と向きが合わない通常 FVG を根拠から外した (K2)
     int onMask         // タッチの前から接触中だったメンバーの根拠マスク
     int side           // 辺マスク (ZA 上辺 / 下辺、ZC 高値線 / 安値線、ZG トップ / ボトム)
     array<int> rMin    // 反発幅ごとの初回到達分 (na = 未到達)
@@ -802,6 +802,9 @@ type ZcSt
     int   nMa5Ev   = 0       // タッチ時に ZB-5m が不明だったイベント
     int   nZeEv    = 0       // タッチ時に ZE が受信不正だったイベント
     int   rowOver  = 0
+    int   nFxK1    = 0       // 方向条件で外した通常 FVG のタッチ (K1: FVG 自身の帯で見た接近方向が FVG の向きと合わない。足 × FVG)
+    int   nFxK2    = 0       // 場所の段階で外した通常 FVG (K2: 場所の方向と FVG の向きが合わない。足 × 場所 × FVG)
+    int   nFxEmpty = 0       // K2 で外した結果メンバーが残らなかった場所 (イベントにしない)
     int   firstT   = na
     int   lastT    = na
     int   nBars    = 0
@@ -851,7 +854,8 @@ var array<int>    zcMaUnk = array.new_int(2, 0)         // MA が不明だった
 var array<int>    zcZeBad = array.new_int(2, 0)         // ZE が未接続・誤接続 (状態 9) だった確定足 (時間足ごと)
 var array<int>    zcZdBad = array.new_int(4, 0)         // ZD が正常でなかった確定足 (時間足ごと)
 var array<int>    zcWhy   = array.new_int(3, 0)         // 計測不能にした観察期間: 0 期間内の足が 0 本 / 1 不正足
-var array<LbZone> zcT     = array.new<LbZone>()         // 作業用: この足でタッチした Zone
+var array<LbZone> zcT     = array.new<LbZone>()         // 作業用: この足でタッチした Zone (方向条件に合わない通常 FVG は除いたもの)
+var array<int>    zcTx    = array.new_int(0)            // 作業用: zcT と同じ並び。0 未使用 / 1 どこかの場所の根拠に入った / 2 場所の段階で外しただけ (K2。接触中の印を付けない)
 var array<int>    zcPL    = array.new_int(0)            // 作業用: この足の場所の共通区間 C の下端・上端 (価格の低い順)
 var array<int>    zcPH    = array.new_int(0)
 var array<int>    zcUL    = array.new_int(0)            // 作業用: 場所のメンバーの帯そのものの共通区間 U (切り詰めない) の下端・上端
@@ -1403,9 +1407,21 @@ f_zcSide(LbZone z) =>
 f_zcDir(int pLo, int pHi, int uLo, int uHi, int o) =>
     o > pHi ? 1 : o < pLo ? -1 : not st.pcOk ? 0 : st.pC > uHi ? 1 : st.pC < uLo ? -1 : 0
 
+// 通常 FVG (ZF で iFVG でないもの) の方向条件。上昇 FVG (sub 1) は上から、下降 FVG (sub -1) は下からのタッチだけ根拠にする。
+//  FVG 自身の帯 [tb, tt] で接近方向を決める (場所と同じ規則): 始値が帯の上 = 上から / 下 = 下から / 帯の中なら直前の有効な足の終値が
+//  帯の上 / 下、帯の中・不明 = 方向不明 (0。どちらの向きとも合わない)。iFVG と他の種類は常に適格
+f_zcFvgDir(LbZone z, int o) =>
+    o > z.tt ? 1 : o < z.tb ? -1 : not st.pcOk ? 0 : st.pC > z.tt ? 1 : st.pC < z.tb ? -1 : 0
+
+f_zcFvgOk(LbZone z, int o) =>
+    not (z.typ == 4 and not z.inv) or f_zcFvgDir(z, o) == z.sub
+
 // 場所 1 つ (共通区間 C = [pLo, pHi]、接近方向 dp)。メンバー = この足でタッチした Zone のうち帯が pLo を含むもの (全員が C 全体を含む)。
 //  メンバー全員が (この足の前から) 接触中なら継続中 (イベントにしない)。そうでなければ、集計開始前・助走中は件数だけ、
 //  dp = 0 は方向不明として別計上、それ以外はイベント (接触中だったメンバーの根拠は onMask に残す)。
+//  K2: dp が決まった (±1) 場所で、向きが dp と違う通常 FVG がメンバーに残っていれば (始値が FVG の帯の中のときに起こり得る)、
+//  その FVG をこの場所の根拠から外す (根拠・本数・補助 / 辺 / 接触中マスク・継続中の判定に入れない。C と方向は計算し直さない)。
+//  外した場所のイベントには状態フラグ 16384。メンバーが残らなければイベントにしない (件数だけ)。戻り値 = メンバーが残った
 f_zcPlace(int pLo, int pHi, int dp, int o, int c, bool live) =>
     bool allOn  = true
     int  nRaw   = 0
@@ -1414,9 +1430,17 @@ f_zcPlace(int pLo, int pHi, int dp, int o, int c, bool live) =>
     int  aux    = 0
     int  onMask = 0
     int  side   = 0
+    int  nX     = 0
     for q = 0 to array.size(zcT) - 1
         LbZone z = array.get(zcT, q)
-        if z.tb <= pLo and z.tt >= pLo
+        bool   isM = z.tb <= pLo and z.tt >= pLo
+        bool   xz  = isM and dp != 0 and z.typ == 4 and not z.inv and z.sub != dp
+        if xz
+            nX += 1
+            if array.get(zcTx, q) == 0
+                array.set(zcTx, q, 2)
+        if isM and not xz
+            array.set(zcTx, q, 1)
             allOn := allOn and z.isOn
             nRaw += 1
             int gb = array.get(zcPow, f_zcGid(z))
@@ -1437,9 +1461,12 @@ f_zcPlace(int pLo, int pHi, int dp, int o, int c, bool live) =>
             if si >= 0
                 if not f_has(side, array.get(zcPow, si))
                     side += array.get(zcPow, si)
-    ZcRow rs = array.get(zrSum, math.min(nG, 3) - 1)
+    st.nFxK2 += nX
+    ZcRow rs = array.get(zrSum, math.max(math.min(nG, 3), 1) - 1)
     ZcRow ra = array.get(zrSum, 3)
-    if allOn
+    if nRaw == 0
+        st.nFxEmpty += 1
+    else if allOn
         st.nCont += 1
     else if not live
         st.nPre += 1
@@ -1469,7 +1496,7 @@ f_zcPlace(int pLo, int pHi, int dp, int o, int c, bool live) =>
         int  edge = byPc ? o : dp == 1 ? pHi : pLo
         int cPos = dp == 1 ? (c > pHi ? 0 : c >= pLo ? 1 : 2) : (c < pLo ? 0 : c <= pHi ? 1 : 2)
         ZcObs ob = ZcObs.new(st.oSeq, time_close, c, dp, mask, nG, nRaw, pHi, pLo, edge, cPos, aux,
-             (u1 ? 512 : 0) + (u5 ? 1024 : 0) + (ue ? 2048 : 0) + (onMask > 0 ? 4096 : 0) + (byPc ? 8192 : 0), onMask, side,
+             (u1 ? 512 : 0) + (u5 ? 1024 : 0) + (ue ? 2048 : 0) + (onMask > 0 ? 4096 : 0) + (byPc ? 8192 : 0) + (nX > 0 ? 16384 : 0), onMask, side,
              array.new_int(3, na), array.new_int(3, na), array.new_int(3, na), array.new_int(3, 0), array.new_int(3, na), array.new_int(3, na), array.new_int(3, 0))
         array.push(zcPend, ob)
         int di = dp == 1 ? 0 : 1
@@ -1481,7 +1508,7 @@ f_zcPlace(int pLo, int pHi, int dp, int o, int c, bool live) =>
         array.push(zcEvBot, pLo)
         array.push(zcEvD, dp)
         array.push(zcEvN, nG)
-    true
+    nRaw > 0
 
 // 確定 5分足 (ティック) のタッチ判定。live = false (集計開始前・助走中) はイベントを作らない (接触中の状態は通常どおり更新)。
 //  (1) タッチした Zone = 有効な Zone で帯が [l, h] と重なるもの。帯を [l, h] に切り詰めた区間で考える。
@@ -1491,6 +1518,9 @@ f_zcPlace(int pLo, int pHi, int dp, int o, int c, bool live) =>
 //  (3) 場所を価格の低い順に 1 回ずつ判定する (足の中の接触順や、最初に触れた場所は扱わない)。場所の接近方向は始値と C、
 //      始値が C の中なら直前終値と U (メンバーの帯そのものの共通区間) で決める (f_zcDir)。
 //  (4) 接触中の印はこの足の全部の場所を判定した後に付ける (判定はこの足の前の状態で行う)。
+//  (0) 方向条件 (K1): タッチした通常 FVG のうち、FVG 自身の帯で見た接近方向が向きと合わないもの (上昇 FVG に下から・下降 FVG に
+//      上から・方向不明) は、場所を作る前に一覧から外す (この足では無いものとして扱う: 場所・根拠・方向不明・継続中の判定に入れず、
+//      接触中の印も付けない)。場所の段階でさらに外したもの (K2) にも印を付けない (別の場所で根拠に入ったものには付ける)。
 f_zcTouch(int o, int h, int l, int c, bool live) =>
     array.clear(zcT)
     array.clear(zcPL)
@@ -1509,7 +1539,18 @@ f_zcTouch(int o, int h, int l, int c, bool live) =>
             LbZone mz = array.get(zcMa, k)
             if mz.tt >= l and mz.tb <= h
                 array.push(zcT, mz)
+    int qx = 0
+    while qx < array.size(zcT)
+        if f_zcFvgOk(array.get(zcT, qx), o)
+            qx += 1
+        else
+            array.remove(zcT, qx)
+            st.nFxK1 += 1
+    array.clear(zcTx)
     int nT    = array.size(zcT)
+    if nT > 0
+        for q = 0 to nT - 1
+            array.push(zcTx, 0)
     int nPl   = 0
     int pend0 = array.size(zcPend)
     if nT > 0
@@ -1555,11 +1596,12 @@ f_zcTouch(int o, int h, int l, int c, bool live) =>
             int pLo = array.get(zcPL, k)
             int pHi = array.get(zcPH, k)
             int dp  = f_zcDir(pLo, pHi, array.get(zcUL, k), array.get(zcUH, k), o)
-            if dp != 0
+            bool kept = f_zcPlace(pLo, pHi, dp, o, c, live)
+            if dp != 0 and kept
                 nPl += 1
-            f_zcPlace(pLo, pHi, dp, o, c, live)
         for q = 0 to nT - 1
-            f_zcSetOn(array.get(zcT, q))
+            if array.get(zcTx, q) != 2
+                f_zcSetOn(array.get(zcT, q))
     int pend1 = array.size(zcPend)
     if pend1 > pend0
         for q = pend0 to pend1 - 1
@@ -2237,6 +2279,11 @@ if barstate.islast
         f_item(ks, vs, ts, ws, "ZD POC D/W", f_zdName(array.get(lbZdStat, 2)) + " / " + f_zdName(array.get(lbZdStat, 3)), "", array.get(lbZdStat, 2) == 9 or array.get(lbZdStat, 3) == 9)
         f_item(ks, vs, ts, ws, "FVG → iFVG", str.tostring(st.nIfvg) + " 回", "", false)
         f_item(ks, vs, ts, ws, "iFVG 無効", str.tostring(st.nFvgDead) + " 回", "", false)
+        f_item(ks, vs, ts, ws, "FVG 方向で除外", str.tostring(st.nFxK1) + " 回", "方向条件で外した通常 FVG のタッチ (足 × FVG。助走中も数える)。上昇 FVG は上から・下降 FVG は下からのタッチだけ根拠にする。" +
+             "接近方向は FVG 自身の帯で判定 (始値が帯の外ならその側、帯の中なら直前終値。不明も外す)。外した FVG はその足では無いものとして扱い、接触中の印も付けない", false)
+        f_item(ks, vs, ts, ws, "FVG 場所で除外", str.tostring(st.nFxK2) + " 回", "場所の方向 (LONG / SHORT) と向きが合わない通常 FVG を、その場所の根拠から外した回数 (足 × 場所 × FVG)。" +
+             "始値が FVG の帯の中のときに起こり得る。外したイベントには状態フラグ 16384。共通区間 C と方向は計算し直さない", false)
+        f_item(ks, vs, ts, ws, "除外で空の場所", str.tostring(st.nFxEmpty) + " 個", "場所の段階で通常 FVG を外した結果、メンバーが残らなかった場所 (イベントにしない)", false)
         f_item(ks, vs, ts, ws, "助走中・開始前", str.tostring(st.nPre) + " 回", "集計開始前・助走中のタッチ (イベントにしない)", false)
         f_item(ks, vs, ts, ws, "助走", str.tostring(zcWarm) + " 本", "先頭から集計しない確定 5分足の本数", false)
         f_item(ks, vs, ts, ws, "ZB-1m の助走", str.tostring(zbWarm1) + " 本", "", false)

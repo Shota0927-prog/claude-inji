@@ -188,7 +188,7 @@ class Runner:
         z = e["st"]
         return dict(nEv=z.nEv, nUnk=z.nUnk, nCont=z.nCont, nDone=z.nDone, nOut=z.nOut, nBad=z.nBad, nMa1Ev=z.nMa1Ev, nMa5Ev=z.nMa5Ev, nZeEv=z.nZeEv,
                     nEvOn=z.nEvOn, nMultiBar=z.nMultiBar, nPre=z.nPre,
-                    nIfvg=z.nIfvg, nFvgDead=z.nFvgDead, maUnk=list(e["zcMaUnk"]), nZone=list(e["zcNZone"]), why=list(e["zcWhy"][:2]),
+                    nIfvg=z.nIfvg, nFvgDead=z.nFvgDead, nFxK1=getattr(z, "nFxK1", 0), nFxK2=getattr(z, "nFxK2", 0), nFxEmpty=getattr(z, "nFxEmpty", 0), maUnk=list(e["zcMaUnk"]), nZone=list(e["zcNZone"]), why=list(e["zcWhy"][:2]),
                     on=sorted((q.gid, q.tb, q.tt) for q in e["zcOn"]), act=self.zones(), zeBad=list(e["zcZeBad"]), zdBad=list(e["zcZdBad"]),
                     zeStat=list(e["lbZeStat"]), zdStat=list(e["lbZdStat"]))
 
@@ -505,6 +505,9 @@ def oracle(bars, prm):
                 drop(z)
 
     events, unk, unk_cnt, cont, n_pre, n_multi = [], 0, {}, 0, 0, 0
+    n_k1, n_k2, n_empty = 0, 0, 0
+    fx_bars = set()                 # bars on which a ZF zone (FVG or iFVG) was touched: the only bars the direction condition can change
+                                    # (directly, or through the contact state an FVG carries into its iFVG)
     ma_unk = [0, 0]
     n_bad = 0
     pc = None
@@ -534,6 +537,25 @@ def oracle(bars, prm):
         touched = [z for z in zones + [m for m in ma if m["ok"]] if z["hi"] >= l and z["lo"] <= h]
         live = tc >= P["zcStart"] and bi >= P["zcWarm"]
 
+        def fvg(z):
+            """a normal FVG (not inverted): only these carry the direction condition"""
+            return 15 <= z["gid"] <= 18 and not z["inv"]
+
+        def own_dir(z):
+            """K1: the approach to the FVG's own band (open outside: that side; open inside: the previous close; else unknown)"""
+            if o > z["hi"]:
+                return 1
+            if o < z["lo"]:
+                return -1
+            if pc is None:
+                return 0
+            return 1 if pc > z["hi"] else -1 if pc < z["lo"] else 0
+        k1_out = [z for z in touched if fvg(z) and own_dir(z) != z["sub"]]
+        if any(15 <= z["gid"] <= 18 for z in touched):
+            fx_bars.add(bi)
+        n_k1 += len(k1_out)
+        touched = [z for z in touched if z not in k1_out]          # as if they did not exist on this bar
+
         def direction(mem, c_lo, c_hi):
             """by the open against C; an open inside C: by the previous close against the members' own common band U (not clipped)"""
             if o > c_hi:
@@ -550,7 +572,17 @@ def oracle(bars, prm):
         def egid(z):
             """evidence ID at the touch: a ZF zone is an FVG (15..18) or, once inverted, an iFVG (22..25) — never both"""
             return z["gid"] + 7 if 15 <= z["gid"] <= 18 and z["inv"] else z["gid"]
-        for mem, c_lo, c_hi, d in pl:                 # by price, low to high; no order of contact inside the bar
+        used, k2_out = set(), set()
+        for mem0, c_lo, c_hi, d in pl:                # by price, low to high; no order of contact inside the bar
+            # K2: with a direction, a normal FVG facing the other way leaves this place's evidence (C and d are kept)
+            xs = [z for z in mem0 if d != 0 and fvg(z) and z["sub"] != d]
+            mem = [z for z in mem0 if z not in xs]
+            n_k2 += len(xs)
+            k2_out |= {z["id"] for z in xs}
+            used |= {z["id"] for z in mem}
+            if not mem:
+                n_empty += 1
+                continue
             gids = sorted(set(egid(z) for z in mem))
             mask = sum(1 << g for g in gids)
             if d != 0:
@@ -581,7 +613,7 @@ def oracle(bars, prm):
                 cpos = 0 if c < c_lo else 1 if c <= c_hi else 2
             ev = dict(id=len(events) + 1, t0=tc, p0=c, d=d, mask=mask, nEv=len(gids), nRaw=len(mem), rTop=c_hi, rBot=c_lo,
                       edge=edge, cPos=cpos, aux=aux, bar=bi, onMask=on_mask, side=side,
-                      flags=(512 if u1 else 0) + (1024 if u5 else 0) + (2048 if 9 in ze_stat else 0) + (4096 if on_mask else 0) + (8192 if by_pc else 0))
+                      flags=(512 if u1 else 0) + (1024 if u5 else 0) + (2048 if 9 in ze_stat else 0) + (4096 if on_mask else 0) + (8192 if by_pc else 0) + (16384 if xs else 0))
             events.append(ev)
             new.append(ev)
         for ev in new:
@@ -589,6 +621,8 @@ def oracle(bars, prm):
         if live and n_pl >= 2:
             n_multi += 1
         for z in touched:
+            if z["id"] in k2_out and z["id"] not in used:      # K3: no contact mark from a touch that was left out
+                continue
             z["on"], z["outT"] = True, None
         for z in zones + ma:
             if not z["on"]:
@@ -654,7 +688,8 @@ def oracle(bars, prm):
     return dict(events=events, unk=unk, unk_cnt=unk_cnt, cont=cont, nPre=n_pre, nMulti=n_multi, nBad=n_bad, maUnk=ma_unk, nZone=n_zone, why=why,
                 on=sorted((z["gid"], z["lo"], z["hi"]) for z in zones + ma if z["on"]),
                 act=sorted((z["gid"], z["sub"], z["lo"], z["hi"], z["inv"]) for z in zones), nbars=len(bars),
-                zeBad=ze_bad, zdBad=zd_bad, zeStat=ze_stat, zdStat=zd_stat, nIfvg=n_ifvg[0], nFvgDead=n_fdead[0])
+                zeBad=ze_bad, zdBad=zd_bad, zeStat=ze_stat, zdStat=zd_stat, nIfvg=n_ifvg[0], nFvgDead=n_fdead[0],
+                nFxK1=n_k1, nFxK2=n_k2, nFxEmpty=n_empty, fxBars=fx_bars)
 
 
 def record_of(ev):
@@ -749,7 +784,8 @@ def compare(r, orc, label=""):
                  ("maUnk", orc["maUnk"]), ("nZone", orc["nZone"]), ("on", orc["on"]), ("act", orc["act"]), ("zeBad", orc["zeBad"]),
                  ("zdBad", orc["zdBad"]), ("zeStat", orc["zeStat"]), ("zdStat", orc["zdStat"]), ("nIfvg", orc["nIfvg"]), ("nFvgDead", orc["nFvgDead"]),
                  ("nMa1Ev", sum(1 for e in ev if e["flags"] & 512)), ("nMa5Ev", sum(1 for e in ev if e["flags"] & 1024)),
-                 ("nEvOn", sum(1 for e in ev if e["onMask"])), ("nMultiBar", orc["nMulti"]), ("nPre", orc["nPre"]), ("nZeEv", sum(1 for e in ev if e["flags"] & 2048)), ("why", orc["why"])):
+                 ("nEvOn", sum(1 for e in ev if e["onMask"])), ("nMultiBar", orc["nMulti"]), ("nPre", orc["nPre"]), ("nZeEv", sum(1 for e in ev if e["flags"] & 2048)), ("why", orc["why"]),
+                 ("nFxK1", orc["nFxK1"]), ("nFxK2", orc["nFxK2"]), ("nFxEmpty", orc["nFxEmpty"])):
         if st[a] != b:
             det.append(f"{a}: {st[a]} != {b}")
     exp_out, exp_q, fins = expected_fifo(orc)
@@ -969,7 +1005,8 @@ def random_vs_oracle(seeds):
                        ("side", sum(1 for e in ev if e["side"])), ("bypc", sum(1 for e in ev if e["flags"] & 8192)),
                        ("zeunk", sum(1 for e in ev if e["flags"] & 2048)), ("ifvg", sum(1 for e in ev if e["mask"] >> 22)), ("one", sum(1 for e in ev if e["nPl"] == 1)),
                        ("triple", sum(1 for e in ev if e["aux"] & 0x700)), ("why0", orc["why"][0]), ("why1", orc["why"][1]),
-                       ("pos0", sum(1 for e in ev if e["cPos"] == 0)), ("pos2", sum(1 for e in ev if e["cPos"] == 2))) \
+                       ("pos0", sum(1 for e in ev if e["cPos"] == 0)), ("pos2", sum(1 for e in ev if e["cPos"] == 2)),
+                       ("fxk1", orc["nFxK1"]), ("fxk2", orc["nFxK2"]), ("fx16384", sum(1 for e in ev if e["flags"] & 16384))) \
                 + tuple((n[:2], sum(1 for e in ev if e["mask"] & G[n])) for n in ("ZA-4H", "ZB-1m", "ZC-D", "ZD-4H", "ZE-4H", "ZF-FVG-4H", "ZG-4H")) + (("ZI", sum(1 for e in ev if e["mask"] & G["ZF-iFVG-4H"])),):
             COVER[k_] = COVER.get(k_, 0) + v_
         rich = len(ev) > 20 and len(set(e["mask"] for e in ev)) > 3
@@ -1000,7 +1037,7 @@ def random_vs_oracle(seeds):
         check(f"B seed {seed}: 表示の全組合せ 2 × 3 (場所数 全件 / 1 のみ × 含める / のみ / 除く) の行ごとに イベント = 計測可能 + 計測不能 + 待ち、本数不足 <= 計測可能、到達 <= 計測可能、$5 >= $10 >= $15、度数の合計 = 到達、集合行の合計 = 全体", inv)
         last = (bars, ov)
     need = dict(one=500, ZI=5, evon=200, npre=50, side=500, bypc=20, ev=3000, multi=500, unmeas=20, short=20, amb=100, unk=20, cont=2000, r15=100, bad=50, pend=1, queue=1, sell=1000, second=20, maunk=1,
-                zeunk=1, ifvg=5, triple=5, why0=10, why1=10, pos0=200, pos2=200, ZA=50, ZB=200, ZC=200, ZD=50, ZE=50, ZF=50, ZG=20)
+                zeunk=1, ifvg=5, triple=5, fxk1=100, fxk2=5, fx16384=3, why0=10, why1=10, pos0=200, pos2=200, ZA=50, ZB=200, ZC=200, ZD=50, ZE=50, ZF=50, ZG=20)
     check("C 乱数系列の合計で各機能・全 7 種類が使われている (複数根拠・本数不足・計測不能・順序不明・方向不明・同じ足の 2 か所目・未出力 ほか)",
           all(COVER.get(k, 0) >= v for k, v in need.items()), str({k: (COVER.get(k, 0), v) for k, v in need.items() if COVER.get(k, 0) < v}) + str(COVER))
     return last
@@ -1190,10 +1227,10 @@ def fixed_cases():
     check("A F2 MA 帯に接触したまま日足線へ初めて到達: 新規イベント (集合は ZB-1m+ZC-D、接触中だった根拠 = ZB-1m を記録・フラグ 4096)。同じ構成で触れ続ける次の足は 0 件",
           ok and [(x["bar"], x["mask"], x["onMask"], x["flags"]) for x in e] == [(1, G["ZB-1m"], 0, 0), (3, G["ZB-1m"] + ZCD, G["ZB-1m"], 4096)]
           and o["cont"] == 2 and r["st"].nEvOn == 1, f"{[(x['bar'], x['mask'], x['onMask'], x['flags']) for x in e]} cont={o['cont']} | {det}")
-    case("A F2b 広い FVG の中を動いて線へ初めて到達: 新規 (接触中だった根拠 = ZF)。FVG の中だけの足・同じ構成の足は増えない",
+    case("A F2b 広い上昇 FVG の中を動いて線へ初めて到達 (ZCR-7): FVG の中で始まる足は FVG 自身の方向が不明なので FVG を根拠から外し (K1)、線だけの新規イベント。同じ構成の足は増えない",
          [(4330, 4330, 4318, 4319), (4319, 4319, 4315, 4316), (4316, 4316, 4311, 4313), (4313, 4313, 4310, 4311.5), (4311.5, 4312, 4309, 4310)],
          merge(zf(1, T0 - 3_600_000, 4350.0, 1, 4320.0, 4280.0), zc(3, 1, 4310.0)),
-         lambda r, ev, o: [(e["bar"], e["mask"], e["onMask"]) for e in ev] == [(1, G["ZF-FVG-4H"], 0), (3, G["ZF-FVG-4H"] + ZCW, G["ZF-FVG-4H"])] and o["cont"] == 3,
+         lambda r, ev, o: [(e["bar"], e["mask"], e["onMask"]) for e in ev] == [(1, G["ZF-FVG-4H"], 0), (3, ZCW, 0)] and o["cont"] == 2 and r["st"].nFxK1 == 4,
          ov={"zfUse2": True})
     # J3: the "one place on the bar" systems are filled after the bar's places are all judged; later sums go to the same systems
     bj = bars_from_rows([(4310, 4310, 4279, 4290), (4290, 4290, 4270, 4272), (4272, 4272, 4265, 4266), (4266, 4279, 4266, 4278.5)] + flat(4278.5, 8), f10)
@@ -1325,9 +1362,10 @@ def kinds():
         start=4290.0, rows=[(4290, 4290, 4290, 4290), (4290, 4290, 4290, 4290), (4290, 4297, 4290, 4291), (4291, 4291, 4291, 4291), (4291, 4291, 4291, 4291)],
         feeds={1: zf(1, k1 + 1, 4295.0), 4: zf(1, k1 + 2, 4304.0)})
     # J1: the same zone object keeps its contact state through FVG -> iFVG; the change of state alone is not a new event
-    one("ZF: 接触中の FVG が iFVG に転換しても同じ Zone (接触中を引き継ぐ)。転換した次の足で触れても 0 件。1 つの Zone は FVG か iFVG のどちらか 1 つの根拠だけ",
+    one("ZF: 接触中の FVG が iFVG に転換しても同じ Zone (接触中を引き継ぐ)。転換した次の足で触れても 0 件。1 つの Zone は FVG か iFVG のどちらか 1 つの根拠だけ"
+        " (ZCR-7: 帯の中で始まる 2 本目は FVG 自身の方向が不明で根拠から外す。3 本目は iFVG なので方向条件なしで継続中)",
         {"zfUse2": True}, zf(1, k1, 4350.0, 1, 4303.0, 4296.0),
-        lambda r, ev, o: [(e["bar"], e["mask"], e["nEv"], e["nRaw"]) for e in ev] == [(1, G["ZF-FVG-4H"], 1, 1)] and o["cont"] == 2 and r["st"].nIfvg == 1
+        lambda r, ev, o: [(e["bar"], e["mask"], e["nEv"], e["nRaw"]) for e in ev] == [(1, G["ZF-FVG-4H"], 1, 1)] and o["cont"] == 1 and r["st"].nFxK1 == 1 and r["st"].nIfvg == 1
         and r.zones() == [(16, 1, 429600, 430300, True)] and sorted(r.rows()) == [G["ZF-FVG-4H"]],
         rows=[(4310, 4310, 4301, 4302), (4302, 4302, 4294, 4295), (4295, 4297, 4294, 4296)], feeds={2: zf(1, k1 + 1, 4295.0)})
     one("ZF: 離脱した後に iFVG へ再接触すると ZF-iFVG の集合で 1 件 (FVG の集合とは別の行。同じ場所で両方に数えない)",
@@ -1346,7 +1384,7 @@ def kinds():
         lambda r, ev, o: [e["bar"] for e in ev] == [1] and r.zones() == [] and o["cont"] == 0,
         start=4296.0, rows=[(4296, 4306, 4296, 4305.5), (4305.5, 4305.5, 4301, 4301)])
     # all 7 kinds on one place
-    allf = merge(za(1, 4300.0, 4280.0, 111, 0), zc(2, 1, 4300.5), zd(1, 4299.5), ze(0, 4250.0, 4350.0, 1, 5), zf(1, k1, 4350.0, -1, 4301.0, 4299.0),
+    allf = merge(za(1, 4300.0, 4280.0, 111, 0), zc(2, 1, 4300.5), zd(1, 4299.5), ze(0, 4250.0, 4350.0, 1, 5), zf(1, k1, 4350.0, 1, 4301.0, 4299.0),
                  zg(1, zg_blk(T0 - 7200_000, T0 - 3600_000, 100, [(7, 1, 2, 4300.0)])))
     b = bars_from_rows([(4306, 4306, 4301, 4305)], allf, start=4340.0)
     b[1]["p1"], b[1]["p5"] = 4300.2, 4299.8
@@ -1389,6 +1427,142 @@ def before_after(seeds=(1, 2, 3, 4)):
               ra == rb and pa == pb and same_st and a.rows() == b.rows() and a.sums() == b.sums() and a.rows2() == b.rows2() and len(rb) > 60 and multi > 10,
               f"records {len(ra)} / {len(rb)} pending {len(pa)} / {len(pb)} state={same_st} multi-place records={multi} "
               f"first diff={next(((x, y) for x, y in zip(ra, rb) if x != y), None)}")
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# ZCR-7: direction condition of the normal FVG
+FX_REV = "d093c03"           # ZCR-6b: the last version without the direction condition of the normal FVG
+FX_SCEN = []                 # the bars of the F cases (the mutation check X also runs them)
+FX_OFF = [("        if f_zcFvgOk(array.get(zcT, qx), o)\n", "        if true\n"),
+          ("        bool   xz  = isM and dp != 0 and", "        bool   xz  = false and dp != 0 and")]
+
+
+def fvg_cases():
+    """F: fixed cases of the direction condition (bullish FVG 4296..4303 / bearish the same band; ZC lines as other evidence)"""
+    k1 = T0 - 3_600_000
+    bull, bear = zf(1, k1, 4350.0, 1, 4303.0, 4296.0), zf(1, k1, 4350.0, -1, 4303.0, 4296.0)
+    F4, ZCD = G["ZF-FVG-4H"], G["ZC-D"]
+
+    def fc(name, rows, feeds0, cond, start=4350.0, feeds=None):
+        FX_SCEN.append((bars_from_rows(rows, feeds0, start=start, feeds=feeds), dict(ONLY_ZC, zfUse2=True)))
+        r, orc, ok, det = run_case(rows, feeds0, {"zfUse2": True}, start=start, feeds=feeds)
+        ev = orc["events"]
+        c = False
+        try:
+            c = cond(r, ev, orc, r["st"])
+        except Exception as ex:        # noqa: BLE001
+            det += f" cond raised {ex!r}"
+        check("F " + name, ok and c, f"events={[(e['bar'], e['d'], e['mask'], e['nRaw'], e['flags'], e['rBot'], e['rTop'], e['onMask']) for e in ev]} unk={orc['unk']} cont={orc['cont']} "
+              f"K1={r['st'].nFxK1} K2={r['st'].nFxK2} empty={r['st'].nFxEmpty} on={sorted(q.gid for q in r['zcOn'])} | {det}")
+    fc("上昇 FVG に上から (始値 > 上端) → 採用 (LONG)", [(4310, 4310, 4301, 4302)], bull,
+       lambda r, ev, o, st: [(e["d"], e["mask"]) for e in ev] == [(1, F4)] and st.nFxK1 == 0 and len(r["zcOn"]) == 1)
+    fc("上昇 FVG に下から (始値 < 下端) → 除外: 他の根拠が無ければイベントなし・方向不明にも継続中にも数えない・接触中にしない", [(4290, 4298, 4289, 4297)], bull,
+       lambda r, ev, o, st: ev == [] and o["unk"] == 0 and o["cont"] == 0 and o["nPre"] == 0 and st.nFxK1 == 1 and len(r["zcOn"]) == 0, start=4290.0)
+    fc("上昇 FVG に下から + 線 (ZC-D 4297) → その線だけのイベント (SHORT、根拠数 1、フラグ 16384 なし)", [(4290, 4298, 4289, 4297)], merge(bull, zc(2, 1, 4297.0)),
+       lambda r, ev, o, st: [(e["d"], e["mask"], e["nRaw"], e["flags"] & 16384) for e in ev] == [(-1, ZCD, 1, 0)] and st.nFxK1 == 1
+       and [q.gid for q in r["zcOn"]] == [7], start=4290.0)
+    fc("下降 FVG に下から → 採用 (SHORT)", [(4290, 4298, 4289, 4297)], bear,
+       lambda r, ev, o, st: [(e["d"], e["mask"]) for e in ev] == [(-1, F4)] and st.nFxK1 == 0, start=4290.0)
+    fc("下降 FVG に上から → 除外 (イベントなし)", [(4310, 4310, 4301, 4302)], bear,
+       lambda r, ev, o, st: ev == [] and o["unk"] == 0 and st.nFxK1 == 1 and len(r["zcOn"]) == 0)
+    fc("始値が FVG の帯の中・直前終値が帯の上 → 上から: 上昇 FVG を採用 (LONG、フラグ 8192)", [(4302, 4304, 4300, 4303)], bull,
+       lambda r, ev, o, st: [(e["d"], e["mask"], e["flags"]) for e in ev] == [(1, F4, 8192)] and st.nFxK1 == 0, start=4310.0)
+    fc("始値が FVG の帯の中・直前終値が帯の下 → 下から: 上昇 FVG は除外", [(4302, 4304, 4300, 4303)], bull,
+       lambda r, ev, o, st: ev == [] and o["unk"] == 0 and st.nFxK1 == 1, start=4290.0)
+    fc("始値も直前終値も帯の中 (方向不明) → 上昇 FVG を除外 (方向不明の件数にも入れない)", [(4300, 4301, 4299, 4300)], bull,
+       lambda r, ev, o, st: ev == [] and o["unk"] == 0 and o["cont"] == 0 and st.nFxK1 == 1 and len(r["zcOn"]) == 0, start=4300.0)
+    fc("始値も直前終値も帯の中 → 下降 FVG も除外", [(4300, 4301, 4299, 4300)], bear,
+       lambda r, ev, o, st: ev == [] and o["unk"] == 0 and st.nFxK1 == 1, start=4300.0)
+    # K2: the FVG itself is approached from above (open inside its band, previous close above), the place (FVG ∩ ZC 4300..4304) from below
+    fc("K2: 上昇 FVG (自身は上から) と線 4302 の場所が下から (始値 4298 < C) → FVG だけ外して線のイベント (SHORT・フラグ 16384・C は 4300..4302 のまま)。FVG は接触中にしない (K3)",
+       [(4298, 4302, 4297, 4301)], merge(bull, zc(2, 1, 4302.0)),
+       lambda r, ev, o, st: [(e["d"], e["mask"], e["nEv"], e["nRaw"], e["flags"] & 16384, e["rBot"], e["rTop"]) for e in ev] == [(-1, ZCD, 1, 1, 16384, 430000, 430200)]
+       and st.nFxK1 == 0 and st.nFxK2 == 1 and st.nFxEmpty == 0 and [q.gid for q in r["zcOn"]] == [7], start=4310.0)
+    fc("K3 (K2 の後): 次の足で FVG に上から触れると、線は接触中・FVG は接触中でないので新規イベント (FVG+線、接触中だった根拠 = 線)",
+       [(4298, 4302, 4297, 4301), (4305, 4305, 4302, 4303)], merge(bull, zc(2, 1, 4302.0)),
+       lambda r, ev, o, st: [(e["bar"], e["d"], e["mask"], e["onMask"]) for e in ev] == [(1, -1, ZCD, 0), (2, 1, F4 + ZCD, ZCD)] and o["cont"] == 0, start=4310.0)
+    fc("K3: 上昇 FVG に下から触れた後 (印を付けない)、離脱せずに上から触れる → 新規イベント (継続中にしない)",
+       [(4290, 4298, 4289, 4297), (4305, 4306, 4304, 4305), (4305, 4305, 4302, 4303)], bull,
+       lambda r, ev, o, st: [(e["bar"], e["d"], e["mask"]) for e in ev] == [(3, 1, F4)] and o["cont"] == 0 and st.nFxK1 == 1, start=4290.0)
+    fc("既に接触中 (正しい側のタッチ由来) の上昇 FVG は、方向が合わないタッチの足 (帯の中で始まる足・下からの足) でも接触中のまま (離脱判定は従来どおり)",
+       [(4310, 4310, 4301, 4302), (4302, 4302, 4294, 4294.5), (4294.5, 4297, 4294, 4295)], bull,
+       lambda r, ev, o, st: [(e["bar"], e["mask"]) for e in ev] == [(1, F4)] and st.nFxK1 == 2 and len(r["zcOn"]) == 1)
+    # iFVG: no direction condition (bullish FVG -> iFVG on bar 1's higher-TF close, then touched from below and from above)
+    fc("iFVG は方向によらず従来どおり (上昇 FVG 由来の iFVG に下から 1 件、離脱後に上から 1 件)",
+       [(4290, 4290, 4290, 4290), (4290, 4297, 4290, 4291), (4291, 4291, 4280, 4281), (4281, 4281, 4281, 4281)] + flat(4281, 6) + [(4310, 4310, 4310, 4310), (4310, 4310, 4302, 4305)],
+       bull, lambda r, ev, o, st: [(e["bar"], e["d"], e["mask"]) for e in ev] == [(2, -1, G["ZF-iFVG-4H"]), (12, 1, G["ZF-iFVG-4H"])] and st.nFxK1 == 0,
+       start=4290.0, feeds={1: zf(1, k1 + 1, 4295.0)})
+    # the empty place (K2 removes every member): impossible through f_zcTouch (shown in the spec §7), so the branch is called directly
+    r = Runner(dict(ONLY_ZC, zfUse2=True)).run(bars_from_rows([(4310, 4310, 4301, 4302)], bull))
+    e = r.env
+    z = e["zcT"][0] if e["zcT"] else None
+    ok = z is not None and z.typ == 4 and not z.inv and z.sub == 1
+    if ok:
+        e["zcT"], e["zcTx"] = [z], [0]
+        n_ev, n_unk, n_cont = e["st"].nEv, e["st"].nUnk, e["st"].nCont
+        kept = e["f_zcPlace"](z.tb, z.tt, -1, z.tb - 10, z.tb, True)
+        ok = kept is False and e["st"].nFxEmpty == 1 and e["st"].nFxK2 == 1 and (e["st"].nEv, e["st"].nUnk, e["st"].nCont) == (n_ev, n_unk, n_cont) and e["zcTx"] == [2]
+    check("F メンバーが全員外れた場所 (f_zcPlace を直接呼ぶ): イベント・方向不明・継続中にせず「除外で空の場所」だけ数え、戻り値 false (場所数に入れない)", ok)
+
+
+def fvg_before_after(seeds=(1, 2, 3, 4)):
+    """V: (1) ZF OFF: records / pending / aggregation / state == d093c03 exactly. (2) ZF ON with the direction condition switched off in the
+    current source (K1 / K2 lines replaced): == d093c03 exactly, so the condition is the only change. (3) ZF ON as is: every event on a bar
+    without a touched ZF zone is unchanged (all columns but the ID); the changed events are all on bars with a touched ZF zone (a normal
+    FVG, or an iFVG whose contact state came from its FVG time, K3)."""
+    try:
+        old = subprocess.run(["git", "show", FX_REV + ":ZoneConfluenceReactionStatsXAU.pine"], cwd=ROOT, capture_output=True, text=True, check=True).stdout
+    except Exception as ex:        # noqa: BLE001
+        check("V 変更前 (ZCR-6b d093c03) の本体を git から取得", False, repr(ex))
+        return
+    cur = read(PINE)
+    off = cur
+    for a, b in FX_OFF:
+        assert off.count(a) == 1, a
+        off = off.replace(a, b)
+    nf = ("nFxK1", "nFxK2", "nFxEmpty")
+
+    def snap(r):
+        sn = r.snapshot()
+        for k in nf:
+            sn["st"].pop(k, None)
+        return sn
+    tot_changed = tot_ev = tot_k = 0
+    for seed in seeds:
+        ov = RANDOM_PRM[seed % len(RANDOM_PRM)]
+        bars = random_bars(seed, 1500)
+        ovo = dict(ov, zfUse1=False, zfUse2=False, zfUse3=False, zfUse4=False)
+        a, b = Runner(ovo, source=old).run(bars), Runner(ovo).run(bars)
+        check(f"V seed {seed}: ZF OFF では記録・追跡中・集計 (4 系統)・件数・出力が変更前 (d093c03) と完全一致 (ID 含む)",
+              snap(a) == snap(b) and len(b.records()) > 60 and b["st"].nFxK1 == 0)
+        ovn = dict(ov, zfUse1=True, zfUse2=True, zfUse3=True, zfUse4=True)
+        a = Runner(ovn, source=old).run(bars)
+        c = Runner(ovn, source=off).run(bars)
+        b = Runner(ovn).run(bars)
+        orc = oracle(bars, params(b))
+        tc_bar = {bb.get("tc", bb["t"] + M5): i for i, bb in enumerate(bars)}
+        key = lambda v: tuple(-1e18 if x is None else round(x, 6) for x in v[1:])     # noqa: E731
+        fx = orc["fxBars"]
+
+        def split(recs):
+            ins, outs = [], []
+            for v in recs:
+                (ins if tc_bar[int(round(v[1] * 1000))] in fx else outs).append(key(v))
+            return sorted(ins), sorted(outs)
+        ai, ao = split(a.records())
+        bi_, bo = split(b.records())
+        pa = sorted((p["t0"], p["mask"], p["d"], p["rTop"], p["rBot"], p["flags"]) for p in a.pending() if tc_bar[p["t0"]] not in fx)
+        pb = sorted((p["t0"], p["mask"], p["d"], p["rTop"], p["rBot"], p["flags"]) for p in b.pending() if tc_bar[p["t0"]] not in fx)
+        changed = len(set(ai) ^ set(bi_))
+        tot_changed += changed
+        tot_ev += len(b.records())
+        tot_k += b["st"].nFxK1 + b["st"].nFxK2
+        check(f"V seed {seed}: ZF ON・方向条件だけを外した現在の本体 == 変更前 (d093c03) で完全一致。方向条件ありでは、ZF に触れていない足のイベントは全列 (ID 以外) 不変、"
+              "変わったイベントはすべて ZF (通常 FVG、または FVG から転換した iFVG。接触中の状態を引き継ぐため) に触れた足にある",
+              snap(a) == snap(c) and ao == bo and pa == pb and changed > 0 and b["st"].nFxK1 > 0 and len(ao) > 50,
+              f"records old {len(a.records())} new {len(b.records())}; on FVG bars old {len(ai)} new {len(bi_)} (symmetric difference {changed}); "
+              f"other bars {len(ao)} / {len(bo)}; K1 {b['st'].nFxK1} K2 {b['st'].nFxK2} empty {b['st'].nFxEmpty}")
+    COVER["fx_changed"] = tot_changed
 
 
 def causality(bars, ov):
@@ -1762,8 +1936,8 @@ MUTATIONS = [
     ("到達を「以上」から「超」へ", "                    if fav >= w\n", "                    if fav > w\n"),
     ("離脱幅を「以上」から「超」へ", "if dist >= zcDepT or", "if dist > zcDepT or"),
     ("離脱時間を使わない", " or time_close - z.outT >= zcDepMs", ""),
-    ("継続中の抑制を外す", "    if allOn\n        st.nCont += 1\n", "    if false\n        st.nCont += 1\n"),
-    ("継続中を「1 つでも接触中」に戻す", "    if allOn\n        st.nCont += 1\n", "    if onMask > 0\n        st.nCont += 1\n"),
+    ("継続中の抑制を外す", "    else if allOn\n        st.nCont += 1\n", "    else if false\n        st.nCont += 1\n"),
+    ("継続中を「1 つでも接触中」に戻す", "    else if allOn\n        st.nCont += 1\n", "    else if onMask > 0\n        st.nCont += 1\n"),
     ("接近方向を始値でなく終値で決める", "array.get(zcUH, k), o)\n", "array.get(zcUH, k), c)\n"),
     ("直前終値で決まった場合も接触端を C の端にする", "        int  edge = byPc ? o : dp == 1 ? pHi : pLo\n", "        int  edge = dp == 1 ? pHi : pLo\n"),
     ("ZB-1m の助走を使わない", "            if st.ma1N > zbWarm1\n", "            if true\n"),
@@ -1783,6 +1957,16 @@ MUTATIONS = [
     ("場所数 1 かつ接触中の系統へ、接触中でないイベントも入れる", "        if ob.onMask > 0\n            f_zcAgg(r.c4, r.hist4, ob, h, ok)\n", "        if true\n            f_zcAgg(r.c4, r.hist4, ob, h, ok)\n"),
     ("根拠数を Zone 本数にする", "        ZcRow row = f_zcRow(mask, nG)\n        st.oSeq += 1", "        ZcRow row = f_zcRow(mask, nRaw)\n        st.oSeq += 1"),
     ("助走中もイベントにする", "    else if not live\n        st.nPre += 1\n", "    else if false\n        st.nPre += 1\n"),
+    # ZCR-7: the direction condition of the normal FVG
+    ("K1: 上昇 / 下降を逆にする", "f_zcFvgDir(z, o) == z.sub\n", "f_zcFvgDir(z, o) == -z.sub\n"),
+    ("K2: 上昇 / 下降を逆にする", "and z.typ == 4 and not z.inv and z.sub != dp\n", "and z.typ == 4 and not z.inv and z.sub == dp\n"),
+    ("K1 を省く", "        if f_zcFvgOk(array.get(zcT, qx), o)\n", "        if true\n"),
+    ("K2 を省く", "        bool   xz  = isM and dp != 0 and", "        bool   xz  = false and dp != 0 and"),
+    ("K3: K1 で外した FVG に接触中の印を付ける", "            array.remove(zcT, qx)\n", "            f_zcSetOn(array.get(zcT, qx))\n            array.remove(zcT, qx)\n"),
+    ("K3: K2 で外した FVG に接触中の印を付ける", "            if array.get(zcTx, q) != 2\n", "            if true\n"),
+    ("iFVG にも方向条件を掛ける", "    not (z.typ == 4 and not z.inv) or f_zcFvgDir", "    not (z.typ == 4) or f_zcFvgDir"),
+    ("方向不明の FVG を外さない", "f_zcFvgDir(z, o) == z.sub\n", "f_zcFvgDir(z, o) != -z.sub\n"),
+    ("K2 のフラグ 16384 を付けない", " + (nX > 0 ? 16384 : 0)", ""),
 ]
 
 
@@ -1794,8 +1978,11 @@ def mutations(bars, ov):
             continue
         caught = False
         try:
-            r = Runner(ov, source=s.replace(old, new)).run(bars)
-            caught = not compare(r, oracle(bars, params(r)))[0]
+            for bb, oo in [(bars, ov)] + FX_SCEN:          # random bars, then the fixed FVG cases (F)
+                r = Runner(oo, source=s.replace(old, new)).run(bb)
+                if not compare(r, oracle(bb, params(r)))[0]:
+                    caught = True
+                    break
         except Exception:      # noqa: BLE001
             caught = True
         check(f"X 変異を検出: {name}", caught)
@@ -1916,11 +2103,12 @@ def static():
             dr = t.index("// ---- 描画 (集計値には影響しない)")
             tb = t.index("// ---- 表 (集計値には影響しない")
             ev = t.index("// ---- イベント記録の出力")
-            return dict(head=t[:g], body=t[za:t.index("\n", t.index(END))], draw=t[dr:tb], out=t[ev:])
+            return dict(head=t[:g], body=t[za:t.index(BEGIN)], draw=t[dr:tb], out=t[ev:])
         po, pn = parts(o), parts(s)
         same_parts = {k: po[k] == pn[k] for k in po}
-        check("S 表示以外は変更前 (47ebe23) と byte 一致: 冒頭〜表示の入力の前 / Zone 検知・登録・ZCR Logic 区間 (begin〜end) / 描画 (枠・印) / イベント記録の出力 (plot 40 本) 〜末尾",
-              all(same_parts.values()) and logic(o) == logic(s) and len(pn["out"]) > 2000 and pn["out"].count("plot(") == 40, str(same_parts))
+        check("S 表示以外は変更前 (47ebe23) と byte 一致: 冒頭〜表示の入力の前 / Zone 検知・登録 (ZCR Logic 区間の前まで) / 描画 (枠・印) / イベント記録の出力 (plot 40 本) 〜末尾。"
+              "ZCR Logic 区間は ZCR-7 (通常 FVG の方向条件) だけ変更 (オラクル照合と変更前後比較 V で確認)",
+              all(same_parts.values()) and len(pn["out"]) > 2000 and pn["out"].count("plot(") == 40, str(same_parts))
         gd_o = o[o.index("var string G_DS = "):o.index("\n// ---- ZA: Accum 検出")].split("\n")
         gd_n = s[s.index("var string G_DS = "):s.index("\n// ---- ZA: Accum 検出")].split("\n")
         kept = [ln for ln in gd_o if not ln.startswith(("zcView ", "zcTopN "))]
@@ -1955,6 +2143,8 @@ def main():
     before_after()
     display_before_after()
     table_render_checks()
+    fvg_cases()
+    fvg_before_after()
     causality(bars, ov)
     mutations(random_bars(10), dict(RANDOM_PRM[10 % len(RANDOM_PRM)], zbWarm1=300))
     bad = 0
