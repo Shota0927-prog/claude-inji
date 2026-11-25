@@ -1,0 +1,2743 @@
+//@version=6
+// ZCS-1: XAUUSD Zone 2 根拠ペアの売買検証ストラテジー (タイミング条件なし。TradingView 標準のストラテジーレポートで成績を見る)
+//
+//  未検証: TradingView 上のコンパイル・request (動的リクエスト) の挙動・約定は未検証 (PINE_NOT_VERIFIED)。tests/zcs_sim.py は下の
+//          「ZCS Logic」区間そのものを Python に機械変換し、TradingView の既定の約定の仮定を模した簡単な約定モデルの上で実行した検証で、
+//          request.* / input.source が返す値は合成データで与えている。
+//  仕様書: ZONE_CONFLUENCE_STRATEGY_XAU_ja.md。要点だけ:
+//  ペア: ZCR-9 (ZoneConfluenceReactionStatsXAU) の 26 根拠の全 325 ペア × LONG / SHORT = 650 個のチェック (初期は全 OFF。自動選別なし)。
+//    この入力は tests/zcs_build.py が機械的に生成する (「ZCS pairs (generated)」区間)。
+//  Zone: 検知・登録・更新・失効・FVG → iFVG・根拠 ID・帯のティック丸めは ZCR-9 の写し (テストが照合)。選んだペアに必要な種類・時間足
+//    だけ request と計算をする (不要なものは request を呼ばない)。
+//  エントリー帯: ペア (A, B) の、A の有効 Zone と B の有効 Zone の帯そのもの (切り詰めない) の共通区間 (端点一致も重なり)。
+//    他の根拠が重なっても狭めない。共通区間が無ければ発注しない。
+//  注文: 確定 5分足の終値で判断し、次の足から有効な指値を置く (過去の足では約定させない)。
+//    LONG = 終値が帯より上 → 帯の上端に買い指値 (候補のうち上端が最も高い帯)、SHORT = 終値が帯より下 → 帯の下端に売り指値
+//    (下端が最も低い帯)。通常 FVG は 上昇 FVG = LONG だけ・下降 FVG = SHORT だけ、さらに終値がその FVG の外 (LONG は上端より上・SHORT は下端より下)
+//    のときだけ (ZCR-9 と同じ「FVG へ上から / 下から」。iFVG は条件なし)。条件を満たさなくなった注文は取消。
+//    全注文は 1 つの OCA グループ (最初の約定で他を取消)。同時保有 1 (pyramiding 0)。
+//  SL / TP: 実際の約定価格から ± X (5 / 10 / 15 ドル。strategy.exit の profit / loss をティック数で指定)。固定 (建値移動・分割・トレーリングなし)。
+//  再エントリー: ペア・方向ごとに、候補帯に触れた足 (約定した足を含む) から接触中。帯から離脱幅 (5 ドル) 以上離れるか、帯の外側が
+//    離脱時間 (30 分) 続くまで新しい注文を置かない (ZCR と同じ離脱規則)。保有中に触れたペアも接触中になる (決済後に遅れて入らない)。
+//  上位足サッツバンド (任意・既定 OFF): 選んだ足 (日足 / 4H / 1H) の確定済みの帯。赤 = SHORT のみ / 青 = LONG のみ /
+//    フラット = 見送り (既定) か両方向。取得できない間 (na) は発注しない。
+strategy("ZoneConfluenceStrategyXAU", shorttitle = "ZCS-XAU", overlay = true,
+     pyramiding                      = 0,
+     initial_capital                 = 10000,
+     default_qty_type                = strategy.fixed,
+     default_qty_value               = 1,
+     commission_type                 = strategy.commission.cash_per_contract,
+     commission_value                = 0,
+     slippage                        = 0,
+     process_orders_on_close         = false,
+     calc_on_every_tick              = false,
+     calc_on_order_fills             = false,
+     backtest_fill_limits_assumption = 0,
+     margin_long                     = 0,
+     margin_short                    = 0,
+     max_bars_back                   = 1100,
+     dynamic_requests                = true)
+// dynamic_requests = true: 必要な種類・時間足の request だけを if の中で呼ぶため (Pine v6 の動的リクエスト)
+
+// 上位足サッツバンドの計算ライブラリ (ZoneComboLabXAU と同じ。公開したユーザー名・版に合わせて書き換える)
+import sekine3310/LabTimingXAU/2 as ltb     // 別名 ltb: ZCR / Lab から写した登録ブロックのローカル変数 lt と同名にしない
+
+// ---- 入力: 売買 ------------------------------------------------------------------------------------------------
+var string G_TR = "00 · 売買 (SL / TP・再エントリー・発注期間)"
+zsX = input.int(15, "SL / TP の値幅 X ($)", options = [5, 10, 15], group = G_TR,
+     tooltip = "実際の約定価格から TP = 反発方向へ X、SL = 逆行方向へ X (strategy.exit の profit / loss をティック数で指定)。約定後は固定。")
+zcDepW = input.float(5.0, "離脱幅 ($)", minval = 0.01, step = 0.5, group = G_TR,
+     tooltip = "ペア・方向ごとの接触中の解除: 確定 5分足が接触の帯の完全に外側で、帯の端からの距離がこの値以上 (ZCR と同じ規則)。接触中は新しい注文を置かない。")
+zcDepMin = input.int(30, "離脱時間 (分)", minval = 1, group = G_TR,
+     tooltip = "接触中の解除: 完全に外側の状態が、最初の外側の足の開始から今の足の確定までこの分数以上続いた (実際の経過時間)。")
+zcStart = input.time(timestamp("01 Jan 2020 00:00 +0000"), "発注開始日時 (判断足の確定時刻)", group = G_TR,
+     tooltip = "判断足 (確定 5分足) の time_close がこの日時より前は注文を置かない。")
+zcWarm = input.int(6000, "先頭から発注しない助走本数 (0 = 無効)", minval = 0, group = G_TR,
+     tooltip = "読み込んだ確定 5分足の先頭からこの本数の間は注文を置かない (EMA 3000 の初期誤差と、上位足由来の Zone がまだ揃っていない区間を外す)。\n" +
+     "その間も Zone の登録・更新・失効と接触中の状態の更新は通常どおり行う。")
+
+var string G_FB = "01 · 上位足サッツバンド フィルター"
+fbUse  = input.bool(false, "上位足の帯色で方向を制限する", group = G_FB,
+     tooltip = "選んだ足の確定済みのサッツバンド (ZoneComboLabXAU の 04a と同じ計算・同じ取得): 赤 → SHORT のみ / 青 → LONG のみ。\n" +
+     "許可するのは Zone エントリーの可否だけ (帯色だけでは発注しない)。帯が取得できない間は発注しない (フラットとして扱わない)。OFF なら取得しない。")
+fbTf   = input.string("4H", "参照足", options = ["日足", "4H", "1H"], group = G_FB)
+fbFlat = input.string("見送り", "フラットのとき", options = ["見送り", "両方向を許可"], group = G_FB)
+
+// ==== ZCS pairs (generated begin) ====
+//  tests/zcs_build.py が生成する区間 (手で編集しない。python3 tests/zcs_build.py で作り直す)。
+//  ZCR-9 の 26 根拠 (ZC_GN の順) の全 325 ペア × LONG / SHORT = 650 個のチェック (初期は全 OFF・自動選別なし)。
+//  設定画面の 1 行 = 1 ペア (inline で LONG と SHORT を並べる)。グループは最初の根拠ごと (25 グループ)。
+//  変数名 pL### / pS### の ### = ペアの通し番号 p (最初の根拠 a < 次の根拠 b の辞書順)。
+var string G_P01 = "P01 · ペア ZA-1H × (後の根拠)"
+var string G_P02 = "P02 · ペア ZA-4H × (後の根拠)"
+var string G_P03 = "P03 · ペア ZA-D × (後の根拠)"
+var string G_P04 = "P04 · ペア ZB-1m × (後の根拠)"
+var string G_P05 = "P05 · ペア ZB-5m × (後の根拠)"
+var string G_P06 = "P06 · ペア ZC-1H × (後の根拠)"
+var string G_P07 = "P07 · ペア ZC-4H × (後の根拠)"
+var string G_P08 = "P08 · ペア ZC-D × (後の根拠)"
+var string G_P09 = "P09 · ペア ZC-W × (後の根拠)"
+var string G_P10 = "P10 · ペア ZD-1H × (後の根拠)"
+var string G_P11 = "P11 · ペア ZD-4H × (後の根拠)"
+var string G_P12 = "P12 · ペア ZD-D × (後の根拠)"
+var string G_P13 = "P13 · ペア ZD-W × (後の根拠)"
+var string G_P14 = "P14 · ペア ZE-4H × (後の根拠)"
+var string G_P15 = "P15 · ペア ZE-D × (後の根拠)"
+var string G_P16 = "P16 · ペア ZF-FVG-1H × (後の根拠)"
+var string G_P17 = "P17 · ペア ZF-FVG-4H × (後の根拠)"
+var string G_P18 = "P18 · ペア ZF-FVG-D × (後の根拠)"
+var string G_P19 = "P19 · ペア ZF-FVG-W × (後の根拠)"
+var string G_P20 = "P20 · ペア ZG-1H × (後の根拠)"
+var string G_P21 = "P21 · ペア ZG-4H × (後の根拠)"
+var string G_P22 = "P22 · ペア ZG-D × (後の根拠)"
+var string G_P23 = "P23 · ペア ZF-iFVG-1H × (後の根拠)"
+var string G_P24 = "P24 · ペア ZF-iFVG-4H × (後の根拠)"
+var string G_P25 = "P25 · ペア ZF-iFVG-D × (後の根拠)"
+pL000 = input.bool(false, "ZA-1H × ZA-4H  LONG", group = G_P01, inline = "q000")
+pS000 = input.bool(false, "SHORT", group = G_P01, inline = "q000")
+pL001 = input.bool(false, "ZA-1H × ZA-D  LONG", group = G_P01, inline = "q001")
+pS001 = input.bool(false, "SHORT", group = G_P01, inline = "q001")
+pL002 = input.bool(false, "ZA-1H × ZB-1m  LONG", group = G_P01, inline = "q002")
+pS002 = input.bool(false, "SHORT", group = G_P01, inline = "q002")
+pL003 = input.bool(false, "ZA-1H × ZB-5m  LONG", group = G_P01, inline = "q003")
+pS003 = input.bool(false, "SHORT", group = G_P01, inline = "q003")
+pL004 = input.bool(false, "ZA-1H × ZC-1H  LONG", group = G_P01, inline = "q004")
+pS004 = input.bool(false, "SHORT", group = G_P01, inline = "q004")
+pL005 = input.bool(false, "ZA-1H × ZC-4H  LONG", group = G_P01, inline = "q005")
+pS005 = input.bool(false, "SHORT", group = G_P01, inline = "q005")
+pL006 = input.bool(false, "ZA-1H × ZC-D  LONG", group = G_P01, inline = "q006")
+pS006 = input.bool(false, "SHORT", group = G_P01, inline = "q006")
+pL007 = input.bool(false, "ZA-1H × ZC-W  LONG", group = G_P01, inline = "q007")
+pS007 = input.bool(false, "SHORT", group = G_P01, inline = "q007")
+pL008 = input.bool(false, "ZA-1H × ZD-1H  LONG", group = G_P01, inline = "q008")
+pS008 = input.bool(false, "SHORT", group = G_P01, inline = "q008")
+pL009 = input.bool(false, "ZA-1H × ZD-4H  LONG", group = G_P01, inline = "q009")
+pS009 = input.bool(false, "SHORT", group = G_P01, inline = "q009")
+pL010 = input.bool(false, "ZA-1H × ZD-D  LONG", group = G_P01, inline = "q010")
+pS010 = input.bool(false, "SHORT", group = G_P01, inline = "q010")
+pL011 = input.bool(false, "ZA-1H × ZD-W  LONG", group = G_P01, inline = "q011")
+pS011 = input.bool(false, "SHORT", group = G_P01, inline = "q011")
+pL012 = input.bool(false, "ZA-1H × ZE-4H  LONG", group = G_P01, inline = "q012")
+pS012 = input.bool(false, "SHORT", group = G_P01, inline = "q012")
+pL013 = input.bool(false, "ZA-1H × ZE-D  LONG", group = G_P01, inline = "q013")
+pS013 = input.bool(false, "SHORT", group = G_P01, inline = "q013")
+pL014 = input.bool(false, "ZA-1H × ZF-FVG-1H  LONG", group = G_P01, inline = "q014")
+pS014 = input.bool(false, "SHORT", group = G_P01, inline = "q014")
+pL015 = input.bool(false, "ZA-1H × ZF-FVG-4H  LONG", group = G_P01, inline = "q015")
+pS015 = input.bool(false, "SHORT", group = G_P01, inline = "q015")
+pL016 = input.bool(false, "ZA-1H × ZF-FVG-D  LONG", group = G_P01, inline = "q016")
+pS016 = input.bool(false, "SHORT", group = G_P01, inline = "q016")
+pL017 = input.bool(false, "ZA-1H × ZF-FVG-W  LONG", group = G_P01, inline = "q017")
+pS017 = input.bool(false, "SHORT", group = G_P01, inline = "q017")
+pL018 = input.bool(false, "ZA-1H × ZG-1H  LONG", group = G_P01, inline = "q018")
+pS018 = input.bool(false, "SHORT", group = G_P01, inline = "q018")
+pL019 = input.bool(false, "ZA-1H × ZG-4H  LONG", group = G_P01, inline = "q019")
+pS019 = input.bool(false, "SHORT", group = G_P01, inline = "q019")
+pL020 = input.bool(false, "ZA-1H × ZG-D  LONG", group = G_P01, inline = "q020")
+pS020 = input.bool(false, "SHORT", group = G_P01, inline = "q020")
+pL021 = input.bool(false, "ZA-1H × ZF-iFVG-1H  LONG", group = G_P01, inline = "q021")
+pS021 = input.bool(false, "SHORT", group = G_P01, inline = "q021")
+pL022 = input.bool(false, "ZA-1H × ZF-iFVG-4H  LONG", group = G_P01, inline = "q022")
+pS022 = input.bool(false, "SHORT", group = G_P01, inline = "q022")
+pL023 = input.bool(false, "ZA-1H × ZF-iFVG-D  LONG", group = G_P01, inline = "q023")
+pS023 = input.bool(false, "SHORT", group = G_P01, inline = "q023")
+pL024 = input.bool(false, "ZA-1H × ZF-iFVG-W  LONG", group = G_P01, inline = "q024")
+pS024 = input.bool(false, "SHORT", group = G_P01, inline = "q024")
+pL025 = input.bool(false, "ZA-4H × ZA-D  LONG", group = G_P02, inline = "q025")
+pS025 = input.bool(false, "SHORT", group = G_P02, inline = "q025")
+pL026 = input.bool(false, "ZA-4H × ZB-1m  LONG", group = G_P02, inline = "q026")
+pS026 = input.bool(false, "SHORT", group = G_P02, inline = "q026")
+pL027 = input.bool(false, "ZA-4H × ZB-5m  LONG", group = G_P02, inline = "q027")
+pS027 = input.bool(false, "SHORT", group = G_P02, inline = "q027")
+pL028 = input.bool(false, "ZA-4H × ZC-1H  LONG", group = G_P02, inline = "q028")
+pS028 = input.bool(false, "SHORT", group = G_P02, inline = "q028")
+pL029 = input.bool(false, "ZA-4H × ZC-4H  LONG", group = G_P02, inline = "q029")
+pS029 = input.bool(false, "SHORT", group = G_P02, inline = "q029")
+pL030 = input.bool(false, "ZA-4H × ZC-D  LONG", group = G_P02, inline = "q030")
+pS030 = input.bool(false, "SHORT", group = G_P02, inline = "q030")
+pL031 = input.bool(false, "ZA-4H × ZC-W  LONG", group = G_P02, inline = "q031")
+pS031 = input.bool(false, "SHORT", group = G_P02, inline = "q031")
+pL032 = input.bool(false, "ZA-4H × ZD-1H  LONG", group = G_P02, inline = "q032")
+pS032 = input.bool(false, "SHORT", group = G_P02, inline = "q032")
+pL033 = input.bool(false, "ZA-4H × ZD-4H  LONG", group = G_P02, inline = "q033")
+pS033 = input.bool(false, "SHORT", group = G_P02, inline = "q033")
+pL034 = input.bool(false, "ZA-4H × ZD-D  LONG", group = G_P02, inline = "q034")
+pS034 = input.bool(false, "SHORT", group = G_P02, inline = "q034")
+pL035 = input.bool(false, "ZA-4H × ZD-W  LONG", group = G_P02, inline = "q035")
+pS035 = input.bool(false, "SHORT", group = G_P02, inline = "q035")
+pL036 = input.bool(false, "ZA-4H × ZE-4H  LONG", group = G_P02, inline = "q036")
+pS036 = input.bool(false, "SHORT", group = G_P02, inline = "q036")
+pL037 = input.bool(false, "ZA-4H × ZE-D  LONG", group = G_P02, inline = "q037")
+pS037 = input.bool(false, "SHORT", group = G_P02, inline = "q037")
+pL038 = input.bool(false, "ZA-4H × ZF-FVG-1H  LONG", group = G_P02, inline = "q038")
+pS038 = input.bool(false, "SHORT", group = G_P02, inline = "q038")
+pL039 = input.bool(false, "ZA-4H × ZF-FVG-4H  LONG", group = G_P02, inline = "q039")
+pS039 = input.bool(false, "SHORT", group = G_P02, inline = "q039")
+pL040 = input.bool(false, "ZA-4H × ZF-FVG-D  LONG", group = G_P02, inline = "q040")
+pS040 = input.bool(false, "SHORT", group = G_P02, inline = "q040")
+pL041 = input.bool(false, "ZA-4H × ZF-FVG-W  LONG", group = G_P02, inline = "q041")
+pS041 = input.bool(false, "SHORT", group = G_P02, inline = "q041")
+pL042 = input.bool(false, "ZA-4H × ZG-1H  LONG", group = G_P02, inline = "q042")
+pS042 = input.bool(false, "SHORT", group = G_P02, inline = "q042")
+pL043 = input.bool(false, "ZA-4H × ZG-4H  LONG", group = G_P02, inline = "q043")
+pS043 = input.bool(false, "SHORT", group = G_P02, inline = "q043")
+pL044 = input.bool(false, "ZA-4H × ZG-D  LONG", group = G_P02, inline = "q044")
+pS044 = input.bool(false, "SHORT", group = G_P02, inline = "q044")
+pL045 = input.bool(false, "ZA-4H × ZF-iFVG-1H  LONG", group = G_P02, inline = "q045")
+pS045 = input.bool(false, "SHORT", group = G_P02, inline = "q045")
+pL046 = input.bool(false, "ZA-4H × ZF-iFVG-4H  LONG", group = G_P02, inline = "q046")
+pS046 = input.bool(false, "SHORT", group = G_P02, inline = "q046")
+pL047 = input.bool(false, "ZA-4H × ZF-iFVG-D  LONG", group = G_P02, inline = "q047")
+pS047 = input.bool(false, "SHORT", group = G_P02, inline = "q047")
+pL048 = input.bool(false, "ZA-4H × ZF-iFVG-W  LONG", group = G_P02, inline = "q048")
+pS048 = input.bool(false, "SHORT", group = G_P02, inline = "q048")
+pL049 = input.bool(false, "ZA-D × ZB-1m  LONG", group = G_P03, inline = "q049")
+pS049 = input.bool(false, "SHORT", group = G_P03, inline = "q049")
+pL050 = input.bool(false, "ZA-D × ZB-5m  LONG", group = G_P03, inline = "q050")
+pS050 = input.bool(false, "SHORT", group = G_P03, inline = "q050")
+pL051 = input.bool(false, "ZA-D × ZC-1H  LONG", group = G_P03, inline = "q051")
+pS051 = input.bool(false, "SHORT", group = G_P03, inline = "q051")
+pL052 = input.bool(false, "ZA-D × ZC-4H  LONG", group = G_P03, inline = "q052")
+pS052 = input.bool(false, "SHORT", group = G_P03, inline = "q052")
+pL053 = input.bool(false, "ZA-D × ZC-D  LONG", group = G_P03, inline = "q053")
+pS053 = input.bool(false, "SHORT", group = G_P03, inline = "q053")
+pL054 = input.bool(false, "ZA-D × ZC-W  LONG", group = G_P03, inline = "q054")
+pS054 = input.bool(false, "SHORT", group = G_P03, inline = "q054")
+pL055 = input.bool(false, "ZA-D × ZD-1H  LONG", group = G_P03, inline = "q055")
+pS055 = input.bool(false, "SHORT", group = G_P03, inline = "q055")
+pL056 = input.bool(false, "ZA-D × ZD-4H  LONG", group = G_P03, inline = "q056")
+pS056 = input.bool(false, "SHORT", group = G_P03, inline = "q056")
+pL057 = input.bool(false, "ZA-D × ZD-D  LONG", group = G_P03, inline = "q057")
+pS057 = input.bool(false, "SHORT", group = G_P03, inline = "q057")
+pL058 = input.bool(false, "ZA-D × ZD-W  LONG", group = G_P03, inline = "q058")
+pS058 = input.bool(false, "SHORT", group = G_P03, inline = "q058")
+pL059 = input.bool(false, "ZA-D × ZE-4H  LONG", group = G_P03, inline = "q059")
+pS059 = input.bool(false, "SHORT", group = G_P03, inline = "q059")
+pL060 = input.bool(false, "ZA-D × ZE-D  LONG", group = G_P03, inline = "q060")
+pS060 = input.bool(false, "SHORT", group = G_P03, inline = "q060")
+pL061 = input.bool(false, "ZA-D × ZF-FVG-1H  LONG", group = G_P03, inline = "q061")
+pS061 = input.bool(false, "SHORT", group = G_P03, inline = "q061")
+pL062 = input.bool(false, "ZA-D × ZF-FVG-4H  LONG", group = G_P03, inline = "q062")
+pS062 = input.bool(false, "SHORT", group = G_P03, inline = "q062")
+pL063 = input.bool(false, "ZA-D × ZF-FVG-D  LONG", group = G_P03, inline = "q063")
+pS063 = input.bool(false, "SHORT", group = G_P03, inline = "q063")
+pL064 = input.bool(false, "ZA-D × ZF-FVG-W  LONG", group = G_P03, inline = "q064")
+pS064 = input.bool(false, "SHORT", group = G_P03, inline = "q064")
+pL065 = input.bool(false, "ZA-D × ZG-1H  LONG", group = G_P03, inline = "q065")
+pS065 = input.bool(false, "SHORT", group = G_P03, inline = "q065")
+pL066 = input.bool(false, "ZA-D × ZG-4H  LONG", group = G_P03, inline = "q066")
+pS066 = input.bool(false, "SHORT", group = G_P03, inline = "q066")
+pL067 = input.bool(false, "ZA-D × ZG-D  LONG", group = G_P03, inline = "q067")
+pS067 = input.bool(false, "SHORT", group = G_P03, inline = "q067")
+pL068 = input.bool(false, "ZA-D × ZF-iFVG-1H  LONG", group = G_P03, inline = "q068")
+pS068 = input.bool(false, "SHORT", group = G_P03, inline = "q068")
+pL069 = input.bool(false, "ZA-D × ZF-iFVG-4H  LONG", group = G_P03, inline = "q069")
+pS069 = input.bool(false, "SHORT", group = G_P03, inline = "q069")
+pL070 = input.bool(false, "ZA-D × ZF-iFVG-D  LONG", group = G_P03, inline = "q070")
+pS070 = input.bool(false, "SHORT", group = G_P03, inline = "q070")
+pL071 = input.bool(false, "ZA-D × ZF-iFVG-W  LONG", group = G_P03, inline = "q071")
+pS071 = input.bool(false, "SHORT", group = G_P03, inline = "q071")
+pL072 = input.bool(false, "ZB-1m × ZB-5m  LONG", group = G_P04, inline = "q072")
+pS072 = input.bool(false, "SHORT", group = G_P04, inline = "q072")
+pL073 = input.bool(false, "ZB-1m × ZC-1H  LONG", group = G_P04, inline = "q073")
+pS073 = input.bool(false, "SHORT", group = G_P04, inline = "q073")
+pL074 = input.bool(false, "ZB-1m × ZC-4H  LONG", group = G_P04, inline = "q074")
+pS074 = input.bool(false, "SHORT", group = G_P04, inline = "q074")
+pL075 = input.bool(false, "ZB-1m × ZC-D  LONG", group = G_P04, inline = "q075")
+pS075 = input.bool(false, "SHORT", group = G_P04, inline = "q075")
+pL076 = input.bool(false, "ZB-1m × ZC-W  LONG", group = G_P04, inline = "q076")
+pS076 = input.bool(false, "SHORT", group = G_P04, inline = "q076")
+pL077 = input.bool(false, "ZB-1m × ZD-1H  LONG", group = G_P04, inline = "q077")
+pS077 = input.bool(false, "SHORT", group = G_P04, inline = "q077")
+pL078 = input.bool(false, "ZB-1m × ZD-4H  LONG", group = G_P04, inline = "q078")
+pS078 = input.bool(false, "SHORT", group = G_P04, inline = "q078")
+pL079 = input.bool(false, "ZB-1m × ZD-D  LONG", group = G_P04, inline = "q079")
+pS079 = input.bool(false, "SHORT", group = G_P04, inline = "q079")
+pL080 = input.bool(false, "ZB-1m × ZD-W  LONG", group = G_P04, inline = "q080")
+pS080 = input.bool(false, "SHORT", group = G_P04, inline = "q080")
+pL081 = input.bool(false, "ZB-1m × ZE-4H  LONG", group = G_P04, inline = "q081")
+pS081 = input.bool(false, "SHORT", group = G_P04, inline = "q081")
+pL082 = input.bool(false, "ZB-1m × ZE-D  LONG", group = G_P04, inline = "q082")
+pS082 = input.bool(false, "SHORT", group = G_P04, inline = "q082")
+pL083 = input.bool(false, "ZB-1m × ZF-FVG-1H  LONG", group = G_P04, inline = "q083")
+pS083 = input.bool(false, "SHORT", group = G_P04, inline = "q083")
+pL084 = input.bool(false, "ZB-1m × ZF-FVG-4H  LONG", group = G_P04, inline = "q084")
+pS084 = input.bool(false, "SHORT", group = G_P04, inline = "q084")
+pL085 = input.bool(false, "ZB-1m × ZF-FVG-D  LONG", group = G_P04, inline = "q085")
+pS085 = input.bool(false, "SHORT", group = G_P04, inline = "q085")
+pL086 = input.bool(false, "ZB-1m × ZF-FVG-W  LONG", group = G_P04, inline = "q086")
+pS086 = input.bool(false, "SHORT", group = G_P04, inline = "q086")
+pL087 = input.bool(false, "ZB-1m × ZG-1H  LONG", group = G_P04, inline = "q087")
+pS087 = input.bool(false, "SHORT", group = G_P04, inline = "q087")
+pL088 = input.bool(false, "ZB-1m × ZG-4H  LONG", group = G_P04, inline = "q088")
+pS088 = input.bool(false, "SHORT", group = G_P04, inline = "q088")
+pL089 = input.bool(false, "ZB-1m × ZG-D  LONG", group = G_P04, inline = "q089")
+pS089 = input.bool(false, "SHORT", group = G_P04, inline = "q089")
+pL090 = input.bool(false, "ZB-1m × ZF-iFVG-1H  LONG", group = G_P04, inline = "q090")
+pS090 = input.bool(false, "SHORT", group = G_P04, inline = "q090")
+pL091 = input.bool(false, "ZB-1m × ZF-iFVG-4H  LONG", group = G_P04, inline = "q091")
+pS091 = input.bool(false, "SHORT", group = G_P04, inline = "q091")
+pL092 = input.bool(false, "ZB-1m × ZF-iFVG-D  LONG", group = G_P04, inline = "q092")
+pS092 = input.bool(false, "SHORT", group = G_P04, inline = "q092")
+pL093 = input.bool(false, "ZB-1m × ZF-iFVG-W  LONG", group = G_P04, inline = "q093")
+pS093 = input.bool(false, "SHORT", group = G_P04, inline = "q093")
+pL094 = input.bool(false, "ZB-5m × ZC-1H  LONG", group = G_P05, inline = "q094")
+pS094 = input.bool(false, "SHORT", group = G_P05, inline = "q094")
+pL095 = input.bool(false, "ZB-5m × ZC-4H  LONG", group = G_P05, inline = "q095")
+pS095 = input.bool(false, "SHORT", group = G_P05, inline = "q095")
+pL096 = input.bool(false, "ZB-5m × ZC-D  LONG", group = G_P05, inline = "q096")
+pS096 = input.bool(false, "SHORT", group = G_P05, inline = "q096")
+pL097 = input.bool(false, "ZB-5m × ZC-W  LONG", group = G_P05, inline = "q097")
+pS097 = input.bool(false, "SHORT", group = G_P05, inline = "q097")
+pL098 = input.bool(false, "ZB-5m × ZD-1H  LONG", group = G_P05, inline = "q098")
+pS098 = input.bool(false, "SHORT", group = G_P05, inline = "q098")
+pL099 = input.bool(false, "ZB-5m × ZD-4H  LONG", group = G_P05, inline = "q099")
+pS099 = input.bool(false, "SHORT", group = G_P05, inline = "q099")
+pL100 = input.bool(false, "ZB-5m × ZD-D  LONG", group = G_P05, inline = "q100")
+pS100 = input.bool(false, "SHORT", group = G_P05, inline = "q100")
+pL101 = input.bool(false, "ZB-5m × ZD-W  LONG", group = G_P05, inline = "q101")
+pS101 = input.bool(false, "SHORT", group = G_P05, inline = "q101")
+pL102 = input.bool(false, "ZB-5m × ZE-4H  LONG", group = G_P05, inline = "q102")
+pS102 = input.bool(false, "SHORT", group = G_P05, inline = "q102")
+pL103 = input.bool(false, "ZB-5m × ZE-D  LONG", group = G_P05, inline = "q103")
+pS103 = input.bool(false, "SHORT", group = G_P05, inline = "q103")
+pL104 = input.bool(false, "ZB-5m × ZF-FVG-1H  LONG", group = G_P05, inline = "q104")
+pS104 = input.bool(false, "SHORT", group = G_P05, inline = "q104")
+pL105 = input.bool(false, "ZB-5m × ZF-FVG-4H  LONG", group = G_P05, inline = "q105")
+pS105 = input.bool(false, "SHORT", group = G_P05, inline = "q105")
+pL106 = input.bool(false, "ZB-5m × ZF-FVG-D  LONG", group = G_P05, inline = "q106")
+pS106 = input.bool(false, "SHORT", group = G_P05, inline = "q106")
+pL107 = input.bool(false, "ZB-5m × ZF-FVG-W  LONG", group = G_P05, inline = "q107")
+pS107 = input.bool(false, "SHORT", group = G_P05, inline = "q107")
+pL108 = input.bool(false, "ZB-5m × ZG-1H  LONG", group = G_P05, inline = "q108")
+pS108 = input.bool(false, "SHORT", group = G_P05, inline = "q108")
+pL109 = input.bool(false, "ZB-5m × ZG-4H  LONG", group = G_P05, inline = "q109")
+pS109 = input.bool(false, "SHORT", group = G_P05, inline = "q109")
+pL110 = input.bool(false, "ZB-5m × ZG-D  LONG", group = G_P05, inline = "q110")
+pS110 = input.bool(false, "SHORT", group = G_P05, inline = "q110")
+pL111 = input.bool(false, "ZB-5m × ZF-iFVG-1H  LONG", group = G_P05, inline = "q111")
+pS111 = input.bool(false, "SHORT", group = G_P05, inline = "q111")
+pL112 = input.bool(false, "ZB-5m × ZF-iFVG-4H  LONG", group = G_P05, inline = "q112")
+pS112 = input.bool(false, "SHORT", group = G_P05, inline = "q112")
+pL113 = input.bool(false, "ZB-5m × ZF-iFVG-D  LONG", group = G_P05, inline = "q113")
+pS113 = input.bool(false, "SHORT", group = G_P05, inline = "q113")
+pL114 = input.bool(false, "ZB-5m × ZF-iFVG-W  LONG", group = G_P05, inline = "q114")
+pS114 = input.bool(false, "SHORT", group = G_P05, inline = "q114")
+pL115 = input.bool(false, "ZC-1H × ZC-4H  LONG", group = G_P06, inline = "q115")
+pS115 = input.bool(false, "SHORT", group = G_P06, inline = "q115")
+pL116 = input.bool(false, "ZC-1H × ZC-D  LONG", group = G_P06, inline = "q116")
+pS116 = input.bool(false, "SHORT", group = G_P06, inline = "q116")
+pL117 = input.bool(false, "ZC-1H × ZC-W  LONG", group = G_P06, inline = "q117")
+pS117 = input.bool(false, "SHORT", group = G_P06, inline = "q117")
+pL118 = input.bool(false, "ZC-1H × ZD-1H  LONG", group = G_P06, inline = "q118")
+pS118 = input.bool(false, "SHORT", group = G_P06, inline = "q118")
+pL119 = input.bool(false, "ZC-1H × ZD-4H  LONG", group = G_P06, inline = "q119")
+pS119 = input.bool(false, "SHORT", group = G_P06, inline = "q119")
+pL120 = input.bool(false, "ZC-1H × ZD-D  LONG", group = G_P06, inline = "q120")
+pS120 = input.bool(false, "SHORT", group = G_P06, inline = "q120")
+pL121 = input.bool(false, "ZC-1H × ZD-W  LONG", group = G_P06, inline = "q121")
+pS121 = input.bool(false, "SHORT", group = G_P06, inline = "q121")
+pL122 = input.bool(false, "ZC-1H × ZE-4H  LONG", group = G_P06, inline = "q122")
+pS122 = input.bool(false, "SHORT", group = G_P06, inline = "q122")
+pL123 = input.bool(false, "ZC-1H × ZE-D  LONG", group = G_P06, inline = "q123")
+pS123 = input.bool(false, "SHORT", group = G_P06, inline = "q123")
+pL124 = input.bool(false, "ZC-1H × ZF-FVG-1H  LONG", group = G_P06, inline = "q124")
+pS124 = input.bool(false, "SHORT", group = G_P06, inline = "q124")
+pL125 = input.bool(false, "ZC-1H × ZF-FVG-4H  LONG", group = G_P06, inline = "q125")
+pS125 = input.bool(false, "SHORT", group = G_P06, inline = "q125")
+pL126 = input.bool(false, "ZC-1H × ZF-FVG-D  LONG", group = G_P06, inline = "q126")
+pS126 = input.bool(false, "SHORT", group = G_P06, inline = "q126")
+pL127 = input.bool(false, "ZC-1H × ZF-FVG-W  LONG", group = G_P06, inline = "q127")
+pS127 = input.bool(false, "SHORT", group = G_P06, inline = "q127")
+pL128 = input.bool(false, "ZC-1H × ZG-1H  LONG", group = G_P06, inline = "q128")
+pS128 = input.bool(false, "SHORT", group = G_P06, inline = "q128")
+pL129 = input.bool(false, "ZC-1H × ZG-4H  LONG", group = G_P06, inline = "q129")
+pS129 = input.bool(false, "SHORT", group = G_P06, inline = "q129")
+pL130 = input.bool(false, "ZC-1H × ZG-D  LONG", group = G_P06, inline = "q130")
+pS130 = input.bool(false, "SHORT", group = G_P06, inline = "q130")
+pL131 = input.bool(false, "ZC-1H × ZF-iFVG-1H  LONG", group = G_P06, inline = "q131")
+pS131 = input.bool(false, "SHORT", group = G_P06, inline = "q131")
+pL132 = input.bool(false, "ZC-1H × ZF-iFVG-4H  LONG", group = G_P06, inline = "q132")
+pS132 = input.bool(false, "SHORT", group = G_P06, inline = "q132")
+pL133 = input.bool(false, "ZC-1H × ZF-iFVG-D  LONG", group = G_P06, inline = "q133")
+pS133 = input.bool(false, "SHORT", group = G_P06, inline = "q133")
+pL134 = input.bool(false, "ZC-1H × ZF-iFVG-W  LONG", group = G_P06, inline = "q134")
+pS134 = input.bool(false, "SHORT", group = G_P06, inline = "q134")
+pL135 = input.bool(false, "ZC-4H × ZC-D  LONG", group = G_P07, inline = "q135")
+pS135 = input.bool(false, "SHORT", group = G_P07, inline = "q135")
+pL136 = input.bool(false, "ZC-4H × ZC-W  LONG", group = G_P07, inline = "q136")
+pS136 = input.bool(false, "SHORT", group = G_P07, inline = "q136")
+pL137 = input.bool(false, "ZC-4H × ZD-1H  LONG", group = G_P07, inline = "q137")
+pS137 = input.bool(false, "SHORT", group = G_P07, inline = "q137")
+pL138 = input.bool(false, "ZC-4H × ZD-4H  LONG", group = G_P07, inline = "q138")
+pS138 = input.bool(false, "SHORT", group = G_P07, inline = "q138")
+pL139 = input.bool(false, "ZC-4H × ZD-D  LONG", group = G_P07, inline = "q139")
+pS139 = input.bool(false, "SHORT", group = G_P07, inline = "q139")
+pL140 = input.bool(false, "ZC-4H × ZD-W  LONG", group = G_P07, inline = "q140")
+pS140 = input.bool(false, "SHORT", group = G_P07, inline = "q140")
+pL141 = input.bool(false, "ZC-4H × ZE-4H  LONG", group = G_P07, inline = "q141")
+pS141 = input.bool(false, "SHORT", group = G_P07, inline = "q141")
+pL142 = input.bool(false, "ZC-4H × ZE-D  LONG", group = G_P07, inline = "q142")
+pS142 = input.bool(false, "SHORT", group = G_P07, inline = "q142")
+pL143 = input.bool(false, "ZC-4H × ZF-FVG-1H  LONG", group = G_P07, inline = "q143")
+pS143 = input.bool(false, "SHORT", group = G_P07, inline = "q143")
+pL144 = input.bool(false, "ZC-4H × ZF-FVG-4H  LONG", group = G_P07, inline = "q144")
+pS144 = input.bool(false, "SHORT", group = G_P07, inline = "q144")
+pL145 = input.bool(false, "ZC-4H × ZF-FVG-D  LONG", group = G_P07, inline = "q145")
+pS145 = input.bool(false, "SHORT", group = G_P07, inline = "q145")
+pL146 = input.bool(false, "ZC-4H × ZF-FVG-W  LONG", group = G_P07, inline = "q146")
+pS146 = input.bool(false, "SHORT", group = G_P07, inline = "q146")
+pL147 = input.bool(false, "ZC-4H × ZG-1H  LONG", group = G_P07, inline = "q147")
+pS147 = input.bool(false, "SHORT", group = G_P07, inline = "q147")
+pL148 = input.bool(false, "ZC-4H × ZG-4H  LONG", group = G_P07, inline = "q148")
+pS148 = input.bool(false, "SHORT", group = G_P07, inline = "q148")
+pL149 = input.bool(false, "ZC-4H × ZG-D  LONG", group = G_P07, inline = "q149")
+pS149 = input.bool(false, "SHORT", group = G_P07, inline = "q149")
+pL150 = input.bool(false, "ZC-4H × ZF-iFVG-1H  LONG", group = G_P07, inline = "q150")
+pS150 = input.bool(false, "SHORT", group = G_P07, inline = "q150")
+pL151 = input.bool(false, "ZC-4H × ZF-iFVG-4H  LONG", group = G_P07, inline = "q151")
+pS151 = input.bool(false, "SHORT", group = G_P07, inline = "q151")
+pL152 = input.bool(false, "ZC-4H × ZF-iFVG-D  LONG", group = G_P07, inline = "q152")
+pS152 = input.bool(false, "SHORT", group = G_P07, inline = "q152")
+pL153 = input.bool(false, "ZC-4H × ZF-iFVG-W  LONG", group = G_P07, inline = "q153")
+pS153 = input.bool(false, "SHORT", group = G_P07, inline = "q153")
+pL154 = input.bool(false, "ZC-D × ZC-W  LONG", group = G_P08, inline = "q154")
+pS154 = input.bool(false, "SHORT", group = G_P08, inline = "q154")
+pL155 = input.bool(false, "ZC-D × ZD-1H  LONG", group = G_P08, inline = "q155")
+pS155 = input.bool(false, "SHORT", group = G_P08, inline = "q155")
+pL156 = input.bool(false, "ZC-D × ZD-4H  LONG", group = G_P08, inline = "q156")
+pS156 = input.bool(false, "SHORT", group = G_P08, inline = "q156")
+pL157 = input.bool(false, "ZC-D × ZD-D  LONG", group = G_P08, inline = "q157")
+pS157 = input.bool(false, "SHORT", group = G_P08, inline = "q157")
+pL158 = input.bool(false, "ZC-D × ZD-W  LONG", group = G_P08, inline = "q158")
+pS158 = input.bool(false, "SHORT", group = G_P08, inline = "q158")
+pL159 = input.bool(false, "ZC-D × ZE-4H  LONG", group = G_P08, inline = "q159")
+pS159 = input.bool(false, "SHORT", group = G_P08, inline = "q159")
+pL160 = input.bool(false, "ZC-D × ZE-D  LONG", group = G_P08, inline = "q160")
+pS160 = input.bool(false, "SHORT", group = G_P08, inline = "q160")
+pL161 = input.bool(false, "ZC-D × ZF-FVG-1H  LONG", group = G_P08, inline = "q161")
+pS161 = input.bool(false, "SHORT", group = G_P08, inline = "q161")
+pL162 = input.bool(false, "ZC-D × ZF-FVG-4H  LONG", group = G_P08, inline = "q162")
+pS162 = input.bool(false, "SHORT", group = G_P08, inline = "q162")
+pL163 = input.bool(false, "ZC-D × ZF-FVG-D  LONG", group = G_P08, inline = "q163")
+pS163 = input.bool(false, "SHORT", group = G_P08, inline = "q163")
+pL164 = input.bool(false, "ZC-D × ZF-FVG-W  LONG", group = G_P08, inline = "q164")
+pS164 = input.bool(false, "SHORT", group = G_P08, inline = "q164")
+pL165 = input.bool(false, "ZC-D × ZG-1H  LONG", group = G_P08, inline = "q165")
+pS165 = input.bool(false, "SHORT", group = G_P08, inline = "q165")
+pL166 = input.bool(false, "ZC-D × ZG-4H  LONG", group = G_P08, inline = "q166")
+pS166 = input.bool(false, "SHORT", group = G_P08, inline = "q166")
+pL167 = input.bool(false, "ZC-D × ZG-D  LONG", group = G_P08, inline = "q167")
+pS167 = input.bool(false, "SHORT", group = G_P08, inline = "q167")
+pL168 = input.bool(false, "ZC-D × ZF-iFVG-1H  LONG", group = G_P08, inline = "q168")
+pS168 = input.bool(false, "SHORT", group = G_P08, inline = "q168")
+pL169 = input.bool(false, "ZC-D × ZF-iFVG-4H  LONG", group = G_P08, inline = "q169")
+pS169 = input.bool(false, "SHORT", group = G_P08, inline = "q169")
+pL170 = input.bool(false, "ZC-D × ZF-iFVG-D  LONG", group = G_P08, inline = "q170")
+pS170 = input.bool(false, "SHORT", group = G_P08, inline = "q170")
+pL171 = input.bool(false, "ZC-D × ZF-iFVG-W  LONG", group = G_P08, inline = "q171")
+pS171 = input.bool(false, "SHORT", group = G_P08, inline = "q171")
+pL172 = input.bool(false, "ZC-W × ZD-1H  LONG", group = G_P09, inline = "q172")
+pS172 = input.bool(false, "SHORT", group = G_P09, inline = "q172")
+pL173 = input.bool(false, "ZC-W × ZD-4H  LONG", group = G_P09, inline = "q173")
+pS173 = input.bool(false, "SHORT", group = G_P09, inline = "q173")
+pL174 = input.bool(false, "ZC-W × ZD-D  LONG", group = G_P09, inline = "q174")
+pS174 = input.bool(false, "SHORT", group = G_P09, inline = "q174")
+pL175 = input.bool(false, "ZC-W × ZD-W  LONG", group = G_P09, inline = "q175")
+pS175 = input.bool(false, "SHORT", group = G_P09, inline = "q175")
+pL176 = input.bool(false, "ZC-W × ZE-4H  LONG", group = G_P09, inline = "q176")
+pS176 = input.bool(false, "SHORT", group = G_P09, inline = "q176")
+pL177 = input.bool(false, "ZC-W × ZE-D  LONG", group = G_P09, inline = "q177")
+pS177 = input.bool(false, "SHORT", group = G_P09, inline = "q177")
+pL178 = input.bool(false, "ZC-W × ZF-FVG-1H  LONG", group = G_P09, inline = "q178")
+pS178 = input.bool(false, "SHORT", group = G_P09, inline = "q178")
+pL179 = input.bool(false, "ZC-W × ZF-FVG-4H  LONG", group = G_P09, inline = "q179")
+pS179 = input.bool(false, "SHORT", group = G_P09, inline = "q179")
+pL180 = input.bool(false, "ZC-W × ZF-FVG-D  LONG", group = G_P09, inline = "q180")
+pS180 = input.bool(false, "SHORT", group = G_P09, inline = "q180")
+pL181 = input.bool(false, "ZC-W × ZF-FVG-W  LONG", group = G_P09, inline = "q181")
+pS181 = input.bool(false, "SHORT", group = G_P09, inline = "q181")
+pL182 = input.bool(false, "ZC-W × ZG-1H  LONG", group = G_P09, inline = "q182")
+pS182 = input.bool(false, "SHORT", group = G_P09, inline = "q182")
+pL183 = input.bool(false, "ZC-W × ZG-4H  LONG", group = G_P09, inline = "q183")
+pS183 = input.bool(false, "SHORT", group = G_P09, inline = "q183")
+pL184 = input.bool(false, "ZC-W × ZG-D  LONG", group = G_P09, inline = "q184")
+pS184 = input.bool(false, "SHORT", group = G_P09, inline = "q184")
+pL185 = input.bool(false, "ZC-W × ZF-iFVG-1H  LONG", group = G_P09, inline = "q185")
+pS185 = input.bool(false, "SHORT", group = G_P09, inline = "q185")
+pL186 = input.bool(false, "ZC-W × ZF-iFVG-4H  LONG", group = G_P09, inline = "q186")
+pS186 = input.bool(false, "SHORT", group = G_P09, inline = "q186")
+pL187 = input.bool(false, "ZC-W × ZF-iFVG-D  LONG", group = G_P09, inline = "q187")
+pS187 = input.bool(false, "SHORT", group = G_P09, inline = "q187")
+pL188 = input.bool(false, "ZC-W × ZF-iFVG-W  LONG", group = G_P09, inline = "q188")
+pS188 = input.bool(false, "SHORT", group = G_P09, inline = "q188")
+pL189 = input.bool(false, "ZD-1H × ZD-4H  LONG", group = G_P10, inline = "q189")
+pS189 = input.bool(false, "SHORT", group = G_P10, inline = "q189")
+pL190 = input.bool(false, "ZD-1H × ZD-D  LONG", group = G_P10, inline = "q190")
+pS190 = input.bool(false, "SHORT", group = G_P10, inline = "q190")
+pL191 = input.bool(false, "ZD-1H × ZD-W  LONG", group = G_P10, inline = "q191")
+pS191 = input.bool(false, "SHORT", group = G_P10, inline = "q191")
+pL192 = input.bool(false, "ZD-1H × ZE-4H  LONG", group = G_P10, inline = "q192")
+pS192 = input.bool(false, "SHORT", group = G_P10, inline = "q192")
+pL193 = input.bool(false, "ZD-1H × ZE-D  LONG", group = G_P10, inline = "q193")
+pS193 = input.bool(false, "SHORT", group = G_P10, inline = "q193")
+pL194 = input.bool(false, "ZD-1H × ZF-FVG-1H  LONG", group = G_P10, inline = "q194")
+pS194 = input.bool(false, "SHORT", group = G_P10, inline = "q194")
+pL195 = input.bool(false, "ZD-1H × ZF-FVG-4H  LONG", group = G_P10, inline = "q195")
+pS195 = input.bool(false, "SHORT", group = G_P10, inline = "q195")
+pL196 = input.bool(false, "ZD-1H × ZF-FVG-D  LONG", group = G_P10, inline = "q196")
+pS196 = input.bool(false, "SHORT", group = G_P10, inline = "q196")
+pL197 = input.bool(false, "ZD-1H × ZF-FVG-W  LONG", group = G_P10, inline = "q197")
+pS197 = input.bool(false, "SHORT", group = G_P10, inline = "q197")
+pL198 = input.bool(false, "ZD-1H × ZG-1H  LONG", group = G_P10, inline = "q198")
+pS198 = input.bool(false, "SHORT", group = G_P10, inline = "q198")
+pL199 = input.bool(false, "ZD-1H × ZG-4H  LONG", group = G_P10, inline = "q199")
+pS199 = input.bool(false, "SHORT", group = G_P10, inline = "q199")
+pL200 = input.bool(false, "ZD-1H × ZG-D  LONG", group = G_P10, inline = "q200")
+pS200 = input.bool(false, "SHORT", group = G_P10, inline = "q200")
+pL201 = input.bool(false, "ZD-1H × ZF-iFVG-1H  LONG", group = G_P10, inline = "q201")
+pS201 = input.bool(false, "SHORT", group = G_P10, inline = "q201")
+pL202 = input.bool(false, "ZD-1H × ZF-iFVG-4H  LONG", group = G_P10, inline = "q202")
+pS202 = input.bool(false, "SHORT", group = G_P10, inline = "q202")
+pL203 = input.bool(false, "ZD-1H × ZF-iFVG-D  LONG", group = G_P10, inline = "q203")
+pS203 = input.bool(false, "SHORT", group = G_P10, inline = "q203")
+pL204 = input.bool(false, "ZD-1H × ZF-iFVG-W  LONG", group = G_P10, inline = "q204")
+pS204 = input.bool(false, "SHORT", group = G_P10, inline = "q204")
+pL205 = input.bool(false, "ZD-4H × ZD-D  LONG", group = G_P11, inline = "q205")
+pS205 = input.bool(false, "SHORT", group = G_P11, inline = "q205")
+pL206 = input.bool(false, "ZD-4H × ZD-W  LONG", group = G_P11, inline = "q206")
+pS206 = input.bool(false, "SHORT", group = G_P11, inline = "q206")
+pL207 = input.bool(false, "ZD-4H × ZE-4H  LONG", group = G_P11, inline = "q207")
+pS207 = input.bool(false, "SHORT", group = G_P11, inline = "q207")
+pL208 = input.bool(false, "ZD-4H × ZE-D  LONG", group = G_P11, inline = "q208")
+pS208 = input.bool(false, "SHORT", group = G_P11, inline = "q208")
+pL209 = input.bool(false, "ZD-4H × ZF-FVG-1H  LONG", group = G_P11, inline = "q209")
+pS209 = input.bool(false, "SHORT", group = G_P11, inline = "q209")
+pL210 = input.bool(false, "ZD-4H × ZF-FVG-4H  LONG", group = G_P11, inline = "q210")
+pS210 = input.bool(false, "SHORT", group = G_P11, inline = "q210")
+pL211 = input.bool(false, "ZD-4H × ZF-FVG-D  LONG", group = G_P11, inline = "q211")
+pS211 = input.bool(false, "SHORT", group = G_P11, inline = "q211")
+pL212 = input.bool(false, "ZD-4H × ZF-FVG-W  LONG", group = G_P11, inline = "q212")
+pS212 = input.bool(false, "SHORT", group = G_P11, inline = "q212")
+pL213 = input.bool(false, "ZD-4H × ZG-1H  LONG", group = G_P11, inline = "q213")
+pS213 = input.bool(false, "SHORT", group = G_P11, inline = "q213")
+pL214 = input.bool(false, "ZD-4H × ZG-4H  LONG", group = G_P11, inline = "q214")
+pS214 = input.bool(false, "SHORT", group = G_P11, inline = "q214")
+pL215 = input.bool(false, "ZD-4H × ZG-D  LONG", group = G_P11, inline = "q215")
+pS215 = input.bool(false, "SHORT", group = G_P11, inline = "q215")
+pL216 = input.bool(false, "ZD-4H × ZF-iFVG-1H  LONG", group = G_P11, inline = "q216")
+pS216 = input.bool(false, "SHORT", group = G_P11, inline = "q216")
+pL217 = input.bool(false, "ZD-4H × ZF-iFVG-4H  LONG", group = G_P11, inline = "q217")
+pS217 = input.bool(false, "SHORT", group = G_P11, inline = "q217")
+pL218 = input.bool(false, "ZD-4H × ZF-iFVG-D  LONG", group = G_P11, inline = "q218")
+pS218 = input.bool(false, "SHORT", group = G_P11, inline = "q218")
+pL219 = input.bool(false, "ZD-4H × ZF-iFVG-W  LONG", group = G_P11, inline = "q219")
+pS219 = input.bool(false, "SHORT", group = G_P11, inline = "q219")
+pL220 = input.bool(false, "ZD-D × ZD-W  LONG", group = G_P12, inline = "q220")
+pS220 = input.bool(false, "SHORT", group = G_P12, inline = "q220")
+pL221 = input.bool(false, "ZD-D × ZE-4H  LONG", group = G_P12, inline = "q221")
+pS221 = input.bool(false, "SHORT", group = G_P12, inline = "q221")
+pL222 = input.bool(false, "ZD-D × ZE-D  LONG", group = G_P12, inline = "q222")
+pS222 = input.bool(false, "SHORT", group = G_P12, inline = "q222")
+pL223 = input.bool(false, "ZD-D × ZF-FVG-1H  LONG", group = G_P12, inline = "q223")
+pS223 = input.bool(false, "SHORT", group = G_P12, inline = "q223")
+pL224 = input.bool(false, "ZD-D × ZF-FVG-4H  LONG", group = G_P12, inline = "q224")
+pS224 = input.bool(false, "SHORT", group = G_P12, inline = "q224")
+pL225 = input.bool(false, "ZD-D × ZF-FVG-D  LONG", group = G_P12, inline = "q225")
+pS225 = input.bool(false, "SHORT", group = G_P12, inline = "q225")
+pL226 = input.bool(false, "ZD-D × ZF-FVG-W  LONG", group = G_P12, inline = "q226")
+pS226 = input.bool(false, "SHORT", group = G_P12, inline = "q226")
+pL227 = input.bool(false, "ZD-D × ZG-1H  LONG", group = G_P12, inline = "q227")
+pS227 = input.bool(false, "SHORT", group = G_P12, inline = "q227")
+pL228 = input.bool(false, "ZD-D × ZG-4H  LONG", group = G_P12, inline = "q228")
+pS228 = input.bool(false, "SHORT", group = G_P12, inline = "q228")
+pL229 = input.bool(false, "ZD-D × ZG-D  LONG", group = G_P12, inline = "q229")
+pS229 = input.bool(false, "SHORT", group = G_P12, inline = "q229")
+pL230 = input.bool(false, "ZD-D × ZF-iFVG-1H  LONG", group = G_P12, inline = "q230")
+pS230 = input.bool(false, "SHORT", group = G_P12, inline = "q230")
+pL231 = input.bool(false, "ZD-D × ZF-iFVG-4H  LONG", group = G_P12, inline = "q231")
+pS231 = input.bool(false, "SHORT", group = G_P12, inline = "q231")
+pL232 = input.bool(false, "ZD-D × ZF-iFVG-D  LONG", group = G_P12, inline = "q232")
+pS232 = input.bool(false, "SHORT", group = G_P12, inline = "q232")
+pL233 = input.bool(false, "ZD-D × ZF-iFVG-W  LONG", group = G_P12, inline = "q233")
+pS233 = input.bool(false, "SHORT", group = G_P12, inline = "q233")
+pL234 = input.bool(false, "ZD-W × ZE-4H  LONG", group = G_P13, inline = "q234")
+pS234 = input.bool(false, "SHORT", group = G_P13, inline = "q234")
+pL235 = input.bool(false, "ZD-W × ZE-D  LONG", group = G_P13, inline = "q235")
+pS235 = input.bool(false, "SHORT", group = G_P13, inline = "q235")
+pL236 = input.bool(false, "ZD-W × ZF-FVG-1H  LONG", group = G_P13, inline = "q236")
+pS236 = input.bool(false, "SHORT", group = G_P13, inline = "q236")
+pL237 = input.bool(false, "ZD-W × ZF-FVG-4H  LONG", group = G_P13, inline = "q237")
+pS237 = input.bool(false, "SHORT", group = G_P13, inline = "q237")
+pL238 = input.bool(false, "ZD-W × ZF-FVG-D  LONG", group = G_P13, inline = "q238")
+pS238 = input.bool(false, "SHORT", group = G_P13, inline = "q238")
+pL239 = input.bool(false, "ZD-W × ZF-FVG-W  LONG", group = G_P13, inline = "q239")
+pS239 = input.bool(false, "SHORT", group = G_P13, inline = "q239")
+pL240 = input.bool(false, "ZD-W × ZG-1H  LONG", group = G_P13, inline = "q240")
+pS240 = input.bool(false, "SHORT", group = G_P13, inline = "q240")
+pL241 = input.bool(false, "ZD-W × ZG-4H  LONG", group = G_P13, inline = "q241")
+pS241 = input.bool(false, "SHORT", group = G_P13, inline = "q241")
+pL242 = input.bool(false, "ZD-W × ZG-D  LONG", group = G_P13, inline = "q242")
+pS242 = input.bool(false, "SHORT", group = G_P13, inline = "q242")
+pL243 = input.bool(false, "ZD-W × ZF-iFVG-1H  LONG", group = G_P13, inline = "q243")
+pS243 = input.bool(false, "SHORT", group = G_P13, inline = "q243")
+pL244 = input.bool(false, "ZD-W × ZF-iFVG-4H  LONG", group = G_P13, inline = "q244")
+pS244 = input.bool(false, "SHORT", group = G_P13, inline = "q244")
+pL245 = input.bool(false, "ZD-W × ZF-iFVG-D  LONG", group = G_P13, inline = "q245")
+pS245 = input.bool(false, "SHORT", group = G_P13, inline = "q245")
+pL246 = input.bool(false, "ZD-W × ZF-iFVG-W  LONG", group = G_P13, inline = "q246")
+pS246 = input.bool(false, "SHORT", group = G_P13, inline = "q246")
+pL247 = input.bool(false, "ZE-4H × ZE-D  LONG", group = G_P14, inline = "q247")
+pS247 = input.bool(false, "SHORT", group = G_P14, inline = "q247")
+pL248 = input.bool(false, "ZE-4H × ZF-FVG-1H  LONG", group = G_P14, inline = "q248")
+pS248 = input.bool(false, "SHORT", group = G_P14, inline = "q248")
+pL249 = input.bool(false, "ZE-4H × ZF-FVG-4H  LONG", group = G_P14, inline = "q249")
+pS249 = input.bool(false, "SHORT", group = G_P14, inline = "q249")
+pL250 = input.bool(false, "ZE-4H × ZF-FVG-D  LONG", group = G_P14, inline = "q250")
+pS250 = input.bool(false, "SHORT", group = G_P14, inline = "q250")
+pL251 = input.bool(false, "ZE-4H × ZF-FVG-W  LONG", group = G_P14, inline = "q251")
+pS251 = input.bool(false, "SHORT", group = G_P14, inline = "q251")
+pL252 = input.bool(false, "ZE-4H × ZG-1H  LONG", group = G_P14, inline = "q252")
+pS252 = input.bool(false, "SHORT", group = G_P14, inline = "q252")
+pL253 = input.bool(false, "ZE-4H × ZG-4H  LONG", group = G_P14, inline = "q253")
+pS253 = input.bool(false, "SHORT", group = G_P14, inline = "q253")
+pL254 = input.bool(false, "ZE-4H × ZG-D  LONG", group = G_P14, inline = "q254")
+pS254 = input.bool(false, "SHORT", group = G_P14, inline = "q254")
+pL255 = input.bool(false, "ZE-4H × ZF-iFVG-1H  LONG", group = G_P14, inline = "q255")
+pS255 = input.bool(false, "SHORT", group = G_P14, inline = "q255")
+pL256 = input.bool(false, "ZE-4H × ZF-iFVG-4H  LONG", group = G_P14, inline = "q256")
+pS256 = input.bool(false, "SHORT", group = G_P14, inline = "q256")
+pL257 = input.bool(false, "ZE-4H × ZF-iFVG-D  LONG", group = G_P14, inline = "q257")
+pS257 = input.bool(false, "SHORT", group = G_P14, inline = "q257")
+pL258 = input.bool(false, "ZE-4H × ZF-iFVG-W  LONG", group = G_P14, inline = "q258")
+pS258 = input.bool(false, "SHORT", group = G_P14, inline = "q258")
+pL259 = input.bool(false, "ZE-D × ZF-FVG-1H  LONG", group = G_P15, inline = "q259")
+pS259 = input.bool(false, "SHORT", group = G_P15, inline = "q259")
+pL260 = input.bool(false, "ZE-D × ZF-FVG-4H  LONG", group = G_P15, inline = "q260")
+pS260 = input.bool(false, "SHORT", group = G_P15, inline = "q260")
+pL261 = input.bool(false, "ZE-D × ZF-FVG-D  LONG", group = G_P15, inline = "q261")
+pS261 = input.bool(false, "SHORT", group = G_P15, inline = "q261")
+pL262 = input.bool(false, "ZE-D × ZF-FVG-W  LONG", group = G_P15, inline = "q262")
+pS262 = input.bool(false, "SHORT", group = G_P15, inline = "q262")
+pL263 = input.bool(false, "ZE-D × ZG-1H  LONG", group = G_P15, inline = "q263")
+pS263 = input.bool(false, "SHORT", group = G_P15, inline = "q263")
+pL264 = input.bool(false, "ZE-D × ZG-4H  LONG", group = G_P15, inline = "q264")
+pS264 = input.bool(false, "SHORT", group = G_P15, inline = "q264")
+pL265 = input.bool(false, "ZE-D × ZG-D  LONG", group = G_P15, inline = "q265")
+pS265 = input.bool(false, "SHORT", group = G_P15, inline = "q265")
+pL266 = input.bool(false, "ZE-D × ZF-iFVG-1H  LONG", group = G_P15, inline = "q266")
+pS266 = input.bool(false, "SHORT", group = G_P15, inline = "q266")
+pL267 = input.bool(false, "ZE-D × ZF-iFVG-4H  LONG", group = G_P15, inline = "q267")
+pS267 = input.bool(false, "SHORT", group = G_P15, inline = "q267")
+pL268 = input.bool(false, "ZE-D × ZF-iFVG-D  LONG", group = G_P15, inline = "q268")
+pS268 = input.bool(false, "SHORT", group = G_P15, inline = "q268")
+pL269 = input.bool(false, "ZE-D × ZF-iFVG-W  LONG", group = G_P15, inline = "q269")
+pS269 = input.bool(false, "SHORT", group = G_P15, inline = "q269")
+pL270 = input.bool(false, "ZF-FVG-1H × ZF-FVG-4H  LONG", group = G_P16, inline = "q270")
+pS270 = input.bool(false, "SHORT", group = G_P16, inline = "q270")
+pL271 = input.bool(false, "ZF-FVG-1H × ZF-FVG-D  LONG", group = G_P16, inline = "q271")
+pS271 = input.bool(false, "SHORT", group = G_P16, inline = "q271")
+pL272 = input.bool(false, "ZF-FVG-1H × ZF-FVG-W  LONG", group = G_P16, inline = "q272")
+pS272 = input.bool(false, "SHORT", group = G_P16, inline = "q272")
+pL273 = input.bool(false, "ZF-FVG-1H × ZG-1H  LONG", group = G_P16, inline = "q273")
+pS273 = input.bool(false, "SHORT", group = G_P16, inline = "q273")
+pL274 = input.bool(false, "ZF-FVG-1H × ZG-4H  LONG", group = G_P16, inline = "q274")
+pS274 = input.bool(false, "SHORT", group = G_P16, inline = "q274")
+pL275 = input.bool(false, "ZF-FVG-1H × ZG-D  LONG", group = G_P16, inline = "q275")
+pS275 = input.bool(false, "SHORT", group = G_P16, inline = "q275")
+pL276 = input.bool(false, "ZF-FVG-1H × ZF-iFVG-1H  LONG", group = G_P16, inline = "q276")
+pS276 = input.bool(false, "SHORT", group = G_P16, inline = "q276")
+pL277 = input.bool(false, "ZF-FVG-1H × ZF-iFVG-4H  LONG", group = G_P16, inline = "q277")
+pS277 = input.bool(false, "SHORT", group = G_P16, inline = "q277")
+pL278 = input.bool(false, "ZF-FVG-1H × ZF-iFVG-D  LONG", group = G_P16, inline = "q278")
+pS278 = input.bool(false, "SHORT", group = G_P16, inline = "q278")
+pL279 = input.bool(false, "ZF-FVG-1H × ZF-iFVG-W  LONG", group = G_P16, inline = "q279")
+pS279 = input.bool(false, "SHORT", group = G_P16, inline = "q279")
+pL280 = input.bool(false, "ZF-FVG-4H × ZF-FVG-D  LONG", group = G_P17, inline = "q280")
+pS280 = input.bool(false, "SHORT", group = G_P17, inline = "q280")
+pL281 = input.bool(false, "ZF-FVG-4H × ZF-FVG-W  LONG", group = G_P17, inline = "q281")
+pS281 = input.bool(false, "SHORT", group = G_P17, inline = "q281")
+pL282 = input.bool(false, "ZF-FVG-4H × ZG-1H  LONG", group = G_P17, inline = "q282")
+pS282 = input.bool(false, "SHORT", group = G_P17, inline = "q282")
+pL283 = input.bool(false, "ZF-FVG-4H × ZG-4H  LONG", group = G_P17, inline = "q283")
+pS283 = input.bool(false, "SHORT", group = G_P17, inline = "q283")
+pL284 = input.bool(false, "ZF-FVG-4H × ZG-D  LONG", group = G_P17, inline = "q284")
+pS284 = input.bool(false, "SHORT", group = G_P17, inline = "q284")
+pL285 = input.bool(false, "ZF-FVG-4H × ZF-iFVG-1H  LONG", group = G_P17, inline = "q285")
+pS285 = input.bool(false, "SHORT", group = G_P17, inline = "q285")
+pL286 = input.bool(false, "ZF-FVG-4H × ZF-iFVG-4H  LONG", group = G_P17, inline = "q286")
+pS286 = input.bool(false, "SHORT", group = G_P17, inline = "q286")
+pL287 = input.bool(false, "ZF-FVG-4H × ZF-iFVG-D  LONG", group = G_P17, inline = "q287")
+pS287 = input.bool(false, "SHORT", group = G_P17, inline = "q287")
+pL288 = input.bool(false, "ZF-FVG-4H × ZF-iFVG-W  LONG", group = G_P17, inline = "q288")
+pS288 = input.bool(false, "SHORT", group = G_P17, inline = "q288")
+pL289 = input.bool(false, "ZF-FVG-D × ZF-FVG-W  LONG", group = G_P18, inline = "q289")
+pS289 = input.bool(false, "SHORT", group = G_P18, inline = "q289")
+pL290 = input.bool(false, "ZF-FVG-D × ZG-1H  LONG", group = G_P18, inline = "q290")
+pS290 = input.bool(false, "SHORT", group = G_P18, inline = "q290")
+pL291 = input.bool(false, "ZF-FVG-D × ZG-4H  LONG", group = G_P18, inline = "q291")
+pS291 = input.bool(false, "SHORT", group = G_P18, inline = "q291")
+pL292 = input.bool(false, "ZF-FVG-D × ZG-D  LONG", group = G_P18, inline = "q292")
+pS292 = input.bool(false, "SHORT", group = G_P18, inline = "q292")
+pL293 = input.bool(false, "ZF-FVG-D × ZF-iFVG-1H  LONG", group = G_P18, inline = "q293")
+pS293 = input.bool(false, "SHORT", group = G_P18, inline = "q293")
+pL294 = input.bool(false, "ZF-FVG-D × ZF-iFVG-4H  LONG", group = G_P18, inline = "q294")
+pS294 = input.bool(false, "SHORT", group = G_P18, inline = "q294")
+pL295 = input.bool(false, "ZF-FVG-D × ZF-iFVG-D  LONG", group = G_P18, inline = "q295")
+pS295 = input.bool(false, "SHORT", group = G_P18, inline = "q295")
+pL296 = input.bool(false, "ZF-FVG-D × ZF-iFVG-W  LONG", group = G_P18, inline = "q296")
+pS296 = input.bool(false, "SHORT", group = G_P18, inline = "q296")
+pL297 = input.bool(false, "ZF-FVG-W × ZG-1H  LONG", group = G_P19, inline = "q297")
+pS297 = input.bool(false, "SHORT", group = G_P19, inline = "q297")
+pL298 = input.bool(false, "ZF-FVG-W × ZG-4H  LONG", group = G_P19, inline = "q298")
+pS298 = input.bool(false, "SHORT", group = G_P19, inline = "q298")
+pL299 = input.bool(false, "ZF-FVG-W × ZG-D  LONG", group = G_P19, inline = "q299")
+pS299 = input.bool(false, "SHORT", group = G_P19, inline = "q299")
+pL300 = input.bool(false, "ZF-FVG-W × ZF-iFVG-1H  LONG", group = G_P19, inline = "q300")
+pS300 = input.bool(false, "SHORT", group = G_P19, inline = "q300")
+pL301 = input.bool(false, "ZF-FVG-W × ZF-iFVG-4H  LONG", group = G_P19, inline = "q301")
+pS301 = input.bool(false, "SHORT", group = G_P19, inline = "q301")
+pL302 = input.bool(false, "ZF-FVG-W × ZF-iFVG-D  LONG", group = G_P19, inline = "q302")
+pS302 = input.bool(false, "SHORT", group = G_P19, inline = "q302")
+pL303 = input.bool(false, "ZF-FVG-W × ZF-iFVG-W  LONG", group = G_P19, inline = "q303")
+pS303 = input.bool(false, "SHORT", group = G_P19, inline = "q303")
+pL304 = input.bool(false, "ZG-1H × ZG-4H  LONG", group = G_P20, inline = "q304")
+pS304 = input.bool(false, "SHORT", group = G_P20, inline = "q304")
+pL305 = input.bool(false, "ZG-1H × ZG-D  LONG", group = G_P20, inline = "q305")
+pS305 = input.bool(false, "SHORT", group = G_P20, inline = "q305")
+pL306 = input.bool(false, "ZG-1H × ZF-iFVG-1H  LONG", group = G_P20, inline = "q306")
+pS306 = input.bool(false, "SHORT", group = G_P20, inline = "q306")
+pL307 = input.bool(false, "ZG-1H × ZF-iFVG-4H  LONG", group = G_P20, inline = "q307")
+pS307 = input.bool(false, "SHORT", group = G_P20, inline = "q307")
+pL308 = input.bool(false, "ZG-1H × ZF-iFVG-D  LONG", group = G_P20, inline = "q308")
+pS308 = input.bool(false, "SHORT", group = G_P20, inline = "q308")
+pL309 = input.bool(false, "ZG-1H × ZF-iFVG-W  LONG", group = G_P20, inline = "q309")
+pS309 = input.bool(false, "SHORT", group = G_P20, inline = "q309")
+pL310 = input.bool(false, "ZG-4H × ZG-D  LONG", group = G_P21, inline = "q310")
+pS310 = input.bool(false, "SHORT", group = G_P21, inline = "q310")
+pL311 = input.bool(false, "ZG-4H × ZF-iFVG-1H  LONG", group = G_P21, inline = "q311")
+pS311 = input.bool(false, "SHORT", group = G_P21, inline = "q311")
+pL312 = input.bool(false, "ZG-4H × ZF-iFVG-4H  LONG", group = G_P21, inline = "q312")
+pS312 = input.bool(false, "SHORT", group = G_P21, inline = "q312")
+pL313 = input.bool(false, "ZG-4H × ZF-iFVG-D  LONG", group = G_P21, inline = "q313")
+pS313 = input.bool(false, "SHORT", group = G_P21, inline = "q313")
+pL314 = input.bool(false, "ZG-4H × ZF-iFVG-W  LONG", group = G_P21, inline = "q314")
+pS314 = input.bool(false, "SHORT", group = G_P21, inline = "q314")
+pL315 = input.bool(false, "ZG-D × ZF-iFVG-1H  LONG", group = G_P22, inline = "q315")
+pS315 = input.bool(false, "SHORT", group = G_P22, inline = "q315")
+pL316 = input.bool(false, "ZG-D × ZF-iFVG-4H  LONG", group = G_P22, inline = "q316")
+pS316 = input.bool(false, "SHORT", group = G_P22, inline = "q316")
+pL317 = input.bool(false, "ZG-D × ZF-iFVG-D  LONG", group = G_P22, inline = "q317")
+pS317 = input.bool(false, "SHORT", group = G_P22, inline = "q317")
+pL318 = input.bool(false, "ZG-D × ZF-iFVG-W  LONG", group = G_P22, inline = "q318")
+pS318 = input.bool(false, "SHORT", group = G_P22, inline = "q318")
+pL319 = input.bool(false, "ZF-iFVG-1H × ZF-iFVG-4H  LONG", group = G_P23, inline = "q319")
+pS319 = input.bool(false, "SHORT", group = G_P23, inline = "q319")
+pL320 = input.bool(false, "ZF-iFVG-1H × ZF-iFVG-D  LONG", group = G_P23, inline = "q320")
+pS320 = input.bool(false, "SHORT", group = G_P23, inline = "q320")
+pL321 = input.bool(false, "ZF-iFVG-1H × ZF-iFVG-W  LONG", group = G_P23, inline = "q321")
+pS321 = input.bool(false, "SHORT", group = G_P23, inline = "q321")
+pL322 = input.bool(false, "ZF-iFVG-4H × ZF-iFVG-D  LONG", group = G_P24, inline = "q322")
+pS322 = input.bool(false, "SHORT", group = G_P24, inline = "q322")
+pL323 = input.bool(false, "ZF-iFVG-4H × ZF-iFVG-W  LONG", group = G_P24, inline = "q323")
+pS323 = input.bool(false, "SHORT", group = G_P24, inline = "q323")
+pL324 = input.bool(false, "ZF-iFVG-D × ZF-iFVG-W  LONG", group = G_P25, inline = "q324")
+pS324 = input.bool(false, "SHORT", group = G_P25, inline = "q324")
+// 選択の配列 (ペア p の LONG = 2p、SHORT = 2p + 1)。最初の根拠ごとに 1 文
+f_zsSel() =>
+    array<bool> s = array.new_bool()
+    array.concat(s, array.from(pL000, pS000, pL001, pS001, pL002, pS002, pL003, pS003, pL004, pS004,
+         pL005, pS005, pL006, pS006, pL007, pS007, pL008, pS008, pL009, pS009,
+         pL010, pS010, pL011, pS011, pL012, pS012, pL013, pS013, pL014, pS014,
+         pL015, pS015, pL016, pS016, pL017, pS017, pL018, pS018, pL019, pS019,
+         pL020, pS020, pL021, pS021, pL022, pS022, pL023, pS023, pL024, pS024))
+    array.concat(s, array.from(pL025, pS025, pL026, pS026, pL027, pS027, pL028, pS028, pL029, pS029,
+         pL030, pS030, pL031, pS031, pL032, pS032, pL033, pS033, pL034, pS034,
+         pL035, pS035, pL036, pS036, pL037, pS037, pL038, pS038, pL039, pS039,
+         pL040, pS040, pL041, pS041, pL042, pS042, pL043, pS043, pL044, pS044,
+         pL045, pS045, pL046, pS046, pL047, pS047, pL048, pS048))
+    array.concat(s, array.from(pL049, pS049, pL050, pS050, pL051, pS051, pL052, pS052, pL053, pS053,
+         pL054, pS054, pL055, pS055, pL056, pS056, pL057, pS057, pL058, pS058,
+         pL059, pS059, pL060, pS060, pL061, pS061, pL062, pS062, pL063, pS063,
+         pL064, pS064, pL065, pS065, pL066, pS066, pL067, pS067, pL068, pS068,
+         pL069, pS069, pL070, pS070, pL071, pS071))
+    array.concat(s, array.from(pL072, pS072, pL073, pS073, pL074, pS074, pL075, pS075, pL076, pS076,
+         pL077, pS077, pL078, pS078, pL079, pS079, pL080, pS080, pL081, pS081,
+         pL082, pS082, pL083, pS083, pL084, pS084, pL085, pS085, pL086, pS086,
+         pL087, pS087, pL088, pS088, pL089, pS089, pL090, pS090, pL091, pS091,
+         pL092, pS092, pL093, pS093))
+    array.concat(s, array.from(pL094, pS094, pL095, pS095, pL096, pS096, pL097, pS097, pL098, pS098,
+         pL099, pS099, pL100, pS100, pL101, pS101, pL102, pS102, pL103, pS103,
+         pL104, pS104, pL105, pS105, pL106, pS106, pL107, pS107, pL108, pS108,
+         pL109, pS109, pL110, pS110, pL111, pS111, pL112, pS112, pL113, pS113,
+         pL114, pS114))
+    array.concat(s, array.from(pL115, pS115, pL116, pS116, pL117, pS117, pL118, pS118, pL119, pS119,
+         pL120, pS120, pL121, pS121, pL122, pS122, pL123, pS123, pL124, pS124,
+         pL125, pS125, pL126, pS126, pL127, pS127, pL128, pS128, pL129, pS129,
+         pL130, pS130, pL131, pS131, pL132, pS132, pL133, pS133, pL134, pS134))
+    array.concat(s, array.from(pL135, pS135, pL136, pS136, pL137, pS137, pL138, pS138, pL139, pS139,
+         pL140, pS140, pL141, pS141, pL142, pS142, pL143, pS143, pL144, pS144,
+         pL145, pS145, pL146, pS146, pL147, pS147, pL148, pS148, pL149, pS149,
+         pL150, pS150, pL151, pS151, pL152, pS152, pL153, pS153))
+    array.concat(s, array.from(pL154, pS154, pL155, pS155, pL156, pS156, pL157, pS157, pL158, pS158,
+         pL159, pS159, pL160, pS160, pL161, pS161, pL162, pS162, pL163, pS163,
+         pL164, pS164, pL165, pS165, pL166, pS166, pL167, pS167, pL168, pS168,
+         pL169, pS169, pL170, pS170, pL171, pS171))
+    array.concat(s, array.from(pL172, pS172, pL173, pS173, pL174, pS174, pL175, pS175, pL176, pS176,
+         pL177, pS177, pL178, pS178, pL179, pS179, pL180, pS180, pL181, pS181,
+         pL182, pS182, pL183, pS183, pL184, pS184, pL185, pS185, pL186, pS186,
+         pL187, pS187, pL188, pS188))
+    array.concat(s, array.from(pL189, pS189, pL190, pS190, pL191, pS191, pL192, pS192, pL193, pS193,
+         pL194, pS194, pL195, pS195, pL196, pS196, pL197, pS197, pL198, pS198,
+         pL199, pS199, pL200, pS200, pL201, pS201, pL202, pS202, pL203, pS203,
+         pL204, pS204))
+    array.concat(s, array.from(pL205, pS205, pL206, pS206, pL207, pS207, pL208, pS208, pL209, pS209,
+         pL210, pS210, pL211, pS211, pL212, pS212, pL213, pS213, pL214, pS214,
+         pL215, pS215, pL216, pS216, pL217, pS217, pL218, pS218, pL219, pS219))
+    array.concat(s, array.from(pL220, pS220, pL221, pS221, pL222, pS222, pL223, pS223, pL224, pS224,
+         pL225, pS225, pL226, pS226, pL227, pS227, pL228, pS228, pL229, pS229,
+         pL230, pS230, pL231, pS231, pL232, pS232, pL233, pS233))
+    array.concat(s, array.from(pL234, pS234, pL235, pS235, pL236, pS236, pL237, pS237, pL238, pS238,
+         pL239, pS239, pL240, pS240, pL241, pS241, pL242, pS242, pL243, pS243,
+         pL244, pS244, pL245, pS245, pL246, pS246))
+    array.concat(s, array.from(pL247, pS247, pL248, pS248, pL249, pS249, pL250, pS250, pL251, pS251,
+         pL252, pS252, pL253, pS253, pL254, pS254, pL255, pS255, pL256, pS256,
+         pL257, pS257, pL258, pS258))
+    array.concat(s, array.from(pL259, pS259, pL260, pS260, pL261, pS261, pL262, pS262, pL263, pS263,
+         pL264, pS264, pL265, pS265, pL266, pS266, pL267, pS267, pL268, pS268,
+         pL269, pS269))
+    array.concat(s, array.from(pL270, pS270, pL271, pS271, pL272, pS272, pL273, pS273, pL274, pS274,
+         pL275, pS275, pL276, pS276, pL277, pS277, pL278, pS278, pL279, pS279))
+    array.concat(s, array.from(pL280, pS280, pL281, pS281, pL282, pS282, pL283, pS283, pL284, pS284,
+         pL285, pS285, pL286, pS286, pL287, pS287, pL288, pS288))
+    array.concat(s, array.from(pL289, pS289, pL290, pS290, pL291, pS291, pL292, pS292, pL293, pS293,
+         pL294, pS294, pL295, pS295, pL296, pS296))
+    array.concat(s, array.from(pL297, pS297, pL298, pS298, pL299, pS299, pL300, pS300, pL301, pS301,
+         pL302, pS302, pL303, pS303))
+    array.concat(s, array.from(pL304, pS304, pL305, pS305, pL306, pS306, pL307, pS307, pL308, pS308,
+         pL309, pS309))
+    array.concat(s, array.from(pL310, pS310, pL311, pS311, pL312, pS312, pL313, pS313, pL314, pS314))
+    array.concat(s, array.from(pL315, pS315, pL316, pS316, pL317, pS317, pL318, pS318))
+    array.concat(s, array.from(pL319, pS319, pL320, pS320, pL321, pS321))
+    array.concat(s, array.from(pL322, pS322, pL323, pS323))
+    array.concat(s, array.from(pL324, pS324))
+    s
+// 根拠 ID g を含むペアのどれかが選ばれている (入力だけから決まる simple bool。不要な種類・時間足の request と計算を止める)
+bool zsN00 = pL000 or pS000 or pL001 or pS001 or pL002 or pS002 or pL003 or pS003 or pL004 or pS004 or
+     pL005 or pS005 or pL006 or pS006 or pL007 or pS007 or pL008 or pS008 or pL009 or pS009 or
+     pL010 or pS010 or pL011 or pS011 or pL012 or pS012 or pL013 or pS013 or pL014 or pS014 or
+     pL015 or pS015 or pL016 or pS016 or pL017 or pS017 or pL018 or pS018 or pL019 or pS019 or
+     pL020 or pS020 or pL021 or pS021 or pL022 or pS022 or pL023 or pS023 or pL024 or pS024
+bool zsN01 = pL000 or pS000 or pL025 or pS025 or pL026 or pS026 or pL027 or pS027 or pL028 or pS028 or
+     pL029 or pS029 or pL030 or pS030 or pL031 or pS031 or pL032 or pS032 or pL033 or pS033 or
+     pL034 or pS034 or pL035 or pS035 or pL036 or pS036 or pL037 or pS037 or pL038 or pS038 or
+     pL039 or pS039 or pL040 or pS040 or pL041 or pS041 or pL042 or pS042 or pL043 or pS043 or
+     pL044 or pS044 or pL045 or pS045 or pL046 or pS046 or pL047 or pS047 or pL048 or pS048
+bool zsN02 = pL001 or pS001 or pL025 or pS025 or pL049 or pS049 or pL050 or pS050 or pL051 or pS051 or
+     pL052 or pS052 or pL053 or pS053 or pL054 or pS054 or pL055 or pS055 or pL056 or pS056 or
+     pL057 or pS057 or pL058 or pS058 or pL059 or pS059 or pL060 or pS060 or pL061 or pS061 or
+     pL062 or pS062 or pL063 or pS063 or pL064 or pS064 or pL065 or pS065 or pL066 or pS066 or
+     pL067 or pS067 or pL068 or pS068 or pL069 or pS069 or pL070 or pS070 or pL071 or pS071
+bool zsN03 = pL002 or pS002 or pL026 or pS026 or pL049 or pS049 or pL072 or pS072 or pL073 or pS073 or
+     pL074 or pS074 or pL075 or pS075 or pL076 or pS076 or pL077 or pS077 or pL078 or pS078 or
+     pL079 or pS079 or pL080 or pS080 or pL081 or pS081 or pL082 or pS082 or pL083 or pS083 or
+     pL084 or pS084 or pL085 or pS085 or pL086 or pS086 or pL087 or pS087 or pL088 or pS088 or
+     pL089 or pS089 or pL090 or pS090 or pL091 or pS091 or pL092 or pS092 or pL093 or pS093
+bool zsN04 = pL003 or pS003 or pL027 or pS027 or pL050 or pS050 or pL072 or pS072 or pL094 or pS094 or
+     pL095 or pS095 or pL096 or pS096 or pL097 or pS097 or pL098 or pS098 or pL099 or pS099 or
+     pL100 or pS100 or pL101 or pS101 or pL102 or pS102 or pL103 or pS103 or pL104 or pS104 or
+     pL105 or pS105 or pL106 or pS106 or pL107 or pS107 or pL108 or pS108 or pL109 or pS109 or
+     pL110 or pS110 or pL111 or pS111 or pL112 or pS112 or pL113 or pS113 or pL114 or pS114
+bool zsN05 = pL004 or pS004 or pL028 or pS028 or pL051 or pS051 or pL073 or pS073 or pL094 or pS094 or
+     pL115 or pS115 or pL116 or pS116 or pL117 or pS117 or pL118 or pS118 or pL119 or pS119 or
+     pL120 or pS120 or pL121 or pS121 or pL122 or pS122 or pL123 or pS123 or pL124 or pS124 or
+     pL125 or pS125 or pL126 or pS126 or pL127 or pS127 or pL128 or pS128 or pL129 or pS129 or
+     pL130 or pS130 or pL131 or pS131 or pL132 or pS132 or pL133 or pS133 or pL134 or pS134
+bool zsN06 = pL005 or pS005 or pL029 or pS029 or pL052 or pS052 or pL074 or pS074 or pL095 or pS095 or
+     pL115 or pS115 or pL135 or pS135 or pL136 or pS136 or pL137 or pS137 or pL138 or pS138 or
+     pL139 or pS139 or pL140 or pS140 or pL141 or pS141 or pL142 or pS142 or pL143 or pS143 or
+     pL144 or pS144 or pL145 or pS145 or pL146 or pS146 or pL147 or pS147 or pL148 or pS148 or
+     pL149 or pS149 or pL150 or pS150 or pL151 or pS151 or pL152 or pS152 or pL153 or pS153
+bool zsN07 = pL006 or pS006 or pL030 or pS030 or pL053 or pS053 or pL075 or pS075 or pL096 or pS096 or
+     pL116 or pS116 or pL135 or pS135 or pL154 or pS154 or pL155 or pS155 or pL156 or pS156 or
+     pL157 or pS157 or pL158 or pS158 or pL159 or pS159 or pL160 or pS160 or pL161 or pS161 or
+     pL162 or pS162 or pL163 or pS163 or pL164 or pS164 or pL165 or pS165 or pL166 or pS166 or
+     pL167 or pS167 or pL168 or pS168 or pL169 or pS169 or pL170 or pS170 or pL171 or pS171
+bool zsN08 = pL007 or pS007 or pL031 or pS031 or pL054 or pS054 or pL076 or pS076 or pL097 or pS097 or
+     pL117 or pS117 or pL136 or pS136 or pL154 or pS154 or pL172 or pS172 or pL173 or pS173 or
+     pL174 or pS174 or pL175 or pS175 or pL176 or pS176 or pL177 or pS177 or pL178 or pS178 or
+     pL179 or pS179 or pL180 or pS180 or pL181 or pS181 or pL182 or pS182 or pL183 or pS183 or
+     pL184 or pS184 or pL185 or pS185 or pL186 or pS186 or pL187 or pS187 or pL188 or pS188
+bool zsN09 = pL008 or pS008 or pL032 or pS032 or pL055 or pS055 or pL077 or pS077 or pL098 or pS098 or
+     pL118 or pS118 or pL137 or pS137 or pL155 or pS155 or pL172 or pS172 or pL189 or pS189 or
+     pL190 or pS190 or pL191 or pS191 or pL192 or pS192 or pL193 or pS193 or pL194 or pS194 or
+     pL195 or pS195 or pL196 or pS196 or pL197 or pS197 or pL198 or pS198 or pL199 or pS199 or
+     pL200 or pS200 or pL201 or pS201 or pL202 or pS202 or pL203 or pS203 or pL204 or pS204
+bool zsN10 = pL009 or pS009 or pL033 or pS033 or pL056 or pS056 or pL078 or pS078 or pL099 or pS099 or
+     pL119 or pS119 or pL138 or pS138 or pL156 or pS156 or pL173 or pS173 or pL189 or pS189 or
+     pL205 or pS205 or pL206 or pS206 or pL207 or pS207 or pL208 or pS208 or pL209 or pS209 or
+     pL210 or pS210 or pL211 or pS211 or pL212 or pS212 or pL213 or pS213 or pL214 or pS214 or
+     pL215 or pS215 or pL216 or pS216 or pL217 or pS217 or pL218 or pS218 or pL219 or pS219
+bool zsN11 = pL010 or pS010 or pL034 or pS034 or pL057 or pS057 or pL079 or pS079 or pL100 or pS100 or
+     pL120 or pS120 or pL139 or pS139 or pL157 or pS157 or pL174 or pS174 or pL190 or pS190 or
+     pL205 or pS205 or pL220 or pS220 or pL221 or pS221 or pL222 or pS222 or pL223 or pS223 or
+     pL224 or pS224 or pL225 or pS225 or pL226 or pS226 or pL227 or pS227 or pL228 or pS228 or
+     pL229 or pS229 or pL230 or pS230 or pL231 or pS231 or pL232 or pS232 or pL233 or pS233
+bool zsN12 = pL011 or pS011 or pL035 or pS035 or pL058 or pS058 or pL080 or pS080 or pL101 or pS101 or
+     pL121 or pS121 or pL140 or pS140 or pL158 or pS158 or pL175 or pS175 or pL191 or pS191 or
+     pL206 or pS206 or pL220 or pS220 or pL234 or pS234 or pL235 or pS235 or pL236 or pS236 or
+     pL237 or pS237 or pL238 or pS238 or pL239 or pS239 or pL240 or pS240 or pL241 or pS241 or
+     pL242 or pS242 or pL243 or pS243 or pL244 or pS244 or pL245 or pS245 or pL246 or pS246
+bool zsN13 = pL012 or pS012 or pL036 or pS036 or pL059 or pS059 or pL081 or pS081 or pL102 or pS102 or
+     pL122 or pS122 or pL141 or pS141 or pL159 or pS159 or pL176 or pS176 or pL192 or pS192 or
+     pL207 or pS207 or pL221 or pS221 or pL234 or pS234 or pL247 or pS247 or pL248 or pS248 or
+     pL249 or pS249 or pL250 or pS250 or pL251 or pS251 or pL252 or pS252 or pL253 or pS253 or
+     pL254 or pS254 or pL255 or pS255 or pL256 or pS256 or pL257 or pS257 or pL258 or pS258
+bool zsN14 = pL013 or pS013 or pL037 or pS037 or pL060 or pS060 or pL082 or pS082 or pL103 or pS103 or
+     pL123 or pS123 or pL142 or pS142 or pL160 or pS160 or pL177 or pS177 or pL193 or pS193 or
+     pL208 or pS208 or pL222 or pS222 or pL235 or pS235 or pL247 or pS247 or pL259 or pS259 or
+     pL260 or pS260 or pL261 or pS261 or pL262 or pS262 or pL263 or pS263 or pL264 or pS264 or
+     pL265 or pS265 or pL266 or pS266 or pL267 or pS267 or pL268 or pS268 or pL269 or pS269
+bool zsN15 = pL014 or pS014 or pL038 or pS038 or pL061 or pS061 or pL083 or pS083 or pL104 or pS104 or
+     pL124 or pS124 or pL143 or pS143 or pL161 or pS161 or pL178 or pS178 or pL194 or pS194 or
+     pL209 or pS209 or pL223 or pS223 or pL236 or pS236 or pL248 or pS248 or pL259 or pS259 or
+     pL270 or pS270 or pL271 or pS271 or pL272 or pS272 or pL273 or pS273 or pL274 or pS274 or
+     pL275 or pS275 or pL276 or pS276 or pL277 or pS277 or pL278 or pS278 or pL279 or pS279
+bool zsN16 = pL015 or pS015 or pL039 or pS039 or pL062 or pS062 or pL084 or pS084 or pL105 or pS105 or
+     pL125 or pS125 or pL144 or pS144 or pL162 or pS162 or pL179 or pS179 or pL195 or pS195 or
+     pL210 or pS210 or pL224 or pS224 or pL237 or pS237 or pL249 or pS249 or pL260 or pS260 or
+     pL270 or pS270 or pL280 or pS280 or pL281 or pS281 or pL282 or pS282 or pL283 or pS283 or
+     pL284 or pS284 or pL285 or pS285 or pL286 or pS286 or pL287 or pS287 or pL288 or pS288
+bool zsN17 = pL016 or pS016 or pL040 or pS040 or pL063 or pS063 or pL085 or pS085 or pL106 or pS106 or
+     pL126 or pS126 or pL145 or pS145 or pL163 or pS163 or pL180 or pS180 or pL196 or pS196 or
+     pL211 or pS211 or pL225 or pS225 or pL238 or pS238 or pL250 or pS250 or pL261 or pS261 or
+     pL271 or pS271 or pL280 or pS280 or pL289 or pS289 or pL290 or pS290 or pL291 or pS291 or
+     pL292 or pS292 or pL293 or pS293 or pL294 or pS294 or pL295 or pS295 or pL296 or pS296
+bool zsN18 = pL017 or pS017 or pL041 or pS041 or pL064 or pS064 or pL086 or pS086 or pL107 or pS107 or
+     pL127 or pS127 or pL146 or pS146 or pL164 or pS164 or pL181 or pS181 or pL197 or pS197 or
+     pL212 or pS212 or pL226 or pS226 or pL239 or pS239 or pL251 or pS251 or pL262 or pS262 or
+     pL272 or pS272 or pL281 or pS281 or pL289 or pS289 or pL297 or pS297 or pL298 or pS298 or
+     pL299 or pS299 or pL300 or pS300 or pL301 or pS301 or pL302 or pS302 or pL303 or pS303
+bool zsN19 = pL018 or pS018 or pL042 or pS042 or pL065 or pS065 or pL087 or pS087 or pL108 or pS108 or
+     pL128 or pS128 or pL147 or pS147 or pL165 or pS165 or pL182 or pS182 or pL198 or pS198 or
+     pL213 or pS213 or pL227 or pS227 or pL240 or pS240 or pL252 or pS252 or pL263 or pS263 or
+     pL273 or pS273 or pL282 or pS282 or pL290 or pS290 or pL297 or pS297 or pL304 or pS304 or
+     pL305 or pS305 or pL306 or pS306 or pL307 or pS307 or pL308 or pS308 or pL309 or pS309
+bool zsN20 = pL019 or pS019 or pL043 or pS043 or pL066 or pS066 or pL088 or pS088 or pL109 or pS109 or
+     pL129 or pS129 or pL148 or pS148 or pL166 or pS166 or pL183 or pS183 or pL199 or pS199 or
+     pL214 or pS214 or pL228 or pS228 or pL241 or pS241 or pL253 or pS253 or pL264 or pS264 or
+     pL274 or pS274 or pL283 or pS283 or pL291 or pS291 or pL298 or pS298 or pL304 or pS304 or
+     pL310 or pS310 or pL311 or pS311 or pL312 or pS312 or pL313 or pS313 or pL314 or pS314
+bool zsN21 = pL020 or pS020 or pL044 or pS044 or pL067 or pS067 or pL089 or pS089 or pL110 or pS110 or
+     pL130 or pS130 or pL149 or pS149 or pL167 or pS167 or pL184 or pS184 or pL200 or pS200 or
+     pL215 or pS215 or pL229 or pS229 or pL242 or pS242 or pL254 or pS254 or pL265 or pS265 or
+     pL275 or pS275 or pL284 or pS284 or pL292 or pS292 or pL299 or pS299 or pL305 or pS305 or
+     pL310 or pS310 or pL315 or pS315 or pL316 or pS316 or pL317 or pS317 or pL318 or pS318
+bool zsN22 = pL021 or pS021 or pL045 or pS045 or pL068 or pS068 or pL090 or pS090 or pL111 or pS111 or
+     pL131 or pS131 or pL150 or pS150 or pL168 or pS168 or pL185 or pS185 or pL201 or pS201 or
+     pL216 or pS216 or pL230 or pS230 or pL243 or pS243 or pL255 or pS255 or pL266 or pS266 or
+     pL276 or pS276 or pL285 or pS285 or pL293 or pS293 or pL300 or pS300 or pL306 or pS306 or
+     pL311 or pS311 or pL315 or pS315 or pL319 or pS319 or pL320 or pS320 or pL321 or pS321
+bool zsN23 = pL022 or pS022 or pL046 or pS046 or pL069 or pS069 or pL091 or pS091 or pL112 or pS112 or
+     pL132 or pS132 or pL151 or pS151 or pL169 or pS169 or pL186 or pS186 or pL202 or pS202 or
+     pL217 or pS217 or pL231 or pS231 or pL244 or pS244 or pL256 or pS256 or pL267 or pS267 or
+     pL277 or pS277 or pL286 or pS286 or pL294 or pS294 or pL301 or pS301 or pL307 or pS307 or
+     pL312 or pS312 or pL316 or pS316 or pL319 or pS319 or pL322 or pS322 or pL323 or pS323
+bool zsN24 = pL023 or pS023 or pL047 or pS047 or pL070 or pS070 or pL092 or pS092 or pL113 or pS113 or
+     pL133 or pS133 or pL152 or pS152 or pL170 or pS170 or pL187 or pS187 or pL203 or pS203 or
+     pL218 or pS218 or pL232 or pS232 or pL245 or pS245 or pL257 or pS257 or pL268 or pS268 or
+     pL278 or pS278 or pL287 or pS287 or pL295 or pS295 or pL302 or pS302 or pL308 or pS308 or
+     pL313 or pS313 or pL317 or pS317 or pL320 or pS320 or pL322 or pS322 or pL324 or pS324
+bool zsN25 = pL024 or pS024 or pL048 or pS048 or pL071 or pS071 or pL093 or pS093 or pL114 or pS114 or
+     pL134 or pS134 or pL153 or pS153 or pL171 or pS171 or pL188 or pS188 or pL204 or pS204 or
+     pL219 or pS219 or pL233 or pS233 or pL246 or pS246 or pL258 or pS258 or pL269 or pS269 or
+     pL279 or pS279 or pL288 or pS288 or pL296 or pS296 or pL303 or pS303 or pL309 or pS309 or
+     pL314 or pS314 or pL318 or pS318 or pL321 or pS321 or pL323 or pS323 or pL324 or pS324
+// ==== ZCS pairs (generated end) ====
+
+// ---- 入力: Zone (ZCR-9 と同じ入力名・初期値。種類・時間足ごとの ON / OFF は無い: 選んだペアに含まれる根拠だけを計算する) ----
+var string G_ZW = "Z01 · Zone 共通"
+zHalf = input.float(2.0, "共通の価格帯幅 (中心から上下 $)", minval = 0.0, step = 0.5, group = G_ZW,
+     tooltip = "ZA / ZB / ZC / ZD / ZE の帯 = 中心 ± この値。ZF (FVG) は本来の上下限、ZG は専用の幅を使う。")
+
+var string G_ZA = "Z02a · ZA アキュム (1H / 4H / D)"
+zaKeep1 = input.int(1, "1時間足: 最新から採用する箱数", minval = 1, group = G_ZA)
+zaKeep2 = input.int(1, "4時間足: 最新から採用する箱数", minval = 1, group = G_ZA)
+zaKeep3 = input.int(1, "日足: 最新から採用する箱数", minval = 1, group = G_ZA,
+     tooltip = "形成終了で固定した箱の上辺・下辺 (別々の Zone) のうち、時間足ごとに最新 N 箱だけを使う (Lab と同じ)。")
+
+var string G_ACCP = "Z02a' · Accum Box のパラメータ (ZoneComboLabXAU と同じ)"
+accumRangeLen        = input.int(10,   "Accum判定レンジ本数",  minval = 6,  group = G_ACCP)
+accumBaseLen         = input.int(20,   "基準平均本数",         minval = 10, group = G_ACCP)
+accumAtrLen          = input.int(14,   "ATR本数",             minval = 1,  group = G_ACCP)
+accumMinUpperCloses  = input.int(4,    "上半分の最低終値本数",  minval = 1,  group = G_ACCP)
+accumMinLowerCloses  = input.int(4,    "下半分の最低終値本数",  minval = 1,  group = G_ACCP)
+accumMaxSameColorRun = input.int(4,    "同色連続の上限",       minval = 1,  group = G_ACCP)
+accumAtrMult         = input.float(2.5,  "Accum レンジ幅 / ATR 上限",    minval = 0.5,  step = 0.1,  group = G_ACCP)
+accumBarRatioMax     = input.float(0.70, "Accum 平均値幅/基準平均 上限", minval = 0.1,  step = 0.01, group = G_ACCP)
+accumDriftMax        = input.float(0.30, "Accum ドリフト上限",          minval = 0.05, maxval = 1.0, step = 0.05, group = G_ACCP)
+
+var string G_ZB = "Z02b · ZB MA (EMA)"
+zbLen1 = input.int(3000, "1分足 EMA 本数", minval = 1, group = G_ZB)
+zbWarm1 = input.int(1800, "ZB-1m の助走本数 (5分足。0 = 無効)", minval = 0, group = G_ZB,
+     tooltip = "1分 EMA の有効値を受け取り始めてからこの本数 (5分足) の間は、未収束として ZB-1m を「不明」にする (Zone を作らず、不明の件数に数える)。\n" +
+     "初期値 1800 本 = 1分足 9000 本相当。ZB-5m は「先頭から発注しない助走本数」で扱う。")
+zbLen2 = input.int(3000, "5分足 EMA 本数", minval = 1, group = G_ZB,
+     tooltip = "帯 = EMA ± 共通幅。確定 5分足 k の終わりに置く注文 (足 k+1 で有効) には足 k が確定した時点の値を使う。ta.ema は先頭の足から値を返すので、読み込んだ履歴の先頭側は\n" +
+     "EMA 3000 の初期誤差が残る (「先頭から発注しない助走本数」で外す)。値が na の足 (1分足の履歴が届いていない区間など) は「不明」として MA の帯を作らない。")
+
+var string G_ZC = "Z02c · ZC 水平線 (Swing 高安)"
+zcPiv1 = input.int(6, "1H 左右の本数", minval = 1, group = G_ZC)
+zcPiv2 = input.int(6, "4H 左右の本数", minval = 1, group = G_ZC)
+zcPiv3 = input.int(6, "日足 左右の本数", minval = 1, group = G_ZC)
+zcPiv4 = input.int(6, "週足 左右の本数", minval = 1, group = G_ZC)
+zcMax = input.int(0, "時間足ごとの保持本数 (0 = 無制限)", minval = 0, group = G_ZC,
+     tooltip = "0 = Lab と同じ (登録した水平線は削除しない)。1 以上にすると時間足ごとに新しい順で N 本だけ残す。\n" +
+     "線ごとに個別の帯 (価格 ± 共通幅) を使う (ZCR と同じ)。Lab の統合帯 (水平線の統合距離) は使わない。")
+
+var string G_ZD = "Z02d · ZD 出来高 POC (内蔵計算。MtfPocFeedXAU と同じ式)"
+zdLen1 = input.int(120, "1H POC の本数", minval = 10, maxval = 1000, group = G_ZD)
+zdLen2 = input.int(120, "4H POC の本数", minval = 10, maxval = 1000, group = G_ZD)
+zdLen3 = input.int(120, "日足 POC の本数", minval = 10, maxval = 1000, group = G_ZD)
+zdLen4 = input.int(120, "週足 POC の本数", minval = 10, maxval = 1000, group = G_ZD)
+vpBins = input.int(75, "VP ビン数 (分割数)", minval = 4, maxval = 100, group = G_ZD)
+
+// ---- ZE / ZF の入力 (ZE は ZE を含むペアを選んだときだけ使う: LongFibWave の接続出力 13 系列) ----
+var string G_ZE = "Z02e · ZE フィボ (外部: LongFibWave の出力を受信)"
+zeProto = input.source(close, "FIB protocol", group = G_ZE)
+ze4O = input.source(close, "FIB 4H 起点", group = G_ZE)
+ze4E = input.source(close, "FIB 4H 終点", group = G_ZE)
+ze4D = input.source(close, "FIB 4H 方向", group = G_ZE)
+ze4I = input.source(close, "FIB 4H 波ID", group = G_ZE)
+ze4S = input.source(close, "FIB 4H 状態", group = G_ZE)
+ze4T = input.source(close, "FIB 4H 更新確定時刻", group = G_ZE)
+zeDO = input.source(close, "FIB 日足 起点", group = G_ZE)
+zeDE = input.source(close, "FIB 日足 終点", group = G_ZE)
+zeDD = input.source(close, "FIB 日足 方向", group = G_ZE)
+zeDI = input.source(close, "FIB 日足 波ID", group = G_ZE)
+zeDS = input.source(close, "FIB 日足 状態", group = G_ZE)
+zeDT = input.source(close, "FIB 日足 更新確定時刻", group = G_ZE)
+
+var string G_ZF = "Z02f · ZF FVG / iFVG"
+zfMinW = input.float(3.0, "FVG 最小幅 ($)", minval = 0.0, step = 0.5, group = G_ZF,
+     tooltip = "上昇: low > high[2] / 下降: high < low[2]、幅 (mintick 正規化) >= この値。Zone = FVG 本来の上下限。\n" +
+     "その時間足の確定終値で反対端を抜けたら iFVG、iFVG を確定終値で逆方向に抜けたら無効。日数による失効なし。")
+
+var string G_ZG = "Z02g · ZG ダブル / トリプル トップ・ボトム (1H / 4H / D)"
+zgExp1  = input.bool(true, "1時間足: 時間で消す", group = G_ZG, inline = "zge1")
+zgExpN1 = input.int(24, "本数", minval = 1, group = G_ZG, inline = "zge1")
+zgExp4  = input.bool(true, "4時間足: 時間で消す", group = G_ZG, inline = "zge4")
+zgExpN4 = input.int(12, "本数", minval = 1, group = G_ZG, inline = "zge4")
+zgExpD  = input.bool(true, "日足: 時間で消す", group = G_ZG, inline = "zgeD")
+zgExpND = input.int(5, "本数", minval = 1, group = G_ZG, inline = "zgeD",
+     tooltip = "検知足 = 0 本目。この本数のその時間足が確定した時点で Zone を消す (Lab と同じ)。")
+zgHalf = input.float(2.0, "ZG 帯の幅 (基準価格から上下 $)", minval = 0.0, step = 0.5, group = G_ZG)
+zgRev  = input.float(5.0, "ZG 逆行で消す幅 ($)", minval = 0.0, step = 0.5, group = G_ZG,
+     tooltip = "トップは max(open, close) > 基準価格 + この値、ボトムは min(open, close) < 基準価格 − この値の確定 5分足で消す (Lab と同じ式)。")
+// ---- ZG 検知の入力 (ZoneComboLabXAU.pine と同一) ----
+var string G_ZG1 = "Z02g-1 · ZG 1時間足の検知 (LongTermDoubleTripleTopBottomXAU と同じ処理)"
+zgPiv1   = input.int(4, "1時間足: Pivot 前後の本数", minval = 1, group = G_ZG1)
+zgWave1  = input.float(10.0, "1時間足: 最初の波の最低値幅 ($)", minval = 0.0, step = 0.5, group = G_ZG1)
+zgBuf1   = input.float(5.0, "1時間足: 接近許容幅 ($)", minval = 0.0, step = 0.5, group = G_ZG1)
+zgDist1  = input.float(30.0, "1時間足: 接触間の最低離れ幅 ($)", minval = 0.0, step = 0.5, group = G_ZG1)
+zgGap1   = input.int(8, "1時間足: 接触開始足どうしの最低間隔", minval = 1, group = G_ZG1)
+zgBody1  = input.float(3.0, "1時間足: 反転足の最低実体幅 ($)", minval = 0.0, step = 0.5, group = G_ZG1)
+zgRatio1 = input.float(30.0, "1時間足: 反転足の最低実体比率 (%)", minval = 0.0, maxval = 100.0, step = 1.0, group = G_ZG1)
+zgWait1  = input.int(3, "1時間足: 反転待ち (接触足の後の最大本数)", minval = 0, group = G_ZG1)
+zgMax1   = input.int(24, "1時間足: 基準の最大監視本数", minval = 1, group = G_ZG1)
+zgDir1   = input.bool(false, "1時間足: 最初の山・谷の方向フィルターを使う", group = G_ZG1)
+zgSep1   = input.bool(true, "1時間足: 最低離れ幅フィルターを使う", group = G_ZG1,
+     tooltip = "各項目の意味・判定は LongTermDoubleTripleTopBottomXAU と同じ (本数は1時間足の bar_index)。検知イベント (反転足の確定) で Zone を発動する。")
+var string G_ZG4 = "Z02g-2 · ZG 4時間足の検知 (LongTermDoubleTripleTopBottomXAU と同じ処理)"
+zgPiv4   = input.int(4, "4時間足: Pivot 前後の本数", minval = 1, group = G_ZG4)
+zgWave4  = input.float(60.0, "4時間足: 最初の波の最低値幅 ($)", minval = 0.0, step = 0.5, group = G_ZG4)
+zgBuf4   = input.float(20.0, "4時間足: 接近許容幅 ($)", minval = 0.0, step = 0.5, group = G_ZG4)
+zgDist4  = input.float(80.0, "4時間足: 接触間の最低離れ幅 ($)", minval = 0.0, step = 0.5, group = G_ZG4)
+zgGap4   = input.int(8, "4時間足: 接触開始足どうしの最低間隔", minval = 1, group = G_ZG4)
+zgBody4  = input.float(6.0, "4時間足: 反転足の最低実体幅 ($)", minval = 0.0, step = 0.5, group = G_ZG4)
+zgRatio4 = input.float(30.0, "4時間足: 反転足の最低実体比率 (%)", minval = 0.0, maxval = 100.0, step = 1.0, group = G_ZG4)
+zgWait4  = input.int(3, "4時間足: 反転待ち (接触足の後の最大本数)", minval = 0, group = G_ZG4)
+zgMax4   = input.int(48, "4時間足: 基準の最大監視本数", minval = 1, group = G_ZG4)
+zgDir4   = input.bool(false, "4時間足: 最初の山・谷の方向フィルターを使う", group = G_ZG4)
+zgSep4   = input.bool(true, "4時間足: 最低離れ幅フィルターを使う", group = G_ZG4,
+     tooltip = "各項目の意味・判定は LongTermDoubleTripleTopBottomXAU と同じ (本数は4時間足の bar_index)。検知イベント (反転足の確定) で Zone を発動する。")
+var string G_ZGD = "Z02g-3 · ZG 日足の検知 (LongTermDoubleTripleTopBottomXAU と同じ処理)"
+zgPivD   = input.int(4, "日足: Pivot 前後の本数", minval = 1, group = G_ZGD)
+zgWaveD  = input.float(40.0, "日足: 最初の波の最低値幅 ($)", minval = 0.0, step = 0.5, group = G_ZGD)
+zgBufD   = input.float(20.0, "日足: 接近許容幅 ($)", minval = 0.0, step = 0.5, group = G_ZGD)
+zgDistD  = input.float(120.0, "日足: 接触間の最低離れ幅 ($)", minval = 0.0, step = 0.5, group = G_ZGD)
+zgGapD   = input.int(8, "日足: 接触開始足どうしの最低間隔", minval = 1, group = G_ZGD)
+zgBodyD  = input.float(12.0, "日足: 反転足の最低実体幅 ($)", minval = 0.0, step = 0.5, group = G_ZGD)
+zgRatioD = input.float(30.0, "日足: 反転足の最低実体比率 (%)", minval = 0.0, maxval = 100.0, step = 1.0, group = G_ZGD)
+zgWaitD  = input.int(3, "日足: 反転待ち (接触足の後の最大本数)", minval = 0, group = G_ZGD)
+zgMaxD   = input.int(24, "日足: 基準の最大監視本数", minval = 1, group = G_ZGD)
+zgDirD   = input.bool(false, "日足: 最初の山・谷の方向フィルターを使う", group = G_ZGD)
+zgSepD   = input.bool(true, "日足: 最低離れ幅フィルターを使う", group = G_ZGD,
+     tooltip = "各項目の意味・判定は LongTermDoubleTripleTopBottomXAU と同じ (本数は日足の bar_index)。検知イベント (反転足の確定) で Zone を発動する。")
+
+// ==== ZCS Select (begin) =====================================================
+//  選択を 1 回だけ配列にする (ペア p の LONG = 2p / SHORT = 2p + 1)。根拠 ID ごとの必要 (zsN00..zsN25、入力だけから決まる simple bool) を
+//  ZCR の採用の入力と同じ名前に置く: ZCR から写した登録・更新・失効の処理が、そのまま「選んだペアに必要な種類・時間足だけ」を扱う。
+var array<bool> zsSel = f_zsSel()
+bool zaUse1 = zsN00
+bool zaUse2 = zsN01
+bool zaUse3 = zsN02
+bool zbUse1 = zsN03
+bool zbUse2 = zsN04
+bool zcUse1 = zsN05
+bool zcUse2 = zsN06
+bool zcUse3 = zsN07
+bool zcUse4 = zsN08
+bool zdUse1 = zsN09
+bool zdUse2 = zsN10
+bool zdUse3 = zsN11
+bool zdUse4 = zsN12
+bool zeUse4 = zsN13
+bool zeUseD = zsN14
+bool zeUse  = zeUse4 or zeUseD
+bool zfUse1 = zsN15 or zsN22
+bool zfUse2 = zsN16 or zsN23
+bool zfUse3 = zsN17 or zsN24
+bool zfUse4 = zsN18 or zsN25
+bool zgUse1 = zsN19
+bool zgUse4 = zsN20
+bool zgUseD = zsN21
+// ==== ZCS Select (end) =======================================================
+
+// ---- 取得 (必要な種類・時間足だけ。不要なものは request を呼ばず na / "" のまま) ---------------------------------------
+//  上位足の式・時間足・lookahead は ZCR-9 と同じ (式の中で 1 本ずらし + lookahead_on = 確定した上位足だけ)。
+// ---- ZA: Accum 検出 (ZCR-9 の写し = ZoneComboLabXAU の写し) ----
+// ==== LAB Accum copy (begin) =================================================
+f_acAccumBoxCore(simple int rangeLen, simple int baseLen, simple int atrLen,
+     simple int minUpper, simple int minLower, simple int maxRun,
+     float atrMult, float barRatioMax, float driftMax) =>
+    _atr = ta.atr(atrLen)
+
+    _bodyTop   = math.max(open, close)
+    _bodyBot   = math.min(open, close)
+    _rangeHigh = ta.highest(_bodyTop, rangeLen)
+    _rangeLow  = ta.lowest(_bodyBot, rangeLen)
+    _rangeNow  = _rangeHigh - _rangeLow
+    _rangeMid  = (_rangeHigh + _rangeLow) * 0.5
+
+    _upperCloses = 0
+    _lowerCloses = 0
+    _bullRun = 0
+    _bearRun = 0
+    _maxBullRun = 0
+    _maxBearRun = 0
+
+    for i = 0 to rangeLen - 1
+        _upperCloses += close[i] > _rangeMid ? 1 : 0
+        _lowerCloses += close[i] < _rangeMid ? 1 : 0
+        _isBull = close[i] > open[i]
+        _isBear = close[i] < open[i]
+
+        if _isBull
+            _bullRun += 1
+            _bearRun := 0
+        else if _isBear
+            _bearRun += 1
+            _bullRun := 0
+        else
+            _bullRun := 0
+            _bearRun := 0
+
+        _maxBullRun := math.max(_maxBullRun, _bullRun)
+        _maxBearRun := math.max(_maxBearRun, _bearRun)
+
+    _startMid = (open[rangeLen - 1] + close[rangeLen - 1]) * 0.5
+    _endMid   = (open + close) * 0.5
+    _drift    = math.abs(_endMid - _startMid)
+
+    _condAtr = _atr > 0 and _rangeNow <= _atr * atrMult
+
+    _bodyTopNow = math.max(open, close)
+    _bodyBotNow = math.min(open, close)
+    _rangeShort = ta.highest(_bodyTopNow, rangeLen) - ta.lowest(_bodyBotNow, rangeLen)
+    _rangeBase  = ta.highest(_bodyTopNow, baseLen)  - ta.lowest(_bodyBotNow, baseLen)
+
+    _condBar      = _rangeBase > 0 and _rangeShort <= _rangeBase * barRatioMax
+    _condBalance  = _upperCloses >= minUpper and _lowerCloses >= minLower
+    _condDrift    = _rangeNow > 0 and (_drift / _rangeNow) <= driftMax
+    _condColorRun = _maxBullRun <= maxRun and _maxBearRun <= maxRun
+
+    _condAtr and _condBar and _condBalance and _condDrift and _condColorRun
+
+f_acAccumBoxState(simple int rangeLen, simple int baseLen, simple int atrLen,
+     simple int minUpper, simple int minLower, simple int maxRun,
+     float atrMult, float barRatioMax, float driftMax) =>
+    _isAccum   = f_acAccumBoxCore(rangeLen, baseLen, atrLen, minUpper, minLower, maxRun, atrMult, barRatioMax, driftMax)
+    _accumHigh = ta.highest(math.max(open, close), rangeLen)
+    _accumLow  = ta.lowest(math.min(open, close), rangeLen)
+    _isStart   = _isAccum and not _isAccum[1]          // v6: bool は na にならない (最初の足の [1] は false = v5 の nz(…, false) と同じ)
+
+    var float _top = na
+    var float _bot = na
+    var int   _sid = na
+
+    if _isStart
+        _top := _accumHigh
+        _bot := _accumLow
+        _sid := time
+    if _isAccum
+        _bt = math.max(open, close)
+        _bb = math.min(open, close)
+        _top := math.max(nz(_top, _bt), _bt)
+        _bot := math.min(nz(_bot, _bb), _bb)
+
+    [_sid, _top, _bot, _isAccum ? 1 : 0]
+// ==== LAB Accum copy (end) ===================================================
+
+f_acConfirmed(simple int rangeLen, simple int baseLen, simple int atrLen,
+     simple int minUpper, simple int minLower, simple int maxRun,
+     float atrMult, float barRatioMax, float driftMax) =>
+    [_i, _u, _l, _a] = f_acAccumBoxState(rangeLen, baseLen, atrLen, minUpper, minLower, maxRun, atrMult, barRatioMax, driftMax)
+    [_u[1], _l[1], _i[1], _a[1]]
+
+float f1u = na
+float f1l = na
+int   f1i = na
+int   f1a = na
+if zaUse1
+    [r0, r1, r2, r3] = request.security(syminfo.tickerid, "60", f_acConfirmed(accumRangeLen, accumBaseLen, accumAtrLen,
+         accumMinUpperCloses, accumMinLowerCloses, accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax),
+         lookahead = barmerge.lookahead_on)
+    f1u := r0
+    f1l := r1
+    f1i := r2
+    f1a := r3
+float f2u = na
+float f2l = na
+int   f2i = na
+int   f2a = na
+if zaUse2
+    [r0, r1, r2, r3] = request.security(syminfo.tickerid, "240", f_acConfirmed(accumRangeLen, accumBaseLen, accumAtrLen,
+         accumMinUpperCloses, accumMinLowerCloses, accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax),
+         lookahead = barmerge.lookahead_on)
+    f2u := r0
+    f2l := r1
+    f2i := r2
+    f2a := r3
+float f3u = na
+float f3l = na
+int   f3i = na
+int   f3a = na
+if zaUse3
+    [r0, r1, r2, r3] = request.security(syminfo.tickerid, "D", f_acConfirmed(accumRangeLen, accumBaseLen, accumAtrLen,
+         accumMinUpperCloses, accumMinLowerCloses, accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax),
+         lookahead = barmerge.lookahead_on)
+    f3u := r0
+    f3l := r1
+    f3i := r2
+    f3a := r3
+
+// ---- ZB: EMA (ZCR と同じ取得)。注文の判断 (確定 5分足 k の終わり) には足 k の確定時点の値を使う (次の足の帯 = ZCR の足 k+1 の帯と同じ) ----
+float zbMa1 = na
+if zbUse1
+    zbMa1 := request.security(syminfo.tickerid, "1", ta.ema(close, zbLen1), lookahead = barmerge.lookahead_off)
+float zbMa2 = ta.ema(close, zbLen2)
+
+// ---- ZC: Swing (ZCR-9 の写し) ----
+f_lbPivotConfirmed(simple int len) =>
+    float _ph = ta.pivothigh(high, len, len)
+    float _pl = ta.pivotlow(low,  len, len)
+    int   _pt = na(_ph) ? int(na) : time
+    int   _lt = na(_pl) ? int(na) : time
+    [_ph[1], _pt[1], _pl[1], _lt[1]]
+
+float s1h = na
+int   s1ht = na
+float s1l = na
+int   s1lt = na
+if zcUse1
+    [r0, r1, r2, r3] = request.security(syminfo.tickerid, "60",  f_lbPivotConfirmed(zcPiv1), lookahead = barmerge.lookahead_on)
+    s1h  := r0
+    s1ht := r1
+    s1l  := r2
+    s1lt := r3
+float s2h = na
+int   s2ht = na
+float s2l = na
+int   s2lt = na
+if zcUse2
+    [r0, r1, r2, r3] = request.security(syminfo.tickerid, "240", f_lbPivotConfirmed(zcPiv2), lookahead = barmerge.lookahead_on)
+    s2h  := r0
+    s2ht := r1
+    s2l  := r2
+    s2lt := r3
+float s3h = na
+int   s3ht = na
+float s3l = na
+int   s3lt = na
+if zcUse3
+    [r0, r1, r2, r3] = request.security(syminfo.tickerid, "D",   f_lbPivotConfirmed(zcPiv3), lookahead = barmerge.lookahead_on)
+    s3h  := r0
+    s3ht := r1
+    s3l  := r2
+    s3lt := r3
+float s4h = na
+int   s4ht = na
+float s4l = na
+int   s4lt = na
+if zcUse4
+    [r0, r1, r2, r3] = request.security(syminfo.tickerid, "W",   f_lbPivotConfirmed(zcPiv4), lookahead = barmerge.lookahead_on)
+    s4h  := r0
+    s4ht := r1
+    s4l  := r2
+    s4lt := r3
+
+// ---- ZD: POC (ZCR-9 の写し = MtfPocFeedXAU の f_pocCore / f_feed。f_feed の off = 1 で確定済み上位足だけ) ----
+// ==== FEED POC core (begin) ==================================================
+f_pocCore(bool enabled, int off, int lookback, int bins) =>
+    float poc = na
+    float pUp = na
+    float pLo = na
+    if enabled and lookback > 0 and bins > 0 and bar_index - off >= lookback
+        float hi = na
+        float lo = na
+        bool  ok = true
+        for k = off to off + lookback - 1
+            float h = high[k]
+            float l = low[k]
+            float v = volume[k]
+            if na(h) or na(l) or na(v)
+                ok := false
+                break
+            hi := na(hi) ? h : math.max(hi, h)
+            lo := na(lo) ? l : math.min(lo, l)
+        float rangeAll = ok ? hi - lo : na
+        if ok and rangeAll > 0
+            array<float> bv = array.new_float(bins, 0.0)
+            float bs = rangeAll / bins
+            float total = 0.0
+            for k = off to off + lookback - 1
+                float ch = high[k]
+                float cl = low[k]
+                float cv = volume[k]
+                total += cv
+                float crange = ch - cl
+                if crange <= 0
+                    int bidx = math.max(0, math.min(bins - 1, int((cl - lo) / bs)))
+                    array.set(bv, bidx, array.get(bv, bidx) + cv)
+                else
+                    int b0 = math.max(0, math.floor((cl - lo) / bs) - 1)
+                    int b1 = math.min(bins - 1, math.floor((ch - lo) / bs) + 1)
+                    for bi = b0 to b1
+                        float binBot = lo + bi * bs
+                        float binTop = binBot + bs
+                        float ov = math.min(binTop, ch) - math.max(binBot, cl)
+                        if ov > 0
+                            array.set(bv, bi, array.get(bv, bi) + cv * ov / crange)
+            if total > 0
+                float best  = -1.0
+                int   bestI = 0
+                for bi = 0 to bins - 1
+                    float bvv = array.get(bv, bi)
+                    if bvv > best
+                        best  := bvv
+                        bestI := bi
+                pLo := lo + bestI * bs
+                pUp := pLo + bs
+                poc := (pUp + pLo) / 2.0
+    [poc, pUp, pLo]
+// ==== FEED POC core (end) ====================================================
+
+// 上位足の中で評価: 1 本前 (確定済み) の上位足までで計算 → [区画下限, 区画上限, 対象足時刻]
+f_feed(bool enabled, int lookback, int bins) =>
+    [pc, up, lo] = f_pocCore(enabled, 1, lookback, bins)
+    int   tk = time[1]
+    float tOut = not enabled ? 0.0 : na(tk) ? na : na(pc) ? -float(tk) : float(tk)
+    [enabled ? lo : na, enabled ? up : na, tOut]
+
+float zdL1 = na
+float zdU1 = na
+float zdT1 = na
+if zdUse1
+    [r0, r1, r2] = request.security(syminfo.tickerid, "60",  f_feed(zdUse1, zdLen1, vpBins), lookahead = barmerge.lookahead_on)
+    zdL1 := r0
+    zdU1 := r1
+    zdT1 := r2
+float zdL2 = na
+float zdU2 = na
+float zdT2 = na
+if zdUse2
+    [r0, r1, r2] = request.security(syminfo.tickerid, "240", f_feed(zdUse2, zdLen2, vpBins), lookahead = barmerge.lookahead_on)
+    zdL2 := r0
+    zdU2 := r1
+    zdT2 := r2
+float zdL3 = na
+float zdU3 = na
+float zdT3 = na
+if zdUse3
+    [r0, r1, r2] = request.security(syminfo.tickerid, "D",   f_feed(zdUse3, zdLen3, vpBins), lookahead = barmerge.lookahead_on)
+    zdL3 := r0
+    zdU3 := r1
+    zdT3 := r2
+float zdL4 = na
+float zdU4 = na
+float zdT4 = na
+if zdUse4
+    [r0, r1, r2] = request.security(syminfo.tickerid, "W",   f_feed(zdUse4, zdLen4, vpBins), lookahead = barmerge.lookahead_on)
+    zdL4 := r0
+    zdU4 := r1
+    zdT4 := r2
+float zdProto = 10001      // 内蔵計算なので protocol は常に正しい値 (ZCR と同じ定数)
+
+// ---- ZF: FVG (ZCR-9 の写し) ----
+// ==== LAB FVG copy (begin) ===================================================
+f_fvgConfirmed(float minWidth) =>
+    bool  _bull = low > high[2]
+    bool  _bear = high < low[2]
+    float _top  = _bull ? low : _bear ? low[2] : na
+    float _bot  = _bull ? high[2] : _bear ? high : na
+    int   _dir  = (_bull or _bear) and math.round_to_mintick(_top - _bot) >= minWidth ? (_bull ? 1 : -1) : 0
+    [time[1], time_close[1], close[1], _dir[1], _top[1], _bot[1]]
+// ==== LAB FVG copy (end) =====================================================
+
+int   g1k = na
+int   g1kc = na
+float g1c = na
+int   g1d = na
+float g1t = na
+float g1b = na
+if zfUse1
+    [r0, r1, r2, r3, r4, r5] = request.security(syminfo.tickerid, "60",  f_fvgConfirmed(zfMinW), lookahead = barmerge.lookahead_on)
+    g1k  := r0
+    g1kc := r1
+    g1c  := r2
+    g1d  := r3
+    g1t  := r4
+    g1b  := r5
+int   g2k = na
+int   g2kc = na
+float g2c = na
+int   g2d = na
+float g2t = na
+float g2b = na
+if zfUse2
+    [r0, r1, r2, r3, r4, r5] = request.security(syminfo.tickerid, "240", f_fvgConfirmed(zfMinW), lookahead = barmerge.lookahead_on)
+    g2k  := r0
+    g2kc := r1
+    g2c  := r2
+    g2d  := r3
+    g2t  := r4
+    g2b  := r5
+int   g3k = na
+int   g3kc = na
+float g3c = na
+int   g3d = na
+float g3t = na
+float g3b = na
+if zfUse3
+    [r0, r1, r2, r3, r4, r5] = request.security(syminfo.tickerid, "D",   f_fvgConfirmed(zfMinW), lookahead = barmerge.lookahead_on)
+    g3k  := r0
+    g3kc := r1
+    g3c  := r2
+    g3d  := r3
+    g3t  := r4
+    g3b  := r5
+int   g4k = na
+int   g4kc = na
+float g4c = na
+int   g4d = na
+float g4t = na
+float g4b = na
+if zfUse4
+    [r0, r1, r2, r3, r4, r5] = request.security(syminfo.tickerid, "W",   f_fvgConfirmed(zfMinW), lookahead = barmerge.lookahead_on)
+    g4k  := r0
+    g4kc := r1
+    g4c  := r2
+    g4d  := r3
+    g4t  := r4
+    g4b  := r5
+
+// ---- ZG: ダブル / トリプル トップ・ボトム (ZCR-9 の写し。検知器は重いので必要な時間足だけ) ----
+// ==== ZG LTB copy (begin) ===================================================
+//  LongTermDoubleTripleTopBottomXAU.pine (LTB-15, 9e92c02) の検知処理 (LtB1 / LtH / ltNew1 / ltCand1 / ltStep1 / ltRevWhy) の写し。
+//  【変更】EPS → ZG_EPS (この位置で使うため)、基準ごとに 2 回目以後の接触群の実体極値 gx を保持し、検知イベント D の末尾 (16 番目) に
+//  Zone の基準価格 (トップ = max(1 回目の山, gx) / ボトム = min(1 回目の谷, gx)) を加える。検知の判定・接触の数え方は変えない
+float ZG_EPS = 1e-7
+// 監視基準 1 個 (トップ = 実体上端の山 / ボトム = 実体下端の谷)
+type LtB1
+    int    id
+    int    side               // -1 = トップ / 1 = ボトム
+    float  lvl                // 基準価格 P (トップ = 実体上端 / ボトム = 実体下端)
+    int    pvT                // 実際の Pivot 足の time / time_close は使わない
+    int    cfT                // 登録 (右側 N 本目) の足の time / time_close (この時刻から利用可能)
+    int    cfTc
+    int    aBar               // 登録した足 (この足では接触・反転を見ない)
+    int    pvBar              // 実際の Pivot 足の bar_index (最大監視本数の起算 = 0 本目 / 1 回目の接触開始足)
+    int    cnt      = 1       // 接触回数 (基準 Pivot = 1 回目)。不採用の接触も数える
+    bool   inC      = true    // 帯に接触中
+    int    lastSt             // 直前の接触開始足の bar_index
+    int    sepN     = 0       // 直前の接触が終わってから帯を離れていた足の本数
+    float  sepX               // その足の実体の極値 (トップ = 実体下端の最小 / ボトム = 実体上端の最大)
+    bool   elig     = false   // 現在の接触がシグナル対象 (開始時に固定)
+    bool   waiting  = false   // 現在の接触で反転待ち中
+    int    waitEnd            // 反転待ちの最後の足 (接触開始足 + 反転待ち)
+    int    stBar              // 現在の接触の開始足 bar_index / time / time_close / 接触価格 (トップ = high / ボトム = low)
+    int    stT
+    int    stTc
+    float  stP
+    string why      = ""      // 現在の接触の不採用・未検知の理由 (1 文字ずつ: G 間隔不足 / S 離れ幅不足 / Z 実体端が帯外 /
+                              //   C 反転方向の色ではない / B 実体幅不足 / R 実体比率不足 / E 接触終了 / W 反転待ち終了 / V 基準無効化 / T 監視期限終了)
+    float  gx                 // 【ZG 追加】2 回目以後の接触群の実体極値 (トップ = 実体上端の最高 / ボトム = 実体下端の最安。接触開始から検知足まで)
+
+type LtH
+    int    piv
+    float  wave               // 最初の波の最低値幅
+    float  buf                // 接近許容幅 (基準帯 = P ± buf)
+    float  dist               // 接触間の最低離れ幅
+    int    gapN               // 接触開始足どうしの最低間隔
+    float  bodyMin            // 反転足の最低実体幅
+    float  ratio              // 反転足の最低実体比率 (0〜1)
+    int    wait               // 反転待ち
+    int    maxN               // 最大監視本数
+    bool   dirOn              // 最初の山・谷の方向フィルター (新しい基準の登録候補だけ)
+    bool   sepOn              // 最低離れ幅フィルター (OFF なら離れ幅を採用条件から外す)
+    array<float> bu           // 直近 (2N + 1) 本の実体上端・実体下端・高値・安値・time
+    array<float> bd
+    array<float> hh
+    array<float> ll
+    array<int>   ts
+    array<LtB1>  bases
+    int    seq      = 0       // ID (確定した Pivot 候補ごとに消費)
+    int    prevT
+    int    sSide    = 0       // 参照系列 (山・谷が交互) の最後の要素: 種類 (-1 山 / 1 谷 / 0 なし)・価格
+    float  sP
+    int    aSide    = 0       // その直前の要素 (反対側)
+    float  aP
+    int    pSide    = 0       // 方向フィルターの比較対象 = 系列で最後の要素の直前の同種 (種類が切り替わる時に更新前の aSide / aP から保存。
+    float  pP                 //   同種の極値更新中は維持する)
+
+ltNew1(int piv, float wave, float buf, float dist, int gapN, float bodyMin, float ratio, int wait, int maxN, bool dirOn, bool sepOn) =>
+    LtH.new(piv, wave, buf, dist, gapN, bodyMin, ratio, wait, maxN, dirOn, sepOn, array.new_float(), array.new_float(), array.new_float(),
+         array.new_float(), array.new_int(), array.new<LtB1>())
+
+ltAdd(string s, string ch) =>
+    str.contains(s, ch) ? s : s + ch
+
+ltAddAll(string s, string w) =>
+    string out = s
+    int n = str.length(w)
+    if n > 0
+        for i = 0 to n - 1
+            out := ltAdd(out, str.substring(w, i, i + 1))
+    out
+
+ltEvB1(LtB1 g, string ty) =>
+    ";" + ty + "," + str.tostring(g.id) + "," + str.tostring(g.side) + "," + str.tostring(g.lvl, "#.########") + "," +
+         str.tostring(g.pvT) + "," + str.tostring(g.cfT) + "," + str.tostring(g.cfTc)
+
+ltEvS1(LtB1 g, string ty) =>
+    ltEvB1(g, ty) + "," + str.tostring(g.cnt) + "," + str.tostring(g.stT) + "," + str.tostring(g.stTc) + "," + str.tostring(g.stP, "#.########")
+
+// 反転足の条件 (すべて満たせば ""、満たさない理由を返す)。トップ = 陰線・実体上端が帯内 / ボトム = 陽線・実体下端が帯内
+ltRevWhy(LtH S, bool top, float P, float o, float h, float l, float c) =>
+    string w = ""
+    float edge = top ? math.max(o, c) : math.min(o, c)
+    if edge < P - S.buf - ZG_EPS or edge > P + S.buf + ZG_EPS
+        w += "Z"
+    if top ? not (c < o) : not (c > o)
+        w += "C"
+    float body = math.abs(c - o)
+    if body < S.bodyMin - ZG_EPS
+        w += "B"
+    float rng = h - l
+    if rng <= 0 or body < rng * S.ratio - ZG_EPS
+        w += "R"
+    w
+
+// 確定した Pivot 候補 1 個: 参照系列の更新 → 最初の波の値幅 → Pivot 確定までの接触履歴 → 登録
+ltCand1(LtH S, int side, float P, int pvT, int t, int tc, int bi) =>
+    string ev = ""
+    int N = S.piv
+    S.seq += 1
+    // 参照系列: 同じ種類が続けば、山はより高い (同値は後の足)・谷はより低いものに更新。更新しない同種 Pivot は追加しない
+    bool adopt = false
+    if S.sSide == side
+        if side == -1 ? P >= S.sP : P <= S.sP
+            S.sP := P
+            adopt := true
+    else
+        // 種類の切り替え: 更新前の aSide / aP (= 今回と同種の直前の要素) を方向フィルターの比較対象に保存
+        S.pSide := S.aSide
+        S.pP    := S.aP
+        S.aSide := S.sSide
+        S.aP    := S.sP
+        S.sSide := side
+        S.sP    := P
+        adopt   := true
+    // 最初の波: 直前の反対側 Pivot だけを見る (無ければ作らない。さらに古い Pivot へ探し直さない)
+    if adopt and S.aSide == -side and S.maxN >= N
+        bool waveOk = side == -1 ? P - S.aP >= S.wave - ZG_EPS : S.aP - P >= S.wave - ZG_EPS
+        // 最初の山・谷の方向フィルター (ON のときだけ): トップ = P > 前の山 + ZG_EPS / ボトム = P < 前の谷 − ZG_EPS。前の同種が無ければ登録しない
+        bool dirOk = not S.dirOn or (S.pSide == side and (side == -1 ? P > S.pP + ZG_EPS : P < S.pP - ZG_EPS))
+        if waveOk and dirOk
+            // Pivot 足 (1 回目の接触開始) から登録足までの右側 N 本の接触履歴。離れてから再び接触していれば採用しない
+            bool  inC    = true
+            bool  second = false
+            int   sepN   = 0
+            float sepX   = na
+            for j = N + 1 to 2 * N
+                bool ct = array.get(S.hh, j) >= P - S.buf - ZG_EPS and array.get(S.ll, j) <= P + S.buf + ZG_EPS
+                if ct
+                    if not inC
+                        second := true
+                    inC := true
+                else
+                    inC := false
+                    sepN += 1
+                    float x = side == -1 ? array.get(S.bd, j) : array.get(S.bu, j)
+                    sepX := na(sepX) ? x : side == -1 ? math.min(sepX, x) : math.max(sepX, x)
+            if not second
+                LtB1 g = LtB1.new(S.seq, side, P, pvT, t, tc, bi, bi - N, inC = inC, lastSt = bi - N, sepN = sepN, sepX = sepX)
+                array.push(S.bases, g)
+                ev += ltEvB1(g, "R")
+    ev
+
+// 1時間足 1 本 (確定 OHLC) の処理。返り値の形は ltStep と同じ (ブロック + イベント)
+//   C (接触開始: 回数・開始足・high / low・シグナル対象 0/1・理由) / D (検知) / Y (シグナル対象の接触が未検知で終了: 理由) /
+//   V,id,待機中,理由 (終値無効化) / T,id,待機中,理由 (監視期限) / R (登録) / E (終了)
+ltStep1(LtH S, float o, float h, float l, float c, int t, int tc, int bi) =>
+    string ev = ""
+    float bu = math.max(o, c)
+    float bd = math.min(o, c)
+    int N = S.piv
+    int W = 2 * N + 1
+    array.push(S.bu, bu)
+    array.push(S.bd, bd)
+    array.push(S.hh, h)
+    array.push(S.ll, l)
+    array.push(S.ts, t)
+    if array.size(S.bu) > W
+        array.shift(S.bu)
+        array.shift(S.bd)
+        array.shift(S.hh)
+        array.shift(S.ll)
+        array.shift(S.ts)
+    // 実体 Pivot (左側は同値可・右側は厳密)。右側 N 本目のこの足で確定。
+    //   LTB-8: 同じ足が山と谷の両方なら、その足は参照系列に採用せず基準も作らない (系列は変えない。ID は山・谷それぞれ消費する)
+    if array.size(S.bu) == W
+        float mh = array.get(S.bu, N)
+        float ml = array.get(S.bd, N)
+        bool isH = true
+        bool isL = true
+        for j = 0 to W - 1
+            if j < N
+                isH := isH and mh >= array.get(S.bu, j)
+                isL := isL and ml <= array.get(S.bd, j)
+            if j > N
+                isH := isH and mh > array.get(S.bu, j)
+                isL := isL and ml < array.get(S.bd, j)
+        int pvT = array.get(S.ts, N)
+        if isH and isL
+            S.seq += 2
+        else
+            if isH
+                ev += ltCand1(S, -1, mh, pvT, t, tc, bi)
+            if isL
+                ev += ltCand1(S, 1, ml, pvT, t, tc, bi)
+    // 各基準 (新しい基準から): ⓪ 監視期限 → ① 終値無効化 → ② 接触・反転。登録した足は飛ばす
+    int ng = array.size(S.bases)
+    if ng > 0
+        for i = ng - 1 to 0
+            LtB1 g = array.get(S.bases, i)
+            if g.aBar < bi
+                bool  top = g.side == -1
+                float P   = g.lvl
+                bool  fin = false
+                if bi - g.pvBar > S.maxN
+                    fin := true
+                    ev += ";T," + str.tostring(g.id) + "," + (g.waiting ? "1" : "0") + "," + ltAdd(g.why, "T")
+                else if top ? c > P + S.buf + ZG_EPS : c < P - S.buf - ZG_EPS
+                    fin := true
+                    ev += ";V," + str.tostring(g.id) + "," + (g.waiting ? "1" : "0") + "," + ltAdd(g.why, "V")
+                else
+                    // 接触 = high ≥ P − buf かつ low ≤ P + buf (ヒゲを含む)。接触していない足 = 帯から離れた足
+                    bool ct = h >= P - S.buf - ZG_EPS and l <= P + S.buf + ZG_EPS
+                    if ct
+                        if not g.inC
+                            // 新しい接触の開始: 回数を数え、シグナル対象かを開始時に固定 (間隔・離れ幅。不採用でも回数は消費する)
+                            g.cnt += 1
+                            g.inC := true
+                            string why = ""
+                            bool gapOk = bi - g.lastSt >= S.gapN
+                            bool sepOk = not S.sepOn or (g.sepN > 0 and (top ? P - g.sepX >= S.dist - ZG_EPS : g.sepX - P >= S.dist - ZG_EPS))
+                            if not gapOk
+                                why += "G"
+                            if not sepOk
+                                why += "S"
+                            g.elig    := gapOk and sepOk and g.cnt <= 3
+                            g.why     := why
+                            g.lastSt  := bi
+                            g.stBar   := bi
+                            g.stT     := t
+                            g.stTc    := tc
+                            g.stP     := top ? h : l
+                            g.sepN    := 0
+                            g.sepX    := na
+                            g.waiting := g.elig
+                            g.waitEnd := bi + S.wait
+                            ev += ltEvS1(g, "C") + "," + (g.elig ? "1" : "0") + "," + why
+                            if not g.elig and g.cnt >= 3
+                                fin := true
+                        // 【ZG 追加】2 回目以後の接触群の実体極値 (検知の判定には使わない)
+                        if g.cnt >= 2
+                            g.gx := na(g.gx) ? (top ? bu : bd) : top ? math.max(g.gx, bu) : math.min(g.gx, bd)
+                        // 反転待ち (接触開始足 = 0 本目〜反転待ちの本数目。接触が続いている足だけ)
+                        if g.waiting
+                            string fw = ltRevWhy(S, top, P, o, h, l, c)
+                            if fw == ""
+                                g.waiting := false
+                                ev += ltEvS1(g, "D") + "," + str.tostring(t) + "," + str.tostring(tc) + "," + str.tostring(bi - g.stBar) + "," +
+                                     str.tostring(bu, "#.########") + "," + str.tostring(bd, "#.########") + "," +
+                                     str.tostring(top ? math.max(P, g.gx) : math.min(P, g.gx), "#.########")     // 【ZG 追加】Zone の基準価格
+                                if g.cnt >= 3
+                                    fin := true
+                            else
+                                g.why := ltAddAll(g.why, fw)
+                                if bi >= g.waitEnd
+                                    g.waiting := false
+                                    g.why := ltAdd(g.why, "W")
+                                    ev += ";Y," + str.tostring(g.id) + "," + g.why
+                                    if g.cnt >= 3
+                                        fin := true
+                    else
+                        // 帯から離れた足: 接触の終了 (待機中ならその接触の待機も終了) と、離れ幅の記録 (実体)
+                        if g.inC
+                            g.inC := false
+                            if g.waiting
+                                g.waiting := false
+                                g.why := ltAdd(g.why, "E")
+                                ev += ";Y," + str.tostring(g.id) + "," + g.why
+                                if g.cnt >= 3
+                                    fin := true
+                        g.sepN += 1
+                        float x = top ? bd : bu
+                        g.sepX := na(g.sepX) ? x : top ? math.min(g.sepX, x) : math.max(g.sepX, x)
+                if fin
+                    array.remove(S.bases, i)
+                    ev += ";E," + str.tostring(g.id)
+    string hd = "B," + str.tostring(t) + "," + str.tostring(tc) + "," + str.tostring(S.prevT) + "," + str.tostring(array.size(S.bases)) +
+         "," + str.tostring(bi)
+    S.prevT := t
+    hd + ev
+// ==== ZG LTB copy (end) =====================================================
+
+f_zgCore(int k, bool on) =>
+    var LtH S = k == 0 ? ltNew1(zgPiv1, zgWave1, zgBuf1, zgDist1, zgGap1, zgBody1, zgRatio1 / 100.0, zgWait1, zgMax1, zgDir1, zgSep1) :
+         k == 1 ? ltNew1(zgPiv4, zgWave4, zgBuf4, zgDist4, zgGap4, zgBody4, zgRatio4 / 100.0, zgWait4, zgMax4, zgDir4, zgSep4) :
+         ltNew1(zgPivD, zgWaveD, zgBufD, zgDistD, zgGapD, zgBodyD, zgRatioD / 100.0, zgWaitD, zgMaxD, zgDirD, zgSepD)
+    var string prevBlk = ""
+    string blk = on ? ltStep1(S, open, high, low, close, time, time_close, bar_index) : ""
+    string out = prevBlk == "" ? blk : prevBlk + ";" + blk
+    prevBlk := blk
+    out[1]
+string zgPk1 = ""
+if zgUse1
+    zgPk1 := request.security(syminfo.tickerid, "60",  f_zgCore(0, zgUse1), lookahead = barmerge.lookahead_on)
+string zgPk4 = ""
+if zgUse4
+    zgPk4 := request.security(syminfo.tickerid, "240", f_zgCore(1, zgUse4), lookahead = barmerge.lookahead_on)
+string zgPkD = ""
+if zgUseD
+    zgPkD := request.security(syminfo.tickerid, "D",   f_zgCore(2, zgUseD), lookahead = barmerge.lookahead_on)
+
+// ---- 上位足サッツバンド (ZoneComboLabXAU の LAB-23 と同じ: ltb.htfBandNow() の 4 値を上位足の評価の中で UDT 1 個に詰めて lookahead_on で読み、
+//      上位足と同時に確定したチャート足 (time_close >= 上位足の time_close) はその足の帯、それ以外は 1 本前 (確定済み) の帯。フィルター OFF なら呼ばない) ----
+//  帯の値: 1 = 青 (終値が LINE1・LINE2・STB の 3 本より上)、-1 = 赤 (3 本より下)、0 = フラット、na = 線が計算できない (LabTimingXAU の f_satBand / htfBandNow)
+type DfBand
+    int b         // 現在の上位足の帯
+    int tc        // 現在の上位足の time_close
+    int bp        // 1 本前の帯
+    int tcp       // 1 本前の time_close
+
+f_dfBandReq() =>
+    [b0, tc0, bp0, tcp0] = ltb.htfBandNow()
+    DfBand.new(b0, tc0, bp0, tcp0)
+
+f_dfPick(DfBand r) =>
+    int v = na
+    if not na(r)
+        if not na(r.tc)
+            v := time_close >= r.tc ? r.b : r.bp
+    v
+
+string fbTfS = fbTf == "日足" ? "D" : fbTf == "1H" ? "60" : "240"
+DfBand fbR = na
+if fbUse
+    fbR := request.security(syminfo.tickerid, fbTfS, f_dfBandReq(), lookahead = barmerge.lookahead_on)
+int  fbBand     = f_dfPick(fbR)
+bool fbFlatBoth = fbFlat == "両方向を許可"
+
+// 標準 (通常ローソク足) の 5分チャートでだけ発注する (ZCR と同じ条件)
+bool hlRun = timeframe.isminutes and timeframe.multiplier == 5 and chart.is_standard
+
+// ==== ZCS Logic (begin) ======================================================
+//  この区間は tests/zcs_sim.py が Python に機械変換して実行する (履歴参照 x[1] を使わない・na との算術 / 比較をしない)。
+//  価格はすべて syminfo.mintick 単位の整数 (ティック)。時刻は ms。
+//  ZCR-9 (ZoneConfluenceReactionStatsXAU.pine) から写した型・関数・登録ブロックは byte 一致 (テストが照合)。ZCR と違うのは Zone の索引
+//  (ZCR は価格順の索引 1 本 + Zone ごとの接触中。ここは登録時の根拠 ID ごとの価格順の索引。f_lbAdd / f_lbRemoveS) と、
+//  計測・集計の代わりのペアの候補・接触・注文。
+
+// Zone 1 個。先頭 12 項目と inv / dead / zgUse / zgShow は Lab の LbZone と同じ並び・意味
+type LbZone
+    int   id
+    int   typ                 // 0 ZA / 1 ZB / 2 ZC / 3 ZD / 4 ZF / 5 ZE / 6 ZG (Lab と同じ番号)
+    int   tf
+    int   sub                 // ZA 1 上辺 / -1 下辺、ZC 1 高値 / -1 安値、ZF 1 上昇 FVG / -1 下降 FVG、ZE 波の方向、ZG 1 トップ / -1 ボトム、他 0
+    float ctr
+    float bot
+    float top
+    float infoA               // ZE: 比率 / ZG: 回数 (2 ダブル / 3 トリプル) / ZD: 区画下限 / ZA: 下辺
+    float infoB               // ZG: 検知足の bar_index / ZE: 更新確定時刻 / ZD: 区画上限 / ZA: 上辺
+    int   key
+    int   aBar                // 登録した 5分足 (次の足から接触)
+    int   aTime
+    bool  inv      = false    // ZF: iFVG
+    bool  dead     = false
+    bool  zgUse    = true
+    bool  zgShow   = true
+    int   gid      = 0        // 登録時の根拠 ID (ZF は FVG の ID 15..18。タッチ時点の根拠 ID は f_zcGid)
+    int   lv       = 0        // ZE: 水準の番号 0..3 (0.236 / 0.382 / 0.5 / 0.618)
+    int   tb       = na       // 帯の下端 (ティック)
+    int   tt       = na       // 帯の上端 (ティック)
+    bool  isOn     = false    // 接触中
+    int   outT     = na       // 帯の完全に外側が続いている最初の足の time (na = 外側でない / 不明)
+
+// 形成中の Accum (Lab の LbAcc と同じ)
+type LbAcc
+    int   tf
+    int   aid
+    float up
+    float lo
+
+// 根拠 ID ごとの価格順の索引 (登録時の根拠 ID 0..21 = LbZone.gid。iFVG は FVG と同じ索引で、状態は f_zcGid で見る。3 / 4 = ZB は毎足作り直す)
+type ZsIdx
+    array<int>    bot          // 帯の下端 (ティック)。同値は登録順
+    array<LbZone> z
+    int           maxW = 0     // 入れた帯の幅の最大 (ティック)
+
+// ペア・方向 1 個 (選んだチェック 1 個)
+type ZsPd
+    int    a                   // 根拠 ID (a < b)
+    int    b
+    int    d                   // 1 LONG / -1 SHORT
+    string id                  // 注文 ID ("L|ZA-4H|ZC-D")
+    bool   on    = false       // 接触中 (候補帯に触れた足から、離脱するまで)
+    int    hb    = na          // 接触の帯 (離脱判定に使う。最後に触れた候補帯の範囲。ティック)
+    int    ht    = na
+    int    outT  = na          // 接触の帯の完全に外側が続いている最初の足の time (na = 外側でない)
+    array<LbZone> ka           // 最後に触れた候補 (Zone の組)。同じ組が残っていれば、その今の共通区間へ接触の帯を引き継ぐ
+    array<LbZone> kb
+    bool   act   = false       // 指値を発注中
+    int    px    = na          // 発注中の指値 (ティック)
+    int    oL    = na          // 発注中の注文の候補帯 (下端・上端) と Zone の組
+    int    oT    = na
+    LbZone oa
+    LbZone ob
+    int    cL    = na          // 作業: 候補の探索結果
+    int    cT    = na
+    LbZone ca
+    LbZone cb
+    int    fb    = -1          // 約定した足の bar_index
+    int    nFill = 0
+
+type ZcSt
+    int   zSeq     = 0
+    int   nAccOut  = 0       // 採用箱数から外れた Accum の辺
+    int   nIfvg    = 0       // FVG → iFVG
+    int   nFvgDead = 0       // iFVG の再突破で無効
+    int   ma1N     = 0       // 1分 EMA の有効値を受け取った有効足の本数 (ZB-1m の助走)
+    int   nBars    = 0       // 確定 5分足の本数
+    int   nBad     = 0       // 不正足
+    int   nCt      = 0       // 確認済みの決済済み取引の数
+    int   nFill    = 0       // エントリーの約定
+    int   nOrd     = 0       // 指値の発注・変更
+    int   nCancel  = 0       // 指値の取消
+    int   nAct     = 0       // この足の終わりに発注中の注文
+    int   nOn      = 0       // この足の終わりに接触中のペア・方向
+
+array<string> ZC_GN = array.from("ZA-1H", "ZA-4H", "ZA-D", "ZB-1m", "ZB-5m", "ZC-1H", "ZC-4H", "ZC-D", "ZC-W", "ZD-1H", "ZD-4H", "ZD-D", "ZD-W",
+     "ZE-4H", "ZE-D", "ZF-FVG-1H", "ZF-FVG-4H", "ZF-FVG-D", "ZF-FVG-W", "ZG-1H", "ZG-4H", "ZG-D", "ZF-iFVG-1H", "ZF-iFVG-4H", "ZF-iFVG-D", "ZF-iFVG-W")
+float  EPS     = 1e-7
+bool   dsZone  = false
+int    ZC_M1   = 60000
+string ZS_OCA  = "ZCS"
+
+var ZcSt st = ZcSt.new()
+var array<ZsIdx>  zsIx       = array.new<ZsIdx>()
+var array<ZsPd>   zsPd       = array.new<ZsPd>()
+var array<LbZone> zsTa       = array.new<LbZone>()      // 作業: この足で触れた候補 (Zone の組)
+var array<LbZone> zsTb       = array.new<LbZone>()
+var array<LbZone> zcMa       = array.new<LbZone>()      // ZB の 2 Zone (1分 EMA / 5分 EMA。帯は足ごとに置き直す)
+var array<bool>   zcMaOk     = array.new_bool(2, false) // ZB の帯が有効
+var array<LbZone> zcSwZ      = array.new<LbZone>()      // 水平線 (保持本数を使うときだけ。登録順)
+var array<LbZone> lbAccZ     = array.new<LbZone>()      // 採用中の Accum の上辺・下辺 (登録順)
+var array<LbAcc>  lbAccs     = array.new<LbAcc>()       // 形成中の Accum
+var array<int>    lbAccLast  = array.new_int(3, na)
+var array<int>    lbPivLastH = array.new_int(4, na)
+var array<int>    lbPivLastL = array.new_int(4, na)
+var array<float>  lbPocLast  = array.new_float(4, na)
+var array<LbZone> lbPocCur   = array.new<LbZone>(4, na)
+var array<int>    lbZdStat   = array.new_int(4, 0)      // 0 OFF / 1 正常 / 2 計算不能 / 3 履歴不足 / 8 OFF (時刻 0) / 9 異常
+var array<LbZone> lbFvgs     = array.new<LbZone>()      // ZF (FVG / iFVG)
+var array<int>    lbFvgLast  = array.new_int(4, na)
+var array<int>    lbZeStat   = array.new_int(2, 0)      // 0 OFF / 1 有効な波 / 2 波なし / 3 保留中 / 8 外部側 OFF / 9 未接続・誤接続
+var array<float>  lbZeLast   = array.new_float(10, na)
+var array<LbZone> lbZeZ      = array.new<LbZone>()
+var array<LbZone> lbZgZ      = array.new<LbZone>()
+var array<int>    lbZgUsed   = array.new_int()
+var array<int>    lbZgLast   = array.new_int(3, na)
+var array<int>    lbDeadNow  = array.new_int()
+var array<int>    zcNZone    = array.new_int(26, 0)     // 根拠 ID ごとの登録本数 (ZB は 0。ZF は FVG の ID 15..18 に数える)
+var array<int>    zcMaUnk    = array.new_int(2, 0)      // MA が不明だった有効足 (系列ごと)
+
+// 閾値 (ティック。値幅が指定幅以上になる最初のティック)
+f_zcTicks(float usd) =>
+    math.max(1, math.ceil(usd / syminfo.mintick - 1e-9))
+int        zcDepT  = f_zcTicks(zcDepW)
+int        zcDepMs = zcDepMin * ZC_M1
+int        zsXT    = f_zcTicks(zsX)                     // SL / TP の値幅 (ティック)
+
+f_zaUse(int k) =>
+    k == 0 ? zaUse1 : k == 1 ? zaUse2 : zaUse3
+
+f_zaKeep(int k) =>
+    k == 0 ? zaKeep1 : k == 1 ? zaKeep2 : zaKeep3
+
+f_zbUse(int k) =>
+    k == 0 ? zbUse1 : zbUse2
+
+f_zcUse(int k) =>
+    k == 0 ? zcUse1 : k == 1 ? zcUse2 : k == 2 ? zcUse3 : zcUse4
+
+f_zdUse(int k) =>
+    k == 0 ? zdUse1 : k == 1 ? zdUse2 : k == 2 ? zdUse3 : zdUse4
+
+// ==== LAB copy use (begin) — ZoneComboLabXAU.pine と同一 ====
+f_zfUse(int k) =>
+    k == 0 ? zfUse1 : k == 1 ? zfUse2 : k == 2 ? zfUse3 : zfUse4
+
+f_zgUse(int k) =>
+    k == 0 ? zgUse1 : k == 1 ? zgUse4 : zgUseD
+
+f_zgExpOn(int k) =>
+    k == 0 ? zgExp1 : k == 1 ? zgExp4 : zgExpD
+
+f_zgExpN(int k) =>
+    k == 0 ? zgExpN1 : k == 1 ? zgExpN4 : zgExpND
+
+f_zeUse(int k) =>
+    zeUse and (k == 0 ? zeUse4 : zeUseD)
+
+// ==== LAB copy use (end) ====
+
+// この集計に「表示だけ」の ZG は無い (Lab の f_zgShow の位置)
+f_zgShow(int k) =>
+    false
+
+// ==== LAB copy zgParse (begin) — ZoneComboLabXAU.pine と同一 ====
+f_zgParse(string pk, int lastT, int tcNow) =>
+    array<float> out = array.new_float()
+    int lt = lastT
+    if not na(pk) and pk != ""
+        array<string> evs = str.split(pk, ";")
+        bool take = false
+        float cbi = na
+        for i = 0 to array.size(evs) - 1
+            string e = array.get(evs, i)
+            if e != ""
+                array<string> f = str.split(e, ",")
+                string ty = array.get(f, 0)
+                if ty == "B"
+                    int sT = int(str.tonumber(array.get(f, 1)))
+                    int sC = int(str.tonumber(array.get(f, 2)))
+                    take := not na(sT) and (na(lt) or sT > lt) and not na(sC) and sC <= tcNow
+                    if take
+                        lt  := sT
+                        cbi := str.tonumber(array.get(f, 5))
+                        array.push(out, 0)
+                        array.push(out, cbi)
+                        array.push(out, na)
+                        array.push(out, na)
+                        array.push(out, na)
+                        array.push(out, na)
+                else if take and ty == "D" and array.size(f) > 16
+                    array.push(out, 1)
+                    array.push(out, cbi)
+                    array.push(out, str.tonumber(array.get(f, 1)))
+                    array.push(out, str.tonumber(array.get(f, 2)))
+                    array.push(out, str.tonumber(array.get(f, 7)))
+                    array.push(out, str.tonumber(array.get(f, 16)))
+    [lt, out]
+
+// ==== LAB copy zgParse (end) ====
+
+f_inc(array<int> a, int ix, int v) =>
+    array.set(a, ix, array.get(a, ix) + v)
+    true
+
+// Lab の表示用の呼び出しを受けるだけ (何もしない)
+f_dsDel(LbZone z, bool b) =>
+    true
+
+f_dsRename(LbZone z) =>
+    true
+
+f_dsAdd(LbZone z) =>
+    true
+
+// 索引 ix の中で下端が v 以上の最初の位置 / v より大きい最初の位置 (ZCR の f_zcLower / f_zcUpper と同じ二分探索)
+f_zsLower(ZsIdx ix, int v) =>
+    int lo = 0
+    int hi = array.size(ix.bot)
+    while lo < hi
+        int mid = int((lo + hi) / 2)
+        if array.get(ix.bot, mid) < v
+            lo := mid + 1
+        else
+            hi := mid
+    lo
+
+f_zsUpper(ZsIdx ix, int v) =>
+    int lo = 0
+    int hi = array.size(ix.bot)
+    while lo < hi
+        int mid = int((lo + hi) / 2)
+        if array.get(ix.bot, mid) <= v
+            lo := mid + 1
+        else
+            hi := mid
+    lo
+
+// Zone を対象に入れる (ZCR の f_lbAdd の位置。根拠 ID・ZE の水準・帯のティック (下端・上端を別々に丸める) は ZCR と同じ式)。
+//  索引は登録時の根拠 ID ごと。ZCR の「接触中の引き継ぎ」は持たない (接触はペア・方向ごとに f_zsContact で持つ)
+f_lbAdd(LbZone z) =>
+    z.gid := z.typ == 0 ? z.tf : z.typ == 2 ? 5 + z.tf : z.typ == 3 ? 9 + z.tf : z.typ == 5 ? 13 + z.tf : z.typ == 4 ? 15 + z.tf : 19 + z.tf
+    if z.typ == 5
+        z.lv := z.infoA == 0.236 ? 0 : z.infoA == 0.382 ? 1 : z.infoA == 0.5 ? 2 : 3
+    z.tb := math.round(z.bot / syminfo.mintick)
+    z.tt := math.round(z.top / syminfo.mintick)
+    ZsIdx ix = array.get(zsIx, z.gid)
+    ix.maxW := math.max(ix.maxW, z.tt - z.tb)
+    int pos = f_zsUpper(ix, z.tb)
+    array.insert(ix.bot, pos, z.tb)
+    array.insert(ix.z, pos, z)
+    f_inc(zcNZone, z.gid, 1)
+    if z.typ == 4
+        array.push(lbFvgs, z)
+    true
+
+// Zone を外す (ZCR の f_lbRemoveS の位置)。索引から除く
+f_lbRemoveS(LbZone z) =>
+    ZsIdx ix = array.get(zsIx, z.gid)
+    int pos = f_zsLower(ix, z.tb)
+    bool fnd = false
+    while not fnd and pos < array.size(ix.z)
+        LbZone q = array.get(ix.z, pos)
+        if q.id == z.id
+            fnd := true
+        else
+            pos += 1
+    if fnd
+        array.remove(ix.bot, pos)
+        array.remove(ix.z, pos)
+    true
+
+// FVG を外す (Lab の f_lbRemove の位置)
+f_lbRemove(LbZone z) =>
+    int fi = 0
+    bool ff = false
+    while not ff and fi < array.size(lbFvgs)
+        LbZone q = array.get(lbFvgs, fi)
+        if q.id == z.id
+            ff := true
+        else
+            fi += 1
+    if ff
+        array.remove(lbFvgs, fi)
+    f_lbRemoveS(z)
+
+// ==== LAB copy funcs (begin) — ZoneComboLabXAU.pine と同一 ====
+f_lbNew(int typ, int tf, int sub, float ctr, float bot, float top, float a, float b, int key) =>
+    st.zSeq += 1
+    LbZone z = LbZone.new(st.zSeq, typ, tf, sub, ctr, bot, top, a, b, key, bar_index, time)
+    z
+
+f_zgKill(int i) =>
+    LbZone z = array.remove(lbZgZ, i)
+    if z.zgUse
+        f_lbRemoveS(z)
+        array.push(lbDeadNow, z.id)
+    if dsZone and z.zgShow
+        f_dsDel(z, false)
+    z.dead := true
+    true
+
+f_zeClear(int k) =>
+    int n = array.size(lbZeZ)
+    if n > 0
+        for i = n - 1 to 0
+            LbZone z = array.get(lbZeZ, i)
+            if z.tf == k
+                array.remove(lbZeZ, i)
+                f_lbRemoveS(z)
+                if dsZone
+                    f_dsDel(z, false)
+                z.dead := true
+                array.push(lbDeadNow, z.id)
+    true
+
+f_zeSet(int k, float o, float e, float d, float id, float t) =>
+    array<float> rs = array.from(0.236, 0.382, 0.5, 0.618)
+    for j = 0 to 3
+        float r = array.get(rs, j)
+        float p = e + r * (o - e)
+        LbZone z = f_lbNew(5, k, int(d), p, p - zHalf, p + zHalf, r, t, int(id))
+        f_lbAdd(z)
+        array.push(lbZeZ, z)
+    int b = k * 5
+    array.set(lbZeLast, b, o)
+    array.set(lbZeLast, b + 1, e)
+    array.set(lbZeLast, b + 2, d)
+    array.set(lbZeLast, b + 3, id)
+    array.set(lbZeLast, b + 4, 1)
+    true
+
+f_zeSame(int k, float o, float e, float d, float id) =>
+    int b = k * 5
+    array.get(lbZeLast, b + 4) == 1 and array.get(lbZeLast, b) == o and array.get(lbZeLast, b + 1) == e and array.get(lbZeLast, b + 2) == d
+         and array.get(lbZeLast, b + 3) == id
+
+f_lbAccFix(LbAcc q) =>
+    LbZone zu = f_lbNew(0, q.tf, 1, q.up, q.up - zHalf, q.up + zHalf, q.lo, q.up, q.aid)
+    LbZone zl = f_lbNew(0, q.tf, -1, q.lo, q.lo - zHalf, q.lo + zHalf, q.lo, q.up, q.aid)
+    f_lbAdd(zu)
+    f_lbAdd(zl)
+    array.push(lbAccZ, zu)
+    array.push(lbAccZ, zl)
+    int nk = 0
+    for i = 0 to array.size(lbAccZ) - 1
+        LbZone qz = array.get(lbAccZ, i)
+        if qz.tf == q.tf
+            nk += 1
+    while nk > 2 * f_zaKeep(q.tf)
+        int oi = 0
+        bool fnd = false
+        while not fnd
+            LbZone qz = array.get(lbAccZ, oi)
+            if qz.tf == q.tf
+                fnd := true
+            else
+                oi += 1
+        LbZone zo = array.remove(lbAccZ, oi)
+        f_lbRemoveS(zo)
+        if dsZone
+            f_dsDel(zo, false)
+        zo.dead := true
+        array.push(lbDeadNow, zo.id)
+        st.nAccOut += 1
+        nk -= 1
+    true
+
+// ==== LAB copy funcs (end) ====
+
+// 水平線を 1 本登録する (Lab の f_swAdd の位置。Lab の統合はしない。線ごとに個別の帯 = 価格 ± 共通幅)。
+//  保持本数 > 0 のときだけ、その時間足の古い線を外す
+f_swAdd(int k, int sub, float pv, int pt) =>
+    LbZone z = f_lbNew(2, k, sub, pv, pv - zHalf, pv + zHalf, na, na, pt)
+    f_lbAdd(z)
+    if zcMax > 0
+        array.push(zcSwZ, z)
+        int nk = 0
+        for i = 0 to array.size(zcSwZ) - 1
+            LbZone qz = array.get(zcSwZ, i)
+            if qz.tf == k
+                nk += 1
+        while nk > zcMax
+            int oi = 0
+            bool fnd = false
+            while not fnd
+                LbZone qz = array.get(zcSwZ, oi)
+                if qz.tf == k
+                    fnd := true
+                else
+                    oi += 1
+            LbZone zo = array.remove(zcSwZ, oi)
+            f_lbRemoveS(zo)
+            zo.dead := true
+            nk -= 1
+    true
+
+// ZB の帯をこの足用に置き直す (v = 直前の足が確定した時点の EMA。na = 不明)
+f_zcMaSet(int k, bool use, float v) =>
+    LbZone mz = array.get(zcMa, k)
+    if use and not na(v)
+        mz.ctr := v
+        mz.bot := v - zHalf
+        mz.top := v + zHalf
+        mz.tb  := math.round(mz.bot / syminfo.mintick)
+        mz.tt  := math.round(mz.top / syminfo.mintick)
+        array.set(zcMaOk, k, true)
+    else
+        array.set(zcMaOk, k, false)
+        if use
+            f_inc(zcMaUnk, k, 1)
+    true
+
+// タッチ時点の根拠 ID。ZF は Zone のその時点の状態で FVG (15..18) か iFVG (22..25) のどちらか 1 つ (同じ Zone が両方に数えられることは無い)
+f_zcGid(LbZone z) =>
+    z.typ == 4 and z.inv ? 22 + z.tf : z.gid
+
+// 根拠 ID g (0..25) の索引
+f_zsIxOf(int g) =>
+    array.get(zsIx, g >= 22 ? g - 7 : g)
+
+// Zone z が、方向 d のペアの根拠 ID g として使えるか: 有効 (消えていない・ZB は帯が有効)、タッチ時点の根拠 ID が g (ZF は FVG / iFVG の状態で
+//  別の ID)、通常 FVG (g = 15..18) は向きが d と同じ (上昇 FVG = LONG だけ / 下降 FVG = SHORT だけ。iFVG と他の種類は条件なし)
+f_zsOk(LbZone z, int g, int d) =>
+    not z.dead and (z.typ != 1 or array.get(zcMaOk, z.tf)) and f_zcGid(z) == g and (g < 15 or g > 18 or z.sub == d)
+
+// 発注時の通常 FVG の接近条件 (ZCR-9 の K1 と同じ意味: FVG 自身の帯へ LONG は上から・SHORT は下から触れる場合だけ根拠にする)。
+//  LONG は確定足の終値 c > その FVG の上端、SHORT は c < 下端 (価格が既に FVG の帯の中なら置かない)。iFVG と他の種類は条件なし
+f_zsFvgSide(LbZone z, int g, int d, int c) =>
+    g < 15 or g > 18 or (d == 1 ? c > z.tt : c < z.tb)
+
+// ZB の索引をこの足の帯で作り直す (f_zcMaSet の後)
+f_zsMaIdx() =>
+    for k = 0 to 1
+        ZsIdx ix = array.get(zsIx, 3 + k)
+        array.clear(ix.bot)
+        array.clear(ix.z)
+        if array.get(zcMaOk, k)
+            LbZone mz = array.get(zcMa, k)
+            array.push(ix.bot, mz.tb)
+            array.push(ix.z, mz)
+            ix.maxW := math.max(ix.maxW, mz.tt - mz.tb)
+    true
+
+// 候補 [cl, ct] (Zone の組 za / zb) が今の最良より良いか。LONG: 上端が高い → 下端が高い → Zone の ID が小さい組。
+//  SHORT: 下端が低い → 上端が低い → Zone の ID が小さい組 (同じ帯の組の選び方を決めておくだけ。注文の価格は帯で決まる)
+f_zsBetter(ZsPd p, bool fnd, int cl, int ct, LbZone za, LbZone zb) =>
+    bool r = not fnd
+    if fnd
+        bool same = ct == p.cT and cl == p.cL
+        bool lowId = za.id < p.ca.id or (za.id == p.ca.id and zb.id < p.cb.id)
+        if p.d == 1
+            r := ct > p.cT or (ct == p.cT and cl > p.cL) or (same and lowId)
+        else
+            r := cl < p.cL or (cl == p.cL and ct < p.cT) or (same and lowId)
+    r
+
+// 発注の候補 (終値 c の確定時点の Zone)。LONG: 共通区間の上端 < c のうち上端が最も高いもの、SHORT: 下端 > c のうち下端が最も低いもの。
+//  見つかれば p.cL / p.cT / p.ca / p.cb に入れて true。片方の根拠の Zone (少ない方) を価格順にたどり、もう片方の重なる Zone を索引で探す。
+//  LONG は下端 < c の Zone を高い方から: 残りの候補の上端は「その Zone の下端 + 索引の幅の最大」以下なので、それが今の最良の上端より
+//  低くなったら打ち切る。SHORT は上端 > c になり得る Zone を低い方から: 残りの候補の下端はその Zone の下端以上なので、最良の下端を超えたら打ち切る
+f_zsBest(ZsPd p, int c) =>
+    ZsIdx ia  = f_zsIxOf(p.a)
+    ZsIdx ib  = f_zsIxOf(p.b)
+    bool  sw  = array.size(ib.z) < array.size(ia.z)
+    ZsIdx io  = sw ? ib : ia
+    ZsIdx ii  = sw ? ia : ib
+    int   go  = sw ? p.b : p.a
+    int   gi  = sw ? p.a : p.b
+    bool  fnd = false
+    int   no  = array.size(io.z)
+    if no > 0 and array.size(ii.z) > 0
+        int  k    = p.d == 1 ? f_zsLower(io, c) - 1 : f_zsLower(io, c - io.maxW + 1)
+        bool more = p.d == 1 ? k >= 0 : k < no
+        while more
+            LbZone zo = array.get(io.z, k)
+            if fnd and (p.d == 1 ? zo.tb + io.maxW < p.cT : zo.tb > p.cL)
+                more := false
+            else
+                if f_zsOk(zo, go, p.d) and f_zsFvgSide(zo, go, p.d, c)
+                    int j = f_zsLower(ii, zo.tb - ii.maxW)
+                    int m = array.size(ii.z)
+                    while j < m and array.get(ii.bot, j) <= zo.tt
+                        LbZone zi = array.get(ii.z, j)
+                        if zi.tt >= zo.tb and f_zsOk(zi, gi, p.d) and f_zsFvgSide(zi, gi, p.d, c)
+                            int    cl = math.max(zo.tb, zi.tb)
+                            int    ct = math.min(zo.tt, zi.tt)
+                            LbZone za = sw ? zi : zo
+                            LbZone zb = sw ? zo : zi
+                            if (p.d == 1 ? ct < c : cl > c) and f_zsBetter(p, fnd, cl, ct, za, zb)
+                                p.cL := cl
+                                p.cT := ct
+                                p.ca := za
+                                p.cb := zb
+                                fnd  := true
+                        j += 1
+                k    += p.d == 1 ? -1 : 1
+                more := p.d == 1 ? k >= 0 : k < no
+    fnd
+
+// 確定 5分足 [l, h] に触れた候補 (共通区間が [l, h] と重なる A と B の Zone の組) を zsTa / zsTb へ。戻り値 = 組の数
+f_zsTouch(ZsPd p, int h, int l) =>
+    array.clear(zsTa)
+    array.clear(zsTb)
+    ZsIdx ia = f_zsIxOf(p.a)
+    ZsIdx ib = f_zsIxOf(p.b)
+    int   ma = array.size(ia.z)
+    int   mb = array.size(ib.z)
+    if ma > 0 and mb > 0
+        int k = f_zsLower(ia, l - ia.maxW)
+        while k < ma and array.get(ia.bot, k) <= h
+            LbZone za = array.get(ia.z, k)
+            if za.tt >= l and f_zsOk(za, p.a, p.d)
+                int j = f_zsLower(ib, za.tb - ib.maxW)
+                while j < mb and array.get(ib.bot, j) <= za.tt
+                    LbZone zb = array.get(ib.z, j)
+                    if zb.tt >= za.tb and f_zsOk(zb, p.b, p.d)
+                        if math.max(za.tb, zb.tb) <= h and math.min(za.tt, zb.tt) >= l
+                            array.push(zsTa, za)
+                            array.push(zsTb, zb)
+                    j += 1
+            k += 1
+    array.size(zsTa)
+
+// 接触中・離脱 (ペア・方向ごと。ZCR の離脱規則を接触の帯に当てる)。確定 5分足 k の [l, h] と、足 k の間に有効だった候補 (足 k-1 の処理の後の Zone) で判定する。
+//  (a) 接触中なら、最後に触れた候補 (Zone の組) のうち今も候補のもの (Zone が有効・FVG の状態と向き・帯が重なる) の今の共通区間へ接触の帯を
+//      置き直す (ZB の帯が動く場合は同じ候補として引き継ぐ)。どれも残っていなければ前の帯のまま (消えた候補の場所で再接触を水増ししない)。
+//  (b) この足が候補帯のどれかに触れた → 接触中 (外側の計時を消し、接触の帯 = 触れた候補帯の範囲)。
+//  (c) 触れていないが接触の帯に掛かっている、または接触の帯の ZB が不明 → 接触中のまま、外側の計時をやり直す。
+//  (d) それ以外 (接触の帯の完全に外側): 帯の端からの距離 >= 離脱幅、または外側が続いている最初の足の time からこの足の time_close まで >= 離脱時間 → 離脱。
+f_zsContact(ZsPd p, int h, int l) =>
+    bool unk = false
+    if p.on
+        int  nk   = array.size(p.ka)
+        bool kept = false
+        int  hb   = 0
+        int  ht   = 0
+        if nk > 0
+            for i = 0 to nk - 1
+                LbZone za = array.get(p.ka, i)
+                LbZone zb = array.get(p.kb, i)
+                if (za.typ == 1 and not array.get(zcMaOk, za.tf)) or (zb.typ == 1 and not array.get(zcMaOk, zb.tf))
+                    unk := true
+                else if f_zsOk(za, p.a, p.d) and f_zsOk(zb, p.b, p.d)
+                    int cl = math.max(za.tb, zb.tb)
+                    int ct = math.min(za.tt, zb.tt)
+                    if cl <= ct
+                        hb   := kept ? math.min(hb, cl) : cl
+                        ht   := kept ? math.max(ht, ct) : ct
+                        kept := true
+        if kept
+            p.hb := hb
+            p.ht := ht
+    int n = f_zsTouch(p, h, l)
+    if n > 0
+        int hb2 = 0
+        int ht2 = 0
+        for i = 0 to n - 1
+            LbZone za = array.get(zsTa, i)
+            LbZone zb = array.get(zsTb, i)
+            int cl = math.max(za.tb, zb.tb)
+            int ct = math.min(za.tt, zb.tt)
+            hb2 := i == 0 ? cl : math.min(hb2, cl)
+            ht2 := i == 0 ? ct : math.max(ht2, ct)
+        p.on   := true
+        p.outT := na
+        p.hb   := hb2
+        p.ht   := ht2
+        p.ka   := array.copy(zsTa)
+        p.kb   := array.copy(zsTb)
+    else if p.on
+        if unk or (p.ht >= l and p.hb <= h)
+            p.outT := na
+        else
+            int dist = l > p.ht ? l - p.ht : p.hb - h
+            if na(p.outT)
+                p.outT := time
+            if dist >= zcDepT or time_close - p.outT >= zcDepMs
+                p.on   := false
+                p.outT := na
+    true
+
+// 上位足サッツバンドで方向 d の新規注文を許可するか (フィルター OFF = 常に許可。na = 許可しない)
+f_zsFbOk(int d) =>
+    not fbUse or (not na(fbBand) and (fbBand == d or (fbBand == 0 and fbFlatBoth)))
+
+// 確定 5分足 k の処理: (1) この足の約定 → (2) 接触・離脱 (足 k-1 の処理の後の Zone) → (3) 足 k の確定情報で Zone を登録 / 更新 / 失効、ZB の帯 →
+//  (4) 注文 (次の足から有効): 置く / 価格を変える / 取り消す
+if hlRun and barstate.isconfirmed
+    if array.size(zcMa) == 0
+        for k = 0 to 1
+            LbZone mz = f_lbNew(1, k, 0, na, na, na, na, na, na)
+            mz.gid := 3 + k
+            array.push(zcMa, mz)
+        for g = 0 to 21
+            array.push(zsIx, ZsIdx.new(array.new_int(0), array.new<LbZone>()))
+        int pi = 0
+        for a = 0 to 24
+            for b = a + 1 to 25
+                for s = 0 to 1
+                    if array.get(zsSel, pi * 2 + s)
+                        int d = s == 0 ? 1 : -1
+                        array.push(zsPd, ZsPd.new(a, b, d, (d == 1 ? "L|" : "S|") + array.get(ZC_GN, a) + "|" + array.get(ZC_GN, b),
+                             ka = array.new<LbZone>(), kb = array.new<LbZone>()))
+                pi += 1
+
+    // 不正足 = OHLC のいずれかが na、高値 < max(始値, 終値)、安値 > min(始値, 終値) (ZCR と同じ定義)
+    bool bad = na(open) or na(high) or na(low) or na(close) or high < math.max(open, close) or low > math.min(open, close)
+    int hT = bad ? int(na) : math.round(high  / syminfo.mintick)
+    int lT = bad ? int(na) : math.round(low   / syminfo.mintick)
+    int cT = bad ? int(na) : math.round(close / syminfo.mintick)
+    int nPd = array.size(zsPd)
+
+    // ---- (1) この足で約定したエントリー (同時保有 1 なので 1 足に高々 1 件)。OCA で他の注文は取り消されているが、念のため全部取り消す。
+    //      約定したペア・方向はこの足から接触中 (帯は注文の候補帯。ギャップで帯に掛からずに約定した場合も)
+    string fid = ""
+    int nCt = strategy.closedtrades
+    if nCt > st.nCt
+        for i = st.nCt to nCt - 1
+            if strategy.closedtrades.entry_bar_index(i) == bar_index
+                fid := strategy.closedtrades.entry_id(i)
+    st.nCt := nCt
+    int nOt = strategy.opentrades
+    if nOt > 0
+        if strategy.opentrades.entry_bar_index(nOt - 1) == bar_index
+            fid := strategy.opentrades.entry_id(nOt - 1)
+    if fid != "" and nPd > 0
+        st.nFill += 1
+        for i = 0 to nPd - 1
+            ZsPd p = array.get(zsPd, i)
+            if p.act
+                strategy.cancel(p.id)
+                p.act := false
+            if p.id == fid
+                p.nFill += 1
+                p.fb    := bar_index
+                p.on    := true
+                p.outT  := na
+                p.hb    := p.oL
+                p.ht    := p.oT
+                p.ka    := array.new<LbZone>(1, p.oa)
+                p.kb    := array.new<LbZone>(1, p.ob)
+
+    // ---- (2) 接触・離脱 (約定した足のペア・方向は (1) のまま)。不正足は外側の計時をやり直すだけ ----------------------------------
+    if nPd > 0
+        for i = 0 to nPd - 1
+            ZsPd p = array.get(zsPd, i)
+            if bad
+                p.outT := na
+            else if p.fb != bar_index
+                f_zsContact(p, hT, lT)
+
+    if not bad
+        // ---- (3) この足の確定情報で Zone を登録 / 更新 / 失効 (ZCR-9 と同じブロック)。ZB の帯はこの足の確定時点の EMA -----------
+        array.clear(lbDeadNow)
+        // ==== LAB register (begin) — ZoneComboLabXAU.pine (B1) と同一 ====
+        // ZA: 新しい ID = 前回届いた ID と違う (未固定が残っていれば固定)。同じ ID は形成中に上下限を更新し、形成中フラグ 0 で固定
+        array<float> fU = array.from(f1u, f2u, f3u)
+        array<float> fL = array.from(f1l, f2l, f3l)
+        array<int>   fI = array.from(f1i, f2i, f3i)
+        array<int>   fA = array.from(f1a, f2a, f3a)
+        for k = 0 to 2
+            int   aid = array.get(fI, k)
+            float u   = array.get(fU, k)
+            float l   = array.get(fL, k)
+            if f_zaUse(k) and not na(aid) and not na(u) and not na(l)
+                bool forming = array.get(fA, k) == 1
+                int  last    = array.get(lbAccLast, k)
+                if na(last) or aid != last
+                    array.set(lbAccLast, k, aid)
+                    int na0 = array.size(lbAccs)
+                    if na0 > 0
+                        for i = na0 - 1 to 0
+                            LbAcc q = array.get(lbAccs, i)
+                            if q.tf == k
+                                f_lbAccFix(q)
+                                array.remove(lbAccs, i)
+                    LbAcc b = LbAcc.new(k, aid, u, l)
+                    if forming
+                        array.push(lbAccs, b)
+                    else
+                        f_lbAccFix(b)
+                else
+                    int na1 = array.size(lbAccs)
+                    if na1 > 0
+                        for i = na1 - 1 to 0
+                            LbAcc q = array.get(lbAccs, i)
+                            if q.tf == k and q.aid == aid
+                                q.up := u
+                                q.lo := l
+                                if not forming
+                                    f_lbAccFix(q)
+                                    array.remove(lbAccs, i)
+        // ZC: 新しい Pivot (時刻キーが前回と違う) はすべて登録。統合距離以内で連鎖する既存の水平線 Zone があればまとめる (f_swAdd)
+        array<float> pH  = array.from(s1h, s2h, s3h, s4h)
+        array<int>   pHt = array.from(s1ht, s2ht, s3ht, s4ht)
+        array<float> pL  = array.from(s1l, s2l, s3l, s4l)
+        array<int>   pLt = array.from(s1lt, s2lt, s3lt, s4lt)
+        for k = 0 to 3
+            if f_zcUse(k)
+                for s = 0 to 1
+                    float pv = s == 0 ? array.get(pH, k) : array.get(pL, k)
+                    int   pt = s == 0 ? array.get(pHt, k) : array.get(pLt, k)
+                    int   lt = s == 0 ? array.get(lbPivLastH, k) : array.get(lbPivLastL, k)
+                    if not na(pt) and not na(pv) and (na(lt) or pt != lt)
+                        if s == 0
+                            array.set(lbPivLastH, k, pt)
+                        else
+                            array.set(lbPivLastL, k, pt)
+                        int sub = s == 0 ? 1 : -1
+                        f_swAdd(k, sub, pv, pt)
+        // ZD: 外部 POC (MtfPocFeedXAU) の受信。この 5分足に届いている確定済み上位足の出力を読み、正常な値で中心が前回の有効値から
+        //  変わったら、同じ時間足の旧 POC を無効化して新 POC を登録する (時間足ごとに最新の確定 POC 1 つだけが有効。旧 POC は Zone の一覧・
+        //  表示・TP 候補から外し、旧 POC を含む待機は (B3) で解除。時刻の更新だけでは何もしない。前と同じ価格に戻った場合も新 POC として採用)。
+        //  状態: 0 検知 OFF / 1 正常 / 2 計算不能 (時刻 < 0) / 3 履歴不足 (時刻 na) / 8 外部側 OFF (時刻 0) / 9 未接続・誤接続
+        //  (protocol ≠ 10001、時刻が時刻として不自然、正常なのに上下限が na / 上限 <= 下限)。8 / 9 は新規発注を止める (close で代用しない)
+        bool zdProtoOK = not na(zdProto) and zdProto == 10001
+        bool zdBad = false
+        array<float> dL = array.from(zdL1, zdL2, zdL3, zdL4)
+        array<float> dU = array.from(zdU1, zdU2, zdU3, zdU4)
+        array<float> dT = array.from(zdT1, zdT2, zdT3, zdT4)
+        for k = 0 to 3
+            int stt = 0
+            if f_zdUse(k)
+                float tt = array.get(dT, k)
+                float lo = array.get(dL, k)
+                float up = array.get(dU, k)
+                if not zdProtoOK
+                    stt := 9
+                else if na(tt)
+                    stt := 3
+                else if tt == 0
+                    stt := 8
+                else if math.abs(tt) < 1e11 or math.abs(tt) >= time or tt != math.round(tt)
+                    stt := 9
+                else if tt < 0
+                    stt := 2
+                else if na(lo) or na(up)
+                    stt := 9
+                else if up <= lo
+                    stt := 9
+                else
+                    stt := 1
+                    float pc = (lo + up) / 2.0
+                    float lp = array.get(lbPocLast, k)
+                    if na(lp) or pc != lp
+                        array.set(lbPocLast, k, pc)
+                        LbZone oz = array.get(lbPocCur, k)
+                        if not na(oz)
+                            f_lbRemoveS(oz)
+                            if dsZone
+                                f_dsDel(oz, false)
+                            oz.dead := true
+                            array.push(lbDeadNow, oz.id)
+                        LbZone nzp = f_lbNew(3, k, 0, pc, pc - zHalf, pc + zHalf, lo, up, int(tt))
+                        f_lbAdd(nzp)
+                        array.set(lbPocCur, k, nzp)
+            array.set(lbZdStat, k, stt)
+            if stt == 8 or stt == 9
+                zdBad := true
+        // ZE: 外部 LongFibWave (13 系列) の受信。4時間足・日足それぞれ最新の 1 波だけ (0.236 / 0.382 / 0.5 / 0.618 の 4 Zone)。
+        //  状態: 0 OFF / 1 有効な波 / 2 波なし・初期化待ち / 3 保留中 / 8 外部側の計算 OFF / 9 未接続・誤接続 (protocol ≠ 20001、状態・波 ID・
+        //  更新確定時刻が不自然、有効なのに起点・終点・方向が不正、無効なのに起点・終点・方向がある)。9 だけ新規発注を止める (close で代用しない)。
+        //  8 (外部側の計算 OFF) は 2 / 3 と同じ正常な無効状態 (その時間足の Zone と待機を外すだけ)。
+        //  有効な波の起点・終点・方向・波 ID のどれかが変わったら旧 4 Zone を外して (待機も解除) 新しい 4 Zone を登録 (同じなら何もしない)。
+        //  波なし・保留中・外部 OFF ではその時間足の Zone を外す。誤接続では Zone を保つ。ZE 検知 OFF では何もしない
+        bool zeProtoOK = not na(zeProto) and zeProto == 20001
+        bool zeBad = false
+        array<float> eO = array.from(ze4O, zeDO)
+        array<float> eE = array.from(ze4E, zeDE)
+        array<float> eD = array.from(ze4D, zeDD)
+        array<float> eI = array.from(ze4I, zeDI)
+        array<float> eS = array.from(ze4S, zeDS)
+        array<float> eT = array.from(ze4T, zeDT)
+        for k = 0 to 1
+            int stt = 0
+            if f_zeUse(k)
+                float fo = array.get(eO, k)
+                float fe = array.get(eE, k)
+                float fd = array.get(eD, k)
+                float fi = array.get(eI, k)
+                float fs = array.get(eS, k)
+                float ft = array.get(eT, k)
+                if not zeProtoOK
+                    stt := 9
+                else if na(fs) or na(fi) or na(ft) or na(fd)
+                    stt := 9
+                else if fs != math.round(fs) or fs < 0 or fs > 3 or fi != math.round(fi) or fi < 0
+                    stt := 9
+                else if math.abs(ft) < 1e11 or ft > time_close or ft != math.round(ft)
+                    stt := 9
+                else if fs == 3
+                    stt := na(fo) or na(fe) ? 9 : fo == fe or not (fd == 1 or fd == -1) ? 9 : 1
+                else
+                    stt := not na(fo) or not na(fe) or fd != 0 ? 9 : fs == 0 ? 8 : fs == 1 ? 2 : 3
+                if stt == 1
+                    if not f_zeSame(k, fo, fe, fd, fi)
+                        f_zeClear(k)
+                        f_zeSet(k, fo, fe, fd, fi, ft)
+                else if stt == 2 or stt == 3 or stt == 8
+                    f_zeClear(k)
+                    array.set(lbZeLast, k * 5 + 4, stt)
+            array.set(lbZeStat, k, stt)
+            if stt == 9
+                zeBad := true
+        // ZF: 新しい上位足 (キー = 形成足の時刻): 既存 FVG / iFVG を確定終値で判定 → 新しい FVG を登録
+        array<int>   gK = array.from(g1k, g2k, g3k, g4k)
+        array<float> gC = array.from(g1c, g2c, g3c, g4c)
+        array<int>   gD = array.from(g1d, g2d, g3d, g4d)
+        array<float> gT = array.from(g1t, g2t, g3t, g4t)
+        array<float> gB = array.from(g1b, g2b, g3b, g4b)
+        for k = 0 to 3
+            int key = array.get(gK, k)
+            int lk  = array.get(lbFvgLast, k)
+            if f_zfUse(k) and not na(key) and (na(lk) or key != lk)
+                array.set(lbFvgLast, k, key)
+                float hc = array.get(gC, k)
+                int nf = array.size(lbFvgs)
+                if nf > 0 and not na(hc)
+                    for i = nf - 1 to 0
+                        LbZone z = array.get(lbFvgs, i)
+                        if z.tf == k and z.key < key
+                            if not z.inv
+                                if (z.sub == 1 and hc < z.bot) or (z.sub == -1 and hc > z.top)
+                                    z.inv := true
+                                    st.nIfvg += 1
+                                    if dsZone
+                                        f_dsRename(z)
+                            else if (z.sub == 1 and hc > z.top) or (z.sub == -1 and hc < z.bot)
+                                z.dead := true
+                                st.nFvgDead += 1
+                                f_lbRemove(z)
+                                array.push(lbDeadNow, z.id)
+                                if dsZone
+                                    f_dsDel(z, true)
+                int   gd = array.get(gD, k)
+                float gt = array.get(gT, k)
+                float gb = array.get(gB, k)
+                if not na(gd) and gd != 0 and not na(gt) and not na(gb)
+                    f_lbAdd(f_lbNew(4, k, gd, (gt + gb) / 2.0, gb, gt, na, na, key))
+        // ZG: ダブル / トリプル トップ・ボトム (1H / 4H / D の検知器の検知イベント = 反転足の確定で発動。接触・Pivot の登録だけでは作らない)。
+        //  根拠 = 時間足 + 基準 ID で 1 回だけ (ダブルで発動した基準のトリプル・消えた基準の後の検知では作らない)。基準価格・幅・期限は発動時に固定。
+        //  期限: 検知足 = 0 本目、その時間足の確定足の bar_index − 検知足 ≥ 本数で消す。逆行: 検知結果を受け取った確定 5分足 (発動した足) から実体端で判定
+        //  (処理順: ZG の登録・期限 → 逆行による消滅 → (B2) 接触・(B3) 待機・(B6) 候補。発動した足で消えた Zone は接触・SL / TP 候補に残らない)
+        array<string> zgPk = array.from(zgPk1, zgPk4, zgPkD)
+        for k = 0 to 2
+            [zlt, zrec] = f_zgParse(array.get(zgPk, k), array.get(lbZgLast, k), time_close)
+            array.set(lbZgLast, k, zlt)
+            int nr = int(array.size(zrec) / 6)
+            if nr > 0
+                for r = 0 to nr - 1
+                    int ro  = r * 6
+                    int rbi = int(array.get(zrec, ro + 1))
+                    if array.get(zrec, ro) == 0
+                        int nzg = array.size(lbZgZ)
+                        if f_zgExpOn(k) and nzg > 0
+                            for i = nzg - 1 to 0
+                                LbZone z = array.get(lbZgZ, i)
+                                if z.tf == k and rbi - int(z.infoB) >= f_zgExpN(k)
+                                    f_zgKill(i)
+                    else
+                        int   zid  = int(array.get(zrec, ro + 2))
+                        int   zsd  = int(array.get(zrec, ro + 3))
+                        float zcnt = array.get(zrec, ro + 4)
+                        float zp   = array.get(zrec, ro + 5)
+                        int   ukey = zid * 3 + k
+                        if not array.includes(lbZgUsed, ukey) and not na(zp)
+                            array.push(lbZgUsed, ukey)
+                            if f_zgUse(k) or f_zgShow(k)
+                                // sub: 1 トップ (抵抗) / -1 ボトム (支持)。infoA = 回数 (2 ダブル / 3 トリプル)、infoB = 検知足の bar_index、key = 基準 ID
+                                LbZone zz = f_lbNew(6, k, zsd == -1 ? 1 : -1, zp, zp - zgHalf, zp + zgHalf, zcnt, rbi, zid)
+                                zz.zgUse  := f_zgUse(k)
+                                zz.zgShow := f_zgShow(k)
+                                if zz.zgUse
+                                    f_lbAdd(zz)
+                                else if dsZone and zz.zgShow
+                                    f_dsAdd(zz)
+                                array.push(lbZgZ, zz)
+        int nzg2 = array.size(lbZgZ)
+        if nzg2 > 0
+            for i = nzg2 - 1 to 0
+                LbZone z = array.get(lbZgZ, i)
+                if z.sub == 1 ? math.max(open, close) > z.ctr + zgRev + EPS : math.min(open, close) < z.ctr - zgRev - EPS
+                    f_zgKill(i)
+        // ==== LAB register (end) ====
+        float v1 = na
+        if not na(zbMa1)
+            st.ma1N += 1
+            if st.ma1N > zbWarm1
+                v1 := zbMa1
+        f_zcMaSet(0, zbUse1, v1)
+        f_zcMaSet(1, zbUse2, zbMa2)
+        f_zsMaIdx()
+
+    // ---- (4) 注文 (次の足から有効)。置く条件: 発注期間・助走の後、ポジションなし、そのペア・方向が接触中でない、上位足フィルターが許可、
+    //      候補帯がある。LONG = 上端に買い指値 / SHORT = 下端に売り指値。満たさなくなった注文は取り消す (不正足でも取り消す) ------------
+    bool live = not bad and time_close >= zcStart and st.nBars >= zcWarm
+    bool flat = strategy.position_size == 0
+    st.nAct := 0
+    st.nOn  := 0
+    if nPd > 0
+        for i = 0 to nPd - 1
+            ZsPd p = array.get(zsPd, i)
+            bool want = false
+            if live and flat and not p.on and f_zsFbOk(p.d)
+                want := f_zsBest(p, cT)
+            if want
+                int px = p.d == 1 ? p.cT : p.cL
+                if not p.act or px != p.px
+                    strategy.entry(p.id, p.d == 1 ? strategy.long : strategy.short, limit = math.round_to_mintick(px * syminfo.mintick),
+                         oca_name = ZS_OCA, oca_type = strategy.oca.cancel,
+                         comment = p.id + " " + str.tostring(p.cL * syminfo.mintick, "#.##") + "-" + str.tostring(p.cT * syminfo.mintick, "#.##"))
+                    strategy.exit("X" + p.id, from_entry = p.id, profit = zsXT, loss = zsXT, comment_profit = "TP", comment_loss = "SL")
+                    st.nOrd += 1
+                p.act := true
+                p.px  := px
+                p.oL  := p.cL
+                p.oT  := p.cT
+                p.oa  := p.ca
+                p.ob  := p.cb
+            else if p.act
+                strategy.cancel(p.id)
+                st.nCancel += 1
+                p.act := false
+            st.nAct += p.act ? 1 : 0
+            st.nOn  += p.on ? 1 : 0
+    st.nBad  += bad ? 1 : 0
+    st.nBars += 1
+// ==== ZCS Logic (end) ========================================================
+
+// ---- 状態の表示 (最小限。売買には影響しない) ------------------------------------------------------------------------------
+var table zsTbl = na
+f_zsCell(table t, int r, string k, string v) =>
+    table.cell(t, 0, r, k, text_size = size.small, bgcolor = color.new(color.gray, 85), text_halign = text.align_left)
+    table.cell(t, 1, r, v, text_size = size.small, bgcolor = color.new(color.gray, 92), text_halign = text.align_left)
+
+if barstate.islast
+    if not na(zsTbl)
+        table.delete(zsTbl)
+    zsTbl := table.new(position.top_right, 2, 9, border_width = 1)
+    if not hlRun
+        f_zsCell(zsTbl, 0, "ZCS-XAU", "停止: 5分の標準チャートで使用 (現在 " + timeframe.period + (chart.is_standard ? "" : " 非標準") + ")")
+    else
+        string nd = ""
+        for g = 0 to 25
+            bool u = g == 15 or g == 22 ? zfUse1 : g == 16 or g == 23 ? zfUse2 : g == 17 or g == 24 ? zfUse3 : g == 18 or g == 25 ? zfUse4 :
+                 g < 3 ? f_zaUse(g) : g < 5 ? f_zbUse(g - 3) : g < 9 ? f_zcUse(g - 5) : g < 13 ? f_zdUse(g - 9) : g < 15 ? f_zeUse(g - 13) : f_zgUse(g - 19)
+            if u
+                nd += (nd == "" ? "" : " ") + array.get(ZC_GN, g)
+        f_zsCell(zsTbl, 0, "ZCS-XAU", "選択 " + str.tostring(array.size(zsPd)) + " (ペア・方向)")
+        f_zsCell(zsTbl, 1, "計算する根拠", nd == "" ? "なし (ペアを選んでください)" : nd)
+        f_zsCell(zsTbl, 2, "SL / TP", "± " + str.tostring(zsX) + " ドル (約定価格から)")
+        f_zsCell(zsTbl, 3, "発注中 / 接触中", str.tostring(st.nAct) + " / " + str.tostring(st.nOn))
+        f_zsCell(zsTbl, 4, "約定 / 発注・変更 / 取消", str.tostring(st.nFill) + " / " + str.tostring(st.nOrd) + " / " + str.tostring(st.nCancel))
+        string fb = not fbUse ? "OFF" : fbTf + ": " + (na(fbBand) ? "取得できない (発注しない)" : fbBand == 1 ? "青 (LONG のみ)" : fbBand == -1 ? "赤 (SHORT のみ)" : "フラット (" + fbFlat + ")")
+        f_zsCell(zsTbl, 5, "上位足フィルター", fb)
+        string zes = not zeUse ? "使わない" : "4H " + str.tostring(array.get(lbZeStat, 0)) + " / D " + str.tostring(array.get(lbZeStat, 1)) +
+             (array.get(lbZeStat, 0) == 9 or array.get(lbZeStat, 1) == 9 ? " (9 = 未接続・誤接続。13 項目を確認)" : "")
+        f_zsCell(zsTbl, 6, "ZE 接続 (状態)", zes)
+        f_zsCell(zsTbl, 7, "ZD POC (状態)", str.tostring(array.get(lbZdStat, 0)) + " " + str.tostring(array.get(lbZdStat, 1)) + " " +
+             str.tostring(array.get(lbZdStat, 2)) + " " + str.tostring(array.get(lbZdStat, 3)) + " (1 = 正常、0 = 使わない)")
+        f_zsCell(zsTbl, 8, "注意", "成績は読み込めた履歴での結果で、将来を保証しない。手数料・スリッページは 0 (プロパティで設定)")
+
+plot(st.nAct, "発注中の注文", display = display.data_window)
+plot(st.nOn,  "接触中のペア・方向", display = display.data_window)
+plot(fbBand,  "上位足の帯 (1 青 / -1 赤 / 0 フラット)", display = display.data_window)
