@@ -75,13 +75,13 @@ def between(t, a, b):
 
 def prog(src):
     """the Python of: the generated selection code (f_zsSel and zsN..) + the Select section + the Logic section"""
-    g0 = src.index("f_zsSel() =>")
+    g0 = src.index("var array<bool> zsS01 =")
     gen = src[g0:src.index(zb.END)]
     return ap.Translator().translate(ap.logical_lines(gen + "\n" + between(src, SB, SE) + "\n" + between(src, LB, LE)))
 
 
 def sel_code(src):
-    g0 = src.index("f_zsSel() =>")
+    g0 = src.index("var array<bool> zsS01 =")
     return ap.Translator().translate(ap.logical_lines(src[g0:src.index(zb.END)] + "\n" + between(src, SB, SE)))
 
 
@@ -901,6 +901,32 @@ def need_cases():
         exec(code, env)
         ok &= [g for g in range(26) if env[f"zsN{g:02d}"]] == [a, b] and env["zsSel"] == [i == 2 * p + 1 for i in range(650)]
     check("N 生成した選択: ペア p の SHORT だけを ON にすると、配列の 2p + 1 だけが true、必要な根拠 ID はその 2 つだけ (47 ペアで確認)", ok)
+    # CE10116 fix: the 650 elements (order and values) and zsN00..25 equal the ZCS-1 (1762322) build for random selections
+    try:
+        old_src = subprocess.run(["git", "show", "1762322:ZoneConfluenceStrategyXAU.pine"], cwd=ROOT, capture_output=True,
+                                 text=True, check=True).stdout
+        g0 = old_src.index("f_zsSel() =>")
+        old_code = compile(ap.Translator().translate(ap.logical_lines(old_src[g0:old_src.index(zb.END)] + "\n"
+                                                                      + between(old_src, SB, SE))), "<sel0>", "exec")
+        rng_s = random.Random(20261125)
+        ok2, n_on = True, 0
+        for trial in range(200):
+            pick = {f"p{x}{p:03d}": rng_s.random() < (0.5 if trial % 2 else 0.02) for p in range(325) for x in "LS"}
+            n_on += sum(pick.values())
+            res = []
+            for cd in (old_code, code):
+                env = dict(base)
+                env.update(pick)
+                env.update(array__new_bool=lambda n=0, v=None: [v] * n, array__concat=lambda x, y: x.extend(y) or x,
+                           array__from=lambda *q: list(q), array__get=lambda arr, i: arr[i], _VARS=set(), _VARIPS=set(), __first__=True)
+                exec(cd, env)
+                res.append((list(env["zsSel"]), [env[f"zsN{g:02d}"] for g in range(26)]))
+            want = [pick[f"p{'LS'[i % 2]}{i // 2:03d}"] for i in range(650)]
+            ok2 &= res[0] == res[1] and res[1][0] == want
+        check("N CE10116 修正の前後 (1762322 と現在) で、650 要素の順番・選択値と zsN00..zsN25 が一致 (乱数の選択 200 通り)。"
+              "要素 i = ペア i // 2 の LONG (i 偶数) / SHORT (i 奇数)", ok2 and n_on > 0, f"{n_on}")
+    except Exception as ex:        # noqa: BLE001
+        check("N CE10116 修正の前後で 650 要素が一致", False, repr(ex))
 
 
 def causality():
@@ -1037,9 +1063,30 @@ def static():
           len(ins) == 650 and all(x[2] == "false" for x in ins) and all(x[1] == x[5] for x in ins)
           and all(ins[2 * p][3] == f"{GN[a]} × {GN[b]}  LONG" and ins[2 * p + 1][3] == "SHORT" and int(ins[2 * p][4]) == a + 1 for p, a, b in PAIRS)
           and len(set(x[4] for x in ins)) == 25 and len(re.findall(r"input\.bool\(", sec)) == 650)
-    sel_stmts = re.findall(r"^    array\.concat\(s, array\.from\(", sec, re.M)
-    check("S 生成区間: 配列化は最初の根拠ごとに 1 文 (25 文)、根拠 ID ごとの必要は 26 文 (各 50 個の入力の OR)",
-          len(sel_stmts) == 25 and len(re.findall(r"^bool zsN\d\d = ", sec, re.M)) == 26)
+    sel_stmts = re.findall(r"^var array<bool> zsS(\d\d) = array\.from\(", sec, re.M)
+    fhead = re.search(r"^f_zsSel\((.*)\) =>$", sec, re.M)
+    fbody = sec[fhead.end():sec.index("var array<bool> zsSel = ")] if fhead else ""
+    check("S 生成区間: 小分け配列 zsS01..zsS25 (グローバル var、最初の根拠ごとに 1 文)、f_zsSel は 25 個の配列を引数で受け取り結合 (宣言は 1 行)、"
+          "zsSel = f_zsSel(zsS01..zsS25)、根拠 ID ごとの必要は 26 文 (各 50 個の入力の OR)",
+          sel_stmts == [f"{a:02d}" for a in range(1, 26)] and fhead is not None
+          and fhead.group(1) == ", ".join(f"array<bool> a{a:02d}" for a in range(1, 26))
+          and re.findall(r"array\.concat\(s, a(\d\d)\)", fbody) == [f"{a:02d}" for a in range(1, 26)]
+          and len(re.findall(r"^bool zsN\d\d = ", sec, re.M)) == 26)
+    # CE10116: a function may use at most 254 outside values. No input pL### / pS### may be referenced inside any function
+    # (indented code); the selection reaches the trading logic only as the built array zsSel.
+    in_fn = [ln for ln in s.split("\n") if ln.startswith(" ") and re.search(r"\bp[LS]\d{3}\b", ln)
+             and not re.match(r"^ {5}", ln)]
+    cont_in_fn = []
+    cur = None
+    for ln in s.split("\n"):
+        if re.match(r"^[A-Za-z_]\w*\(.*\) =>", ln):
+            cur = ln
+        elif ln and not ln.startswith(" "):
+            cur = None
+        if cur and re.search(r"\bp[LS]\d{3}\b", ln):
+            cont_in_fn.append(ln)
+    check("S CE10116 対策: 650 個の入力 pL### / pS### を参照する行は関数の中に無い (入力はグローバルの小分け配列と zsN の OR だけで参照)",
+          not in_fn and not cont_in_fn, str((in_fn + cont_in_fn)[:2]))
     # requests
     reqs = re.findall(r"^(\s*)(?:\[([\w, ]+)\] = |(\w+) := )request\.(\w+)\((.*?)\)$", code, re.M)
     n_req = len(re.findall(r"request\.\w+\(", code))
@@ -1098,10 +1145,10 @@ def static():
     try:
         stt = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"], cwd=ROOT, capture_output=True, text=True, check=True).stdout
         lines_ = [x for x in stt.split("\n") if x.strip() and "__pycache__" not in x]
-        other = [x for x in lines_ if not (x.startswith("?? ") and x[3:] in mine)]
-        check("S git status: 新規 4 ファイルだけ (既存ファイルは未変更)", not other and len(lines_) == 4, str(lines_))
+        other = [x for x in lines_ if x[3:] not in mine]
+        check("S git status: 変更・追加はこのストラテジーの 4 ファイルだけ (他の既存ファイルは未変更)", not other, str(lines_))
     except Exception as ex:        # noqa: BLE001
-        check("S git status: 新規 4 ファイルだけ (既存ファイルは未変更)", False, repr(ex))
+        check("S git status: 変更・追加はこのストラテジーの 4 ファイルだけ (他の既存ファイルは未変更)", False, repr(ex))
 
 
 def main():

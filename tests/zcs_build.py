@@ -7,8 +7,9 @@ The section holds, for the 26 evidence IDs of ZCR-9 (names = ZC_GN of ZoneConflu
   * 25 group titles (one per first evidence a = 0..24),
   * 650 input.bool (all 325 pairs a < b x LONG / SHORT, default false); the LONG and SHORT of one pair share an `inline` id,
     so one pair is one row of the settings,
-  * f_zsSel(): the 650 selections as one array<bool> (pair p: LONG = 2p, SHORT = 2p + 1; p = lexicographic order of (a, b)),
-    built with one array.concat(array.from(...)) per group,
+  * zsS01..zsS25 (global var arrays, one per first evidence, built once) and f_zsSel(a01..a25) joining them into zsSel, the 650
+    selections as one array<bool> (pair p: LONG = 2p, SHORT = 2p + 1; p = lexicographic order of (a, b)). The inputs are never
+    referenced inside a function: a function may use at most 254 outside values (CE10116 on TradingView),
   * zsN00..zsN25: "a pair containing evidence g is selected" (an OR of inputs only = simple bool), used to skip the requests and
     the calculation of the kinds / timeframes no selected pair needs.
 """
@@ -62,13 +63,20 @@ def generate():
     for p, a, b in ps:
         L.append(f'pL{p:03d} = input.bool(false, "{GN[a]} × {GN[b]}  LONG", group = G_P{a + 1:02d}, inline = "q{p:03d}")')
         L.append(f'pS{p:03d} = input.bool(false, "SHORT", group = G_P{a + 1:02d}, inline = "q{p:03d}")')
-    L.append("// 選択の配列 (ペア p の LONG = 2p、SHORT = 2p + 1)。最初の根拠ごとに 1 文")
-    L.append("f_zsSel() =>")
-    L.append("    array<bool> s = array.new_bool()")
+    # CE10116 (1 関数が参照できる外部の値は 254 個まで) を避けるため、650 個の入力は関数の中で参照しない:
+    # グローバルで最初の根拠ごとの小分け配列 zsS01..zsS25 を var で 1 回だけ作り、結合関数 f_zsSel には引数で渡す。
+    L.append("// 選択の配列 (ペア p の LONG = 2p、SHORT = 2p + 1)。CE10116 (関数の外部参照 254 個まで) を避けるため、入力は関数の中で参照しない:")
+    L.append("//  グローバルで最初の根拠ごとの小分け配列 zsS01..zsS25 を var で初回だけ作り、f_zsSel が引数で受け取って 1 本に結合する")
     for a in range(len(GN) - 1):
         items = [f"{x}{p:03d}" for p, a2, _ in ps if a2 == a for x in ("pL", "pS")]
-        L += wrap("    array.concat(s, array.from(", items, ", ", "))", 4)
+        L += wrap(f"var array<bool> zsS{a + 1:02d} = array.from(", items, ", ", ")", 0)
+    args = [f"array<bool> a{a + 1:02d}" for a in range(len(GN) - 1)]
+    L.append("f_zsSel(" + ", ".join(args) + ") =>")    # 関数の宣言は 1 行に (宣言の途中で改行しない)
+    L.append("    array<bool> s = array.new_bool()")
+    for a in range(len(GN) - 1):
+        L.append(f"    array.concat(s, a{a + 1:02d})")
     L.append("    s")
+    L += wrap("var array<bool> zsSel = f_zsSel(", [f"zsS{a + 1:02d}" for a in range(len(GN) - 1)], ", ", ")", 0)
     L.append("// 根拠 ID g を含むペアのどれかが選ばれている (入力だけから決まる simple bool。不要な種類・時間足の request と計算を止める)")
     for g in range(len(GN)):
         items = [f"{x}{p:03d}" for p, a, b in ps if g in (a, b) for x in ("pL", "pS")]
