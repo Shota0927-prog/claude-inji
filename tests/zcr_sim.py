@@ -52,7 +52,7 @@ T0 = z9.T0
 MT = 0.01
 GN = z9.GN
 GI = {n: i for i, n in enumerate(GN)}
-NF, K = 15, 4
+NF, K = 10, 6
 RESULTS = []
 INFO = []
 
@@ -161,6 +161,8 @@ class Runner:
         self.out = []                  # (bar index, [record...]) of every bar with an output
         self.nnew = []                 # new contacts per bar
         self.qlen = []
+        self.nrec = []                 # records put in the output queue per bar
+        self.done0 = 0
 
     def step(self, b):
         self.bi += 1
@@ -182,6 +184,8 @@ class Runner:
             self.out.append((self.bi, [list(x) for x in recs]))
         self.nnew.append(len(e["zrNp"]))
         self.qlen.append(len(e["zcQ"]))
+        self.nrec.append(e["st"].nDone - self.done0)
+        self.done0 = e["st"].nDone
         return self
 
     def run(self, bars):
@@ -207,13 +211,14 @@ class Runner:
         return [list(q.v) for q in self.env["zcQ"]]
 
     def pend_recs(self):
-        """the records the tracking observations would give now (state 0 for open widths), made from the objects (nothing changed)"""
+        """the records of the widths still tracking (state 0), made from the objects (nothing changed). Settled / skipped widths of these
+        events are already in the queue or the output (ZCR-11: one record per (event ID, width))"""
         out = []
         for ob in self.env["zcPend"]:
-            v = [ob.id, ob.pi, ob.t0 / 1000.0, ob.za, ob.zb, ob.zta / 1000.0, ob.ztb / 1000.0, ob.cT * MT, ob.cL * MT, ob.p0 * MT,
-                 ob.fSt[0] * 100 + ob.fSt[1] * 10 + ob.fSt[2], ob.flags * 1000 + ob.tbJ[0] * 100 + ob.tbJ[1] * 10 + ob.tbJ[2]]
-            v += [None if x is None else x / 1000.0 for x in ob.fTc]
-            out.append(v)
+            for j in range(3):
+                if ob.fSt[j] == 0:
+                    out.append([ob.id, (j + 1) * 1000 + ob.tbJ[j] * 10 + ((ob.flags >> j) & 1), ob.pi, ob.t0 / 1000.0, ob.za, ob.zb,
+                                ob.cT * MT, ob.cL * MT, ob.p0 * MT, None])
         return out
 
     def all_recs(self):
@@ -227,18 +232,30 @@ class Runner:
 
 
 def rec(v):
-    """a record (15 values) -> dict (prices in ticks, times in ms)"""
-    st = int(v[10])
-    tj = int(v[11])
-    return dict(id=int(v[0]), pd=int(v[1]), pair=int(v[1]) // 2, d=1 if int(v[1]) % 2 == 0 else -1, t0=round(v[2] * 1000), za=int(v[3]), zb=int(v[4]),
-                ta=round(v[5] * 1000), tb=round(v[6] * 1000), top=tk(v[7]), bot=tk(v[8]), p0=tk(v[9]),
-                st=(st // 100, st // 10 % 10, st % 10), tbj=(tj // 100 % 10, tj // 10 % 10, tj % 10), flags=tj // 1000,
-                tc=tuple(None if x is None else round(x * 1000) for x in v[12:15]))
+    """a record (10 values, one (event ID, width)) -> dict (prices in ticks, times in ms). w = width index 0 / 1 / 2.
+    Column 1 = code = width number (1 / 2 / 3) x 1000 + result x 100 + touch-bar judgement x 10 + flag"""
+    code = int(v[1])
+    return dict(id=int(v[0]), code=code, w=code // 1000 - 1, st=code // 100 % 10, tbj=code // 10 % 10, flag=code % 10,
+                pd=int(v[2]), pair=int(v[2]) // 2, d=1 if int(v[2]) % 2 == 0 else -1, t0=round(v[3] * 1000),
+                za=int(v[4]), zb=int(v[5]), top=tk(v[6]), bot=tk(v[7]), p0=tk(v[8]), tc=None if v[9] is None else round(v[9] * 1000))
 
 
 def ident(r):
-    """a record without the zone IDs / record number (they depend on the other evidences' registrations)"""
-    return (r["pd"], r["t0"], r["ta"], r["tb"], r["top"], r["bot"], r["p0"], r["st"], r["tbj"], r["flags"], r["tc"])
+    """a record without the zone IDs / event ID (they depend on the other evidences' registrations)"""
+    return (r["pd"], r["t0"], r["w"], r["top"], r["bot"], r["p0"], r["st"], r["tbj"], r["flag"], r["tc"])
+
+
+def events(recs):
+    """per-width records -> events (the 3 widths together: st / tc / tbj tuples, flags bitmask), by event ID"""
+    ev = {}
+    for x in recs:
+        e = ev.setdefault(x["id"], dict(x, st=[None] * 3, tc=[None] * 3, tbj=[None] * 3, flags=0, n=0))
+        e["st"][x["w"]], e["tc"][x["w"]], e["tbj"][x["w"]] = x["st"], x["tc"], x["tbj"]
+        e["flags"] |= x["flag"] << x["w"]
+        e["n"] += 1
+    for e in ev.values():
+        e["st"], e["tc"], e["tbj"] = tuple(e["st"]), tuple(e["tc"]), tuple(e["tbj"])
+    return ev
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -260,7 +277,8 @@ PS = pdn("ZC-D", "ZC-W", "S")
 
 
 def recs_of(r, pd):
-    return sorted((rec(v) for v in r.all_recs() if int(v[1]) == pd), key=lambda x: x["t0"])
+    """the events of a pair x direction (all 3 widths, from output + queue + tracking)"""
+    return sorted((e for e in events(rec(v) for v in r.all_recs()).values() if e["pd"] == pd), key=lambda x: x["t0"])
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -310,7 +328,7 @@ def static():
           str(same) + str([k for k in zone_keys if k not in ii]))
     code = "\n".join(ap.strip_comment(x) for x in s.split("\n"))
     np_ = len(re.findall(r"^plot\(", code, re.M))
-    check("S plot は 64 本以下 (記録 15 列 × 4 件 = 60 + 状態 3 = 63)、strategy / alert なし", np_ == 63 and "strategy(" not in code and "alert" not in code, str(np_))
+    check("S plot は 64 本以下 (記録 10 列 × 6 件 = 60 + 状態 3 = 63)、strategy / alert なし", np_ == 63 and "strategy(" not in code and "alert" not in code, str(np_))
     rq_s = len(re.findall(r"request\.security\(", code))
     rq_9 = len(re.findall(r"request\.security\(", "\n".join(ap.strip_comment(x) for x in r9.split("\n"))))
     check("S request.security の数は ZCR-9 と同じ", rq_s == rq_9, f"{rq_s} {rq_9}")
@@ -438,6 +456,10 @@ def fixed_cases():
           and r.cnt(PL * 3, 1) == 2 and r.cnt(PL * 3 + 1, 2) == 1 and r.cnt(PL * 3 + 2, 2) == 1 and r["zrBusy"][PL * 3:PL * 3 + 3] == [1, 1, 1])
     check("3a 値幅ごとに独立: $5 は足 2 で反発先に決着、$10 / $15 は未決着のまま離脱 → 足 4 の 2 件目は $5 だけ採用、$10 / $15 は見送り (後から採用しない)",
           ok, str([(q["st"], q["tc"]) for q in x]))
+    ob_ = {(rec(v)["id"], rec(v)["w"]): bi for bi, rs in r.out for v in rs}
+    check("3f 値幅ごとに独立して出力: 1 件目の $5 は決着した足 2 で記録を出す ($10 / $15 は追跡中のまま未出力)。2 件目の見送り ($10 / $15) は新規接触の足 4 で出す",
+          ob_.get((1, 0)) == 2 and (1, 1) not in ob_ and (1, 2) not in ob_ and ob_.get((2, 1)) == 4 and ob_.get((2, 2)) == 4 and r["st"].nTrk == 3
+          and sorted(rec(v)["w"] for v in r.pend_recs() if rec(v)["id"] == 1) == [1, 2], str(ob_))
     rows7 = ([(4310, 4311, 4301, 4303)] + [(4303, 4306, 4303, 4305)] * 6 + [(4305, 4305, 4303.5, 4305), (4306, 4307.2, 4301, 4303)])
     r = run_rows(rows7)
     x = recs_of(r, PL)
@@ -515,38 +537,49 @@ def invariants(r):
 
 
 def from_records(recs):
-    """the table counts recomputed from records (state 0 = still tracking)"""
+    """the table counts recomputed from per-width records (state 0 = still tracking)"""
     cnt = [[0] * 9 for _ in range(1950)]
     for x in recs:
-        for j, s in enumerate(x["st"]):
-            c = cnt[x["pd"] * 3 + j]
-            c[0] += 1
-            if s == 9:
-                c[2] += 1
-            else:
-                c[1] += 1
-                c[{0: 8, 1: 3, 2: 4, 3: 5, 4: 6, 5: 7}[s]] += 1
+        c = cnt[x["pd"] * 3 + x["w"]]
+        s = x["st"]
+        c[0] += 1
+        if s == 9:
+            c[2] += 1
+        else:
+            c[1] += 1
+            c[{0: 8, 1: 3, 2: 4, 3: 5, 4: 6, 5: 7}[s]] += 1
     return [tuple(c) for c in cnt]
+
+
+WPER = collections.Counter()      # per width: (table, csv, unoutput) of the settled counts (report)
 
 
 def csv_checks(r, label):
     outs = [rec(v) for v in r.out_recs()]
     q = [rec(v) for v in r.queue_recs()]
     p = [rec(v) for v in r.pend_recs()]
-    ids = [x["id"] for x in outs + q + p]
+    keys = [(x["id"], x["w"]) for x in outs + q + p]
     n = r["st"].oSeq
-    check(f"4 {label}: 出力済み + 出力待ち + 追跡中 = 全新規接触 (記録番号 1..{n} が欠落・重複なし)。出力は確定した順 (FIFO)",
-          sorted(ids) == list(range(1, n + 1)) and len(ids) == len(set(ids)) and r["st"].nOut == len(outs) and r["st"].nDone == len(outs) + len(q),
+    check(f"4 {label}: 出力済み + 出力待ち + 追跡中の値幅 = 全 (イベント ID, 値幅) (1..{n} × 3 が欠落・重複なし)。出力は出力待ちへ入った順 (FIFO)",
+          sorted(keys) == [(i, j) for i in range(1, n + 1) for j in range(3)] and len(keys) == len(set(keys)) and r["st"].nOut == len(outs)
+          and r["st"].nDone == len(outs) + len(q) and len(p) == r["st"].nTrk,
           f"n={n} out={len(outs)} q={len(q)} p={len(p)}")
     check(f"4 {label}: 1 足の出力は {K} 件まで、出力待ちがある限り毎足 {K} 件出す (出し切れない分は次の足へ)",
           all(len(rs) <= K for _, rs in r.out) and all((len(dict(r.out).get(i, [])) == K) or r.qlen[i] == 0 for i in range(len(r.qlen))))
+    rows = r.rows()
     rc = from_records(outs + q + p)
-    check(f"4 {label}: 記録 (出力済み + 出力待ち + 追跡中) から再計算した集計 == 表の 1,950 行 (新規接触・採用・見送り・各結果・追跡中)", rc == r.rows())
-    ro = from_records(outs)
-    unout = sum(1 for _ in q) + len(p)
-    tot_tab = sum(c[0] for c in r.rows()) // 3
-    check(f"4 {label}: CSV (出力済み) だけの新規接触 + 未出力 (出力待ち + 追跡中) = 表の新規接触 (欠けている件数は表の「未出力」と一致)",
-          sum(c[0] for c in ro) // 3 + unout == tot_tab == n, f"csv={sum(c[0] for c in ro) // 3} unout={unout} tab={tot_tab}")
+    check(f"4 {label}: 記録 (出力済み + 出力待ち + 追跡中) から再計算した集計 == 表の 1,950 行 (新規接触・採用・見送り・各結果・追跡中)", rc == rows)
+    ro, ru = from_records(outs), from_records(q + p)
+    for j, wn in enumerate(("$5", "$10", "$15")):
+        ks = [k for k in range(1950) if k % 3 == j]
+        ok = all(tuple(a + b for a, b in zip(ro[k], ru[k])) == rows[k] for k in ks) and all(ro[k][8] == 0 for k in ks)
+        tab = [sum(rows[k][i] for k in ks) for i in range(9)]
+        csv_ = [sum(ro[k][i] for k in ks) for i in range(9)]
+        for i, nm in enumerate(("new", "adopt", "skip", "reb", "adv", "unk", "bad", "cut", "trk")):
+            WPER[(wn, nm, "table")] += tab[i]
+            WPER[(wn, nm, "csv")] += csv_[i]
+        check(f"4 {label} {wn}: CSV (出力済みの記録) から数えた 新規接触・採用・見送り・反発先・逆行先・順序不明・計測不能・打切り + 未出力 (出力待ち・追跡中) "
+              f"= 表 (この値幅の 650 行すべて)。CSV に追跡中は無い", ok, f"table={tab} csv={csv_}")
     # the CSV of the chart export (one row per bar, the plots as columns, empty = na) -> tests/zcr_csv_tabs.py
     titles = re.findall(r'^plot\(array\.get\(zcOut, \d+\),\s+"([^"]+)"', read(PINE), re.M)
     header = ["time"] + titles
@@ -558,15 +591,26 @@ def csv_checks(r, label):
             for x in range(NF):
                 vals[k * NF + x] = "" if v[x] is None else repr(v[x])
         rows_csv.append([str(i)] + vals)
-    got = ct.records_from_rows(header, rows_csv)
-    check(f"4 {label}: チャート書き出し相当の CSV (足ごとの R1〜R4 の plot) → tests/zcr_csv_tabs.py の集計 == 出力済みの記録の集計 (記録番号の重複・欠落なし)",
-          len(titles) == K * NF and sorted(got) == sorted(x["id"] for x in outs) and [tuple(c) for c in ct.tally(got)] == ro)
+    got, dup = ct.records_from_rows(header, rows_csv)
+    check(f"4 {label}: チャート書き出し相当の CSV (足ごとの R1〜R6 の plot) → tests/zcr_csv_tabs.py の集計 == 出力済みの記録の集計 ((イベント ID, 値幅) の重複・欠落なし)",
+          len(titles) == K * NF and dup == 0 and sorted(got) == sorted((x["id"], x["w"]) for x in outs) and [tuple(c) for c in ct.tally(got)] == ro)
+    # duplicated rows (the same record exported twice, e.g. overlapping exports joined) are counted once, with a warning count
+    rnd = random.Random(len(rows_csv))
+    with_rec = [x for x in rows_csv if any(c != "" for c in x[1:])]
+    extra = [list(x) for x in rnd.sample(with_rec, min(25, len(with_rec)))]
+    got2, dup2 = ct.records_from_rows(header, rows_csv + extra + extra[:5])
+    ndup = sum(sum(1 for k in range(K) if x[1 + k * NF] != "") for x in extra + extra[:5])
+    check(f"4 {label}: わざと重複行 ({len(extra) + 5} 行・記録 {ndup} 件) を入れた CSV → 重複を警告件数に数え、(イベント ID, 値幅) ごとに 1 回だけ集計 (結果は重複なしと同じ)",
+          got2 == got and dup2 == ndup and ndup > 0 and ct.tally(got2) == ct.tally(got), f"dup={dup2} want={ndup}")
     allr, lg, sh = ct.tabs(ct.tally(got))
     check(f"4 {label}: 3 タブ (全 1,950 行 / LONG 先着率 50% 以上 / SHORT 50% 以上、ちょうど 50% を含む・最低件数なし)",
           len(allr) == 1950 and all(r_[2] == "LONG" and r_[13] >= 50 for r_ in lg) and all(r_[2] == "SHORT" and r_[13] >= 50 for r_ in sh)
           and len(lg) + len(sh) == sum(1 for r_ in allr if r_[13] != "" and r_[7] >= r_[8]))
-    st_ok = all(all(s != 0 for s in x["st"]) for x in outs + q) and all(any(s == 0 for s in x["st"]) for x in p)
-    check(f"4 {label}: 出力済み・出力待ちの記録に追跡中 (0) は無い (全採用値幅が決着した記録だけ出す)、追跡中の記録には必ず未決着がある", st_ok)
+    code_ok = all(1000 <= x["code"] <= 3999 and x["w"] in (0, 1, 2) and x["st"] in (1, 2, 3, 4, 5, 9) and 0 <= x["tbj"] <= 5 and x["flag"] in (0, 1)
+                  for x in outs + q) and all(x["st"] == 0 and 0 <= x["tbj"] <= 5 and x["flag"] in (0, 1) for x in p)
+    check(f"4 {label}: コード列の各桁が範囲内 (値幅番号 1〜3・結果 1〜5 / 9 (未出力の追跡中は 0)・判定 0〜5・フラグ 0 / 1)", code_ok)
+    st_ok = all(x["st"] != 0 for x in outs + q) and all(x["st"] == 0 for x in p) and all((x["st"] == 9) == (x["tc"] is None) for x in outs + q)
+    check(f"4 {label}: 出力済み・出力待ちの記録は決着済みか見送り (追跡中 0 は無い。決着時刻は見送りだけ na)、未出力の追跡中は 0 だけ", st_ok)
     return outs
 
 
@@ -576,6 +620,7 @@ def random_runs(seeds):
     qmax = 0
     unout_end = []
     stats = collections.Counter()
+    rhist = collections.Counter()
     runs = {}
     for seed in seeds:
         bars = rbars(seed)
@@ -591,12 +636,13 @@ def random_runs(seeds):
             for i, nm in enumerate(("new", "adopt", "skip", "reb", "adv", "unk", "bad", "cut", "trk")):
                 stats[nm] += c[i]
         for x in outs:
-            stats["tb_settle"] += sum(1 for s, t in zip(x["st"], x["tc"]) if s in (1, 2, 3) and t == x["t0"])
-            stats["flag"] += 1 if x["flags"] else 0
+            stats["tb_settle"] += 1 if x["st"] in (1, 2, 3) and x["tc"] == x["t0"] else 0
+            stats["flag"] += x["flag"]
         hist.update(r.nnew)
+        rhist.update(r.nrec)
         nbar += len(r.nnew)
         qmax = max(qmax, max(r.qlen))
-        unout_end.append((seed, len(r["zcQ"]), len(r["zcPend"]), r["st"].oSeq))
+        unout_end.append((seed, len(r["zcQ"]), r["st"].nTrk, 3 * r["st"].oSeq))
         on_ok = sorted(r["zrOnL"]) == sorted(p.pi for p in r["zsPd"] if p.on)
         check(f"3 seed {seed}: 接触中の一覧 (zrOnL) == 接触中のペア・方向 (重複なし)", on_ok and len(set(r["zrOnL"])) == len(r["zrOnL"]))
     need = dict(reb=300, adv=300, unk=10, bad=3, skip=50, tb_settle=50, flag=1)
@@ -606,7 +652,10 @@ def random_runs(seeds):
     dist = {k: hist[k] for k in sorted(hist)}
     info(f"[4] 1 足あたりの新規接触 (全 650 ペア・方向、{len(seeds)} 系列 × 2500 本 = {nbar} 本): 度数 {dist}、"
          f"平均 {sum(k * v for k, v in hist.items()) / tot:.3f}、最大 {max(hist)}、K = {K} を超える足 {sum(v for k, v in hist.items() if k > K)} 本、"
-         f"出力待ちの最大 {qmax}、履歴末尾の未出力 (系列, 出力待ち, 追跡中, 全記録) {unout_end}")
+         f"出力待ちの最大 {qmax}、履歴末尾の未出力 (系列, 出力待ち, 追跡中の値幅, 全記録) {unout_end}")
+    rt = sum(rhist.values())
+    info(f"[4] 1 足あたりの記録 (出力待ちへ入る (イベント ID, 値幅)。{nbar} 本): 度数 {dict(sorted(rhist.items()))}、平均 {sum(k * v for k, v in rhist.items()) / rt:.3f}、"
+         f"最大 {max(rhist)}、K = {K} を超える足 {sum(v for k, v in rhist.items() if k > K)} 本")
     info(f"[3] 区分の合計 (全系列・全行): {dict(stats)}")
     return runs
 
@@ -664,8 +713,7 @@ def zcs_compare(runs):
         if seed % 2 == 0:
             continue                    # the runs with all kinds ON
         recs = collections.defaultdict(list)
-        for v in r.all_recs():
-            x = rec(v)
+        for x in events(rec(v) for v in r.all_recs()).values():
             recs[x["pd"]].append(x)
         for a, b in ZCS_PAIRS:
             for s in "LS":
@@ -825,6 +873,8 @@ MUTATIONS = [
     ("判定 4 の後の逆行先を順序不明にしない", "                if res == 2 and array.get(ob.tbJ, j) == 4", "                if false"),
     ("f_zrBest で次の足に届く条件を外す", "(p.d == 1 ? ct < c and ct >= lim : cl > c and cl <= lim)", "(p.d == 1 ? ct < c : cl > c)"),
     ("1 足に 1 件しか出力しない", "    int nq = math.min(ZR_K, array.size(zcQ))", "    int nq = math.min(1, array.size(zcQ))"),
+    ("値幅の記録を全値幅の決着まで待つ (ZCR-10 の出し方)", "    st.nTrk -= 1\n    f_zrRec(ob, j)", "    st.nTrk -= 1\n    if not f_zcFtOpen(ob)\n        for jj = 0 to 2\n            if array.get(ob.fSt, jj) != 9\n                f_zrRec(ob, jj)"),
+    ("見送りの値幅の記録を出さない", "        if array.get(ob.fSt, j) == 9\n            f_zrRec(ob, j)", "        if false\n            f_zrRec(ob, j)"),
 ]
 
 
