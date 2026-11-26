@@ -31,12 +31,12 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import acc_pine as ap      # noqa: E402
-import zcr_sim as zr       # noqa: E402
+import zcr9_sim as zr      # noqa: E402   (ZCR-9 frozen: tests/zcr9_sim.py on tests/zcr9_reference.pine)
 import zcs_build as zb     # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PINE = os.path.join(ROOT, "ZoneConfluenceStrategyXAU.pine")
-ZCR = os.path.join(ROOT, "ZoneConfluenceReactionStatsXAU.pine")
+ZCR = os.path.join(ROOT, "tests", "zcr9_reference.pine")     # ZCR-9 frozen copy (ZCR-10 rewrote the indicator)
 LAB = os.path.join(ROOT, "ZoneComboLabXAU.pine")
 DOC = os.path.join(ROOT, "ZONE_CONFLUENCE_STRATEGY_XAU_ja.md")
 LB, LE = "// ==== ZCS Logic (begin) ", "// ==== ZCS Logic (end) "
@@ -1145,7 +1145,9 @@ def static():
     try:
         stt = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"], cwd=ROOT, capture_output=True, text=True, check=True).stdout
         lines_ = [x for x in stt.split("\n") if x.strip() and "__pycache__" not in x]
-        other = [x for x in lines_ if x[3:] not in mine]
+        zcr10 = {"ZoneConfluenceReactionStatsXAU.pine", "tests/zcr_sim.py", "ZONE_CONFLUENCE_REACTION_XAU_ja.md", "tests/zcr9_reference.pine",
+                 "tests/zcr9_sim.py", "tests/zcr_csv_tabs.py"}       # ZCR-10 (the indicator rewrite and its frozen ZCR-9 copies)
+        other = [x for x in lines_ if x[3:] not in mine | zcr10]
         check("S git status: 変更・追加はこのストラテジーの 4 ファイルだけ (他の既存ファイルは未変更)", not other, str(lines_))
     except Exception as ex:        # noqa: BLE001
         check("S git status: 変更・追加はこのストラテジーの 4 ファイルだけ (他の既存ファイルは未変更)", False, repr(ex))
